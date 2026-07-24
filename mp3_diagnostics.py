@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -29,6 +30,10 @@ from typing import Any, Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from ffmpeg_manager import FFmpegManager
+from winlive_classification import PostNormalizationValidationStatus, WinLiveClassificationInput, WinLiveOutcome, classify_winlive
+from winlive_normalizer import contains_semantic_text, count_unrecognized_chords, normalize_synct_content
+from winlive_safe_write import WinLiveWriteValidationResult, decode_text_lossless, write_normalized_winlive_copy
+from winlive_tags import WinLiveStructureState, parse_winlive_blocks_strict
 
 
 STATUS_PERFECT = "Integro"
@@ -259,6 +264,7 @@ class MP3DiagnosticResult:
     preserved_original_path: str = ""
     placement_effective_operation: str = ""
     file_already_present: bool = False
+    winlive: WinLiveDiagnosticResult = field(default_factory=lambda: WinLiveDiagnosticResult())
 
     def to_summary_row(self, index: int) -> dict[str, Any]:
         return {
@@ -422,6 +428,26 @@ class MP3DiagnosticResult:
         }
 
 
+@dataclass(slots=True)
+class WinLiveDiagnosticResult:
+    verifica_winlive_eseguita: bool = False
+    struttura_synct: WinLiveStructureState | None = None
+    struttura_chord: WinLiveStructureState | None = None
+    testo_presente: bool = False
+    accordi_presenti: bool = False
+    accordi_non_riconosciuti: int = 0
+    normalizzazione_necessaria: bool = False
+    normalizzazione_tentata: bool = False
+    normalizzazione_validata: bool = False
+    stato_winlive_finale: WinLiveOutcome | None = None
+    note_winlive: list[str] = field(default_factory=list)
+    errore_winlive: str = ""
+    errore_winlive_code: str = ""
+    file_temporaneo: str = ""
+    audio_hash_preservato: bool | None = None
+    metadati_preservati: bool | None = None
+
+
 class MP3DiagnosticsEngine:
     def __init__(self, ffmpeg: FFmpegManager | None = None) -> None:
         self.ffmpeg = ffmpeg or FFmpegManager()
@@ -437,6 +463,7 @@ class MP3DiagnosticsEngine:
         selected_input_files: list[Path] | None = None,
         progress_callback: ProgressCallback | None = None,
         cancel_event: Any | None = None,
+        verify_winlive: bool = False,
     ) -> dict[str, Any]:
         source_dir = Path(input_folder).expanduser().resolve()
         if selected_input_files is None and not source_dir.is_dir():
@@ -489,7 +516,12 @@ class MP3DiagnosticsEngine:
 
             file_stat = file_path.stat()
             normalized_path = _normalize_key(file_path)
-            file_hash = self._sha256(file_path)
+            original_data: bytes | None = None
+            if verify_winlive:
+                original_data = self._read_file_bytes(file_path)
+                file_hash = self._sha256_bytes(original_data)
+            else:
+                file_hash = self._sha256(file_path)
 
             before_analysis = self._analyze_mp3(
                 file_path=file_path,
@@ -522,6 +554,14 @@ class MP3DiagnosticsEngine:
             )
             relevant_before = [it for it in evaluated_before if not it.ignored_for_classification]
             ignored_before = [it for it in evaluated_before if it.ignored_for_classification]
+            winlive_result = WinLiveDiagnosticResult()
+            if verify_winlive and original_data is not None:
+                winlive_result = self._diagnose_winlive(
+                    file_path=file_path,
+                    original_data=original_data,
+                    repair_mode=repair_mode,
+                    temp_dir=temp_dir,
+                )
 
             after_analysis = before_analysis
             after_issues = before_issues
@@ -748,6 +788,7 @@ class MP3DiagnosticsEngine:
                 preserved_original_path=preserved_original_path,
                 placement_effective_operation=placement_effective_operation or placement_operation,
                 file_already_present=file_already_present,
+                winlive=winlive_result,
             )
             rows.append(result)
 
@@ -762,7 +803,128 @@ class MP3DiagnosticsEngine:
         return {
             "summary": summary,
             "report_paths": report_paths,
+            "diagnostic_results": rows,
         }
+
+    def _diagnose_winlive(
+        self,
+        *,
+        file_path: Path,
+        original_data: bytes,
+        repair_mode: bool,
+        temp_dir: Path,
+    ) -> WinLiveDiagnosticResult:
+        result = WinLiveDiagnosticResult(verifica_winlive_eseguita=True)
+
+        try:
+            parsed = parse_winlive_blocks_strict(original_data)
+            result.struttura_synct = parsed.synct.state
+            result.struttura_chord = parsed.chord.state
+
+            if parsed.anomalies:
+                result.note_winlive.extend(anomaly.message for anomaly in parsed.anomalies)
+
+            synct_text: str | None = None
+            chord_text: str | None = None
+            synct_normalization = None
+
+            if parsed.synct.state == WinLiveStructureState.VALID:
+                decoded_synct = decode_text_lossless(parsed.synct.content_bytes or b"")
+                if decoded_synct.text is None:
+                    result.errore_winlive_code = "DECODING_FAILED"
+                    result.errore_winlive = decoded_synct.report.error or "Decodifica SYNCT fallita"
+                    result.stato_winlive_finale = WinLiveOutcome.NORMALIZATION_NOT_VALIDATED
+                    return result
+                synct_text = decoded_synct.text
+                synct_normalization = normalize_synct_content(synct_text)
+                result.testo_presente = contains_semantic_text(synct_text)
+                result.normalizzazione_necessaria = synct_normalization.changed
+                result.note_winlive.extend(synct_normalization.notes)
+
+            if parsed.chord.state == WinLiveStructureState.VALID:
+                decoded_chord = decode_text_lossless(parsed.chord.content_bytes or b"")
+                if decoded_chord.text is None:
+                    result.errore_winlive_code = "DECODING_FAILED"
+                    result.errore_winlive = decoded_chord.report.error or "Decodifica CHORD fallita"
+                    result.stato_winlive_finale = WinLiveOutcome.NORMALIZATION_NOT_VALIDATED
+                    return result
+                chord_text = decoded_chord.text
+                result.accordi_presenti = True
+                result.accordi_non_riconosciuti = count_unrecognized_chords(chord_text)
+
+            text_valid = parsed.synct.state == WinLiveStructureState.VALID and bool(synct_normalization and synct_normalization.text_semantically_valid)
+            chord_valid = parsed.chord.state == WinLiveStructureState.VALID and chord_text is not None
+
+            if parsed.synct.state == WinLiveStructureState.INVALID_STRUCTURE or parsed.chord.state == WinLiveStructureState.INVALID_STRUCTURE:
+                if parsed.synct.state != WinLiveStructureState.ABSENT and parsed.synct.state != WinLiveStructureState.VALID:
+                    result.errore_winlive_code = "AMBIGUOUS_STRUCTURE"
+                if parsed.chord.state != WinLiveStructureState.ABSENT and parsed.chord.state != WinLiveStructureState.VALID:
+                    result.errore_winlive_code = result.errore_winlive_code or "AMBIGUOUS_STRUCTURE"
+                if result.errore_winlive_code:
+                    result.errore_winlive = "Struttura WinLive ambigua o non valida"
+                    result.stato_winlive_finale = WinLiveOutcome.NORMALIZATION_NOT_VALIDATED
+                    return result
+
+            post_validation_status = PostNormalizationValidationStatus.NOT_NECESSARY
+            should_attempt_normalization = (
+                repair_mode
+                and text_valid
+                and chord_valid
+                and result.normalizzazione_necessaria
+                and result.accordi_non_riconosciuti == 0
+            )
+
+            if should_attempt_normalization:
+                result.normalizzazione_tentata = True
+                write_result = write_normalized_winlive_copy(
+                    source_path=str(file_path),
+                    temp_dir=str(temp_dir),
+                    keep_temporary_on_failure=False,
+                )
+                self._merge_winlive_write_result(result, write_result)
+                post_validation_status = (
+                    PostNormalizationValidationStatus.OK
+                    if write_result.error_code is None and write_result.write_succeeded and write_result.readback_succeeded
+                    else PostNormalizationValidationStatus.FAILED
+                )
+            elif result.normalizzazione_necessaria:
+                post_validation_status = PostNormalizationValidationStatus.FAILED
+
+            classification = classify_winlive(
+                WinLiveClassificationInput(
+                    text_valid=text_valid,
+                    chord_valid=chord_valid,
+                    chord_unrecognized_count=result.accordi_non_riconosciuti,
+                    text_was_modified=result.normalizzazione_necessaria,
+                    post_validation_status=post_validation_status,
+                )
+            )
+            result.stato_winlive_finale = classification.outcome
+            result.note_winlive.append(classification.reason)
+            if post_validation_status == PostNormalizationValidationStatus.OK:
+                result.normalizzazione_validata = True
+
+            return result
+        except Exception as exc:
+            result.errore_winlive_code = type(exc).__name__
+            result.errore_winlive = f"{type(exc).__name__}: {exc}"
+            result.note_winlive.append(traceback.format_exc().strip())
+            result.stato_winlive_finale = WinLiveOutcome.NORMALIZATION_NOT_VALIDATED
+            return result
+
+    @staticmethod
+    def _merge_winlive_write_result(
+        result: WinLiveDiagnosticResult,
+        write_result: WinLiveWriteValidationResult,
+    ) -> None:
+        result.file_temporaneo = write_result.temporary_path or ""
+        result.audio_hash_preservato = write_result.audio_identical
+        result.metadati_preservati = write_result.metadata_preserved
+        result.normalizzazione_validata = write_result.error_code is None and write_result.write_succeeded and write_result.readback_succeeded
+        result.note_winlive.extend(write_result.notes)
+        if write_result.error_code is not None:
+            result.errore_winlive_code = write_result.error_code.value
+            result.errore_winlive = write_result.error or write_result.error_code.value
 
     def detect_significant_audio_bounds(self, file_path: Path) -> AudioBounds:
         duration_ms = max(0, int(round(self._safe_duration_seconds(file_path) * 1000.0)))
@@ -1145,6 +1307,14 @@ class MP3DiagnosticsEngine:
             return float(self.ffmpeg.get_duration(file_path))
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _read_file_bytes(file_path: Path) -> bytes:
+        return file_path.read_bytes()
+
+    @staticmethod
+    def _sha256_bytes(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
 
     def _sha256(self, file_path: Path, block_size: int = 1024 * 1024) -> str:
         hasher = hashlib.sha256()
