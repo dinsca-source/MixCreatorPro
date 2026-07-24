@@ -54,6 +54,18 @@ OUTPUT_FOLDER_TEMP = "_TMP_DIAGNOSTICS"
 PLACEMENT_MODE_COPY = "copy"
 PLACEMENT_MODE_MOVE = "move"
 
+WINLIVE_COL_VERIFY = "Verifica WinLive"
+WINLIVE_COL_STATUS = "Stato WinLive"
+WINLIVE_COL_TEXT_PRESENT = "Testo presente"
+WINLIVE_COL_CHORDS_PRESENT = "Accordi presenti"
+WINLIVE_COL_UNRECOGNIZED = "Accordi non riconosciuti"
+WINLIVE_COL_NORMALIZATION_REQUIRED = "Normalizzazione richiesta"
+WINLIVE_COL_NORMALIZATION_ATTEMPTED = "Normalizzazione tentata"
+WINLIVE_COL_NORMALIZATION_VALIDATED = "Normalizzazione validata"
+WINLIVE_COL_NOTES = "Note WinLive"
+WINLIVE_COL_ERROR_CODE = "Codice errore WinLive"
+WINLIVE_COL_ERROR = "Errore WinLive"
+
 # Legacy folders are excluded from scan for backward compatibility.
 LEGACY_OUTPUT_FOLDERS = (
     "Parziali",
@@ -266,8 +278,33 @@ class MP3DiagnosticResult:
     file_already_present: bool = False
     winlive: WinLiveDiagnosticResult = field(default_factory=lambda: WinLiveDiagnosticResult())
 
-    def to_summary_row(self, index: int) -> dict[str, Any]:
+    @staticmethod
+    def _si_no(value: bool) -> str:
+        return "SI" if value else "NO"
+
+    @staticmethod
+    def _join_notes(notes: list[str]) -> str:
+        cleaned = [item.strip() for item in notes if item and item.strip()]
+        return " | ".join(cleaned)
+
+    def _winlive_summary_fields(self) -> dict[str, Any]:
+        status = self.winlive.stato_winlive_finale.value if self.winlive.stato_winlive_finale is not None else ""
         return {
+            WINLIVE_COL_VERIFY: self._si_no(self.winlive.verifica_winlive_eseguita),
+            WINLIVE_COL_STATUS: status,
+            WINLIVE_COL_TEXT_PRESENT: self._si_no(self.winlive.testo_presente),
+            WINLIVE_COL_CHORDS_PRESENT: self._si_no(self.winlive.accordi_presenti),
+            WINLIVE_COL_UNRECOGNIZED: self.winlive.accordi_non_riconosciuti,
+            WINLIVE_COL_NORMALIZATION_REQUIRED: self._si_no(self.winlive.normalizzazione_necessaria),
+            WINLIVE_COL_NORMALIZATION_ATTEMPTED: self._si_no(self.winlive.normalizzazione_tentata),
+            WINLIVE_COL_NORMALIZATION_VALIDATED: self._si_no(self.winlive.normalizzazione_validata),
+            WINLIVE_COL_NOTES: self._join_notes(self.winlive.note_winlive),
+            WINLIVE_COL_ERROR_CODE: self.winlive.errore_winlive_code,
+            WINLIVE_COL_ERROR: self.winlive.errore_winlive,
+        }
+
+    def to_summary_row(self, index: int, include_winlive: bool = False) -> dict[str, Any]:
+        row = {
             "Numero": index,
             "File": self.file_name,
             "Percorso originale": self.file_path,
@@ -303,6 +340,9 @@ class MP3DiagnosticResult:
             "Output riparato": self.output_repaired_path,
             "Output non recuperabile": self.output_unrecoverable_path,
         }
+        if include_winlive:
+            row.update(self._winlive_summary_fields())
+        return row
 
     def _active_evaluated_issues(self) -> list[EvaluatedIssue]:
         if self.repair_outcome == STATUS_UNRECOVERABLE:
@@ -2021,8 +2061,10 @@ class MP3DiagnosticsEngine:
         return any(_safe_int(metrics.get(field), 0) > 0 for field in _BLOCKING_ERROR_FIELDS)
 
     def _write_reports(self, rows: list[MP3DiagnosticResult], report_dir: Path) -> dict[str, str]:
-        summary_rows = [row.to_summary_row(i + 1) for i, row in enumerate(rows)]
+        include_winlive = any(row.winlive.verifica_winlive_eseguita for row in rows)
+        summary_rows = [row.to_summary_row(i + 1, include_winlive=include_winlive) for i, row in enumerate(rows)]
         problem_rows = self._build_grouped_problem_rows(rows)
+        winlive_rows = self._build_winlive_rows(rows) if include_winlive else []
 
         summary_csv = report_dir / "Riepilogo_File.csv"
         problems_csv = report_dir / "Dettaglio_Problemi.csv"
@@ -2031,7 +2073,7 @@ class MP3DiagnosticsEngine:
 
         self._write_csv(summary_csv, summary_rows)
         self._write_csv(problems_csv, problem_rows)
-        self._write_html(html_path, summary_rows, problem_rows)
+        self._write_html(html_path, summary_rows, problem_rows, winlive_rows)
         self._write_xlsx(xlsx_path, summary_rows, problem_rows)
 
         return {
@@ -2182,9 +2224,41 @@ class MP3DiagnosticsEngine:
             for row in rows:
                 writer.writerow(row)
 
-    def _write_html(self, file_path: Path, summary_rows: list[dict[str, Any]], problem_rows: list[dict[str, Any]]) -> None:
+    def _build_winlive_rows(self, rows: list[MP3DiagnosticResult]) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        for row in rows:
+            if not row.winlive.verifica_winlive_eseguita:
+                continue
+            status = row.winlive.stato_winlive_finale.value if row.winlive.stato_winlive_finale is not None else ""
+            note_text = MP3DiagnosticResult._join_notes(row.winlive.note_winlive)
+            out.append(
+                {
+                    "File": row.file_name,
+                    "Stato MP3": row.repair_outcome,
+                    "Stato WinLive": status,
+                    "Testo presente": "SI" if row.winlive.testo_presente else "NO",
+                    "Accordi presenti": "SI" if row.winlive.accordi_presenti else "NO",
+                    "Accordi non riconosciuti": str(row.winlive.accordi_non_riconosciuti),
+                    "Normalizzazione richiesta": "SI" if row.winlive.normalizzazione_necessaria else "NO",
+                    "Normalizzazione tentata": "SI" if row.winlive.normalizzazione_tentata else "NO",
+                    "Normalizzazione validata": "SI" if row.winlive.normalizzazione_validata else "NO",
+                    "Codice errore WinLive": row.winlive.errore_winlive_code,
+                    "Errore WinLive": row.winlive.errore_winlive,
+                    "_note_winlive": f"{row.file_name}: {note_text}" if note_text else "",
+                }
+            )
+        return out
+
+    def _write_html(
+        self,
+        file_path: Path,
+        summary_rows: list[dict[str, Any]],
+        problem_rows: list[dict[str, Any]],
+        winlive_rows: list[dict[str, str]],
+    ) -> None:
         summary_headers = list(summary_rows[0].keys()) if summary_rows else []
         problem_headers = list(problem_rows[0].keys()) if problem_rows else []
+        winlive_headers = [key for key in winlive_rows[0].keys() if not key.startswith("_")] if winlive_rows else []
 
         lines = [
             "<!doctype html>",
@@ -2212,6 +2286,21 @@ class MP3DiagnosticsEngine:
         lines.extend(self._html_table(summary_headers, summary_rows))
         lines.append("  <h2>Dettaglio Problemi</h2>")
         lines.extend(self._html_problem_table(problem_headers, problem_rows))
+
+        if winlive_rows:
+            lines.append("  <h2>Sezione WinLive</h2>")
+            lines.extend(self._html_table(winlive_headers, winlive_rows))
+
+            note_items = [str(item.get("_note_winlive", "")).strip() for item in winlive_rows]
+            note_items = [item for item in note_items if item]
+
+            if note_items:
+                lines.append("  <h3>Note WinLive</h3>")
+                lines.append("  <ul>")
+                for item in note_items:
+                    lines.append(f"    <li>{_xml_escape(item)}</li>")
+                lines.append("  </ul>")
+
         lines.extend(["</body>", "</html>"])
         file_path.write_text("\n".join(lines), encoding="utf-8")
 
