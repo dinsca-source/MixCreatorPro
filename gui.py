@@ -121,6 +121,8 @@ class MixCreatorApp(ctk.CTk):
         self._display_track_names: list[str] = []
         self.track_filter_var = tk.StringVar(value=FILTER_ALL)
         self.diagnostics_include_subfolders_var = tk.BooleanVar(value=False)
+        self.diagnostics_verify_winlive_var = tk.BooleanVar(value=False)
+        self.diagnostics_winlive_autocorrect_var = tk.BooleanVar(value=False)
         self.diagnostics_placement_mode_var = tk.StringVar(
             value=str(self.settings.get("diagnostics_placement_mode", "copy"))
         )
@@ -621,15 +623,51 @@ class MixCreatorApp(ctk.CTk):
         )
         self.diagnostics_subfolders_checkbox.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=4)
 
-        ctk.CTkLabel(diag_card, text="Cartella di output").grid(row=3, column=0, sticky="w", padx=10, pady=5)
+        self.diagnostics_winlive_group_label = ctk.CTkLabel(
+            diag_card,
+            text="Verifica WinLive",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.diagnostics_winlive_group_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
+
+        self.diagnostics_winlive_checkbox = ctk.CTkCheckBox(
+            diag_card,
+            text="Verifica TAG WinLive",
+            variable=self.diagnostics_verify_winlive_var,
+            command=self._on_diagnostics_winlive_toggle,
+        )
+        self.diagnostics_winlive_checkbox.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=2)
+        self._add_tooltip(
+            self.diagnostics_winlive_checkbox,
+            "Controlla la presenza e la correttezza\n"
+            "dei TAG WinLive (testo e accordi)\n"
+            "e include i risultati nei report.",
+        )
+
+        self.diagnostics_winlive_autocorrect_checkbox = ctk.CTkCheckBox(
+            diag_card,
+            text="Correggi automaticamente\ngli errori normalizzabili",
+            variable=self.diagnostics_winlive_autocorrect_var,
+            command=self._on_diagnostics_winlive_autocorrect_toggle,
+        )
+        self.diagnostics_winlive_autocorrect_checkbox.grid(row=5, column=0, columnspan=3, sticky="w", padx=30, pady=(0, 4))
+        self._add_tooltip(
+            self.diagnostics_winlive_autocorrect_checkbox,
+            "Applica esclusivamente\n"
+            "le normalizzazioni sicure\n"
+            "previste dal motore WinLive.",
+        )
+        self._sync_diagnostics_winlive_controls_state()
+
+        ctk.CTkLabel(diag_card, text="Cartella di output").grid(row=6, column=0, sticky="w", padx=10, pady=5)
         self.diagnostics_output_entry = ctk.CTkEntry(diag_card)
-        self.diagnostics_output_entry.grid(row=3, column=1, sticky="ew", padx=6, pady=5)
+        self.diagnostics_output_entry.grid(row=6, column=1, sticky="ew", padx=6, pady=5)
         ctk.CTkButton(diag_card, text="Sfoglia", width=84, command=self.select_diagnostics_output).grid(
-            row=3, column=2, sticky="e", padx=10, pady=5
+            row=6, column=2, sticky="e", padx=10, pady=5
         )
 
         ctk.CTkLabel(diag_card, text="Al termine dell'analisi:").grid(
-            row=4,
+            row=7,
             column=0,
             sticky="w",
             padx=10,
@@ -642,7 +680,7 @@ class MixCreatorApp(ctk.CTk):
             value="copy",
             command=self._on_diagnostics_placement_mode_changed,
         )
-        self.diagnostics_placement_copy_radio.grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=2)
+        self.diagnostics_placement_copy_radio.grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=2)
 
         self.diagnostics_placement_move_radio = ctk.CTkRadioButton(
             diag_card,
@@ -651,10 +689,10 @@ class MixCreatorApp(ctk.CTk):
             value="move",
             command=self._on_diagnostics_placement_mode_changed,
         )
-        self.diagnostics_placement_move_radio.grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.diagnostics_placement_move_radio.grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
         buttons_frame = ctk.CTkFrame(diag_card, fg_color="transparent")
-        buttons_frame.grid(row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
+        buttons_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
         buttons_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self.diagnostics_analyze_button = ctk.CTkButton(
@@ -687,14 +725,14 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_stop_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         self.diagnostics_progress = ctk.CTkProgressBar(diag_card)
-        self.diagnostics_progress.grid(row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
+        self.diagnostics_progress.grid(row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
         self.diagnostics_progress.set(0)
 
         self.diagnostics_status_label = ctk.CTkLabel(diag_card, text="Pronto", anchor="w")
-        self.diagnostics_status_label.grid(row=9, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 2))
+        self.diagnostics_status_label.grid(row=12, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 2))
 
         counters_frame = ctk.CTkFrame(diag_card, fg_color="transparent")
-        counters_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
+        counters_frame.grid(row=13, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
         counters_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.diagnostics_count_label = ctk.CTkLabel(counters_frame, text="File analizzati: 0 / 0", anchor="w")
@@ -705,10 +743,27 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_eta_label.grid(row=0, column=2, sticky="w")
 
         self.diagnostics_log_box = ctk.CTkTextbox(diag_card, height=130)
-        self.diagnostics_log_box.grid(row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
+        self.diagnostics_log_box.grid(row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
         self.diagnostics_log_box.configure(state="disabled")
 
     def _on_diagnostics_placement_mode_changed(self) -> None:
+        self.save_settings()
+
+    def _sync_diagnostics_winlive_controls_state(self) -> None:
+        main_enabled = bool(self.diagnostics_verify_winlive_var.get())
+        if not main_enabled and bool(self.diagnostics_winlive_autocorrect_var.get()):
+            self.diagnostics_winlive_autocorrect_var.set(False)
+
+        if hasattr(self, "diagnostics_winlive_autocorrect_checkbox"):
+            self.diagnostics_winlive_autocorrect_checkbox.configure(
+                state="normal" if main_enabled else "disabled"
+            )
+
+    def _on_diagnostics_winlive_toggle(self) -> None:
+        self._sync_diagnostics_winlive_controls_state()
+        self.save_settings()
+
+    def _on_diagnostics_winlive_autocorrect_toggle(self) -> None:
         self.save_settings()
 
     def _build_right_panel(self) -> None:
@@ -1182,10 +1237,17 @@ class MixCreatorApp(ctk.CTk):
             else:
                 self.exclude_unrecoverable_checkbox.deselect()
 
+            self.diagnostics_verify_winlive_var.set(bool(self.settings.get("diagnostics_verify_winlive", False)))
+            self.diagnostics_winlive_autocorrect_var.set(bool(self.settings.get("diagnostics_winlive_autocorrect", False)))
+            self._sync_diagnostics_winlive_controls_state()
+
             placement_mode = str(self.settings.get("diagnostics_placement_mode", "copy")).strip().lower()
             if placement_mode not in ("copy", "move"):
                 placement_mode = "copy"
             self.diagnostics_placement_mode_var.set(placement_mode)
+            self.diagnostics_verify_winlive_var.set(bool(self.settings.get("diagnostics_verify_winlive", False)))
+            self.diagnostics_winlive_autocorrect_var.set(bool(self.settings.get("diagnostics_winlive_autocorrect", False)))
+            self._sync_diagnostics_winlive_controls_state()
 
             self.reuse_previous_clips_var.set(False)
             self.appearance_combo.set(self.settings["appearance_mode"])
@@ -1270,6 +1332,13 @@ class MixCreatorApp(ctk.CTk):
             self.diagnostics_placement_copy_radio.configure(state="disabled" if is_diag_running else "normal")
         if hasattr(self, "diagnostics_placement_move_radio"):
             self.diagnostics_placement_move_radio.configure(state="disabled" if is_diag_running else "normal")
+        if hasattr(self, "diagnostics_winlive_checkbox"):
+            self.diagnostics_winlive_checkbox.configure(state="disabled" if is_diag_running else "normal")
+        if hasattr(self, "diagnostics_winlive_autocorrect_checkbox"):
+            can_edit_autocorrect = (not is_diag_running) and bool(self.diagnostics_verify_winlive_var.get())
+            self.diagnostics_winlive_autocorrect_checkbox.configure(
+                state="normal" if can_edit_autocorrect else "disabled"
+            )
 
     def _mark_project_dirty(self) -> None:
         if self._suspend_project_dirty_tracking:
@@ -4213,6 +4282,8 @@ class MixCreatorApp(ctk.CTk):
                 "normalize_audio": bool(self.normalize_checkbox.get()),
                 "continue_short_tracks": bool(self.short_checkbox.get()),
                 "exclude_unrecoverable_from_mix": bool(self.exclude_unrecoverable_var.get()),
+                "diagnostics_verify_winlive": bool(self.diagnostics_verify_winlive_var.get()),
+                "diagnostics_winlive_autocorrect": bool(self.diagnostics_winlive_autocorrect_var.get()),
                 "diagnostics_placement_mode": str(self.diagnostics_placement_mode_var.get() or "copy").strip().lower(),
                 "appearance_mode": self.appearance_combo.get()
             }

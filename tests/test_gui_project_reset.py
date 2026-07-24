@@ -137,6 +137,10 @@ class GuiProjectResetTests(unittest.TestCase):
     def test_diagnostics_placement_mode_defaults_to_copy(self) -> None:
         self.assertEqual(str(self.app.diagnostics_placement_mode_var.get()), "copy")
 
+    def test_diagnostics_winlive_defaults_are_disabled(self) -> None:
+        self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+
     def test_diagnostics_window_reuses_single_instance(self) -> None:
         self.app.open_diagnostics_window()
         first = self.app.diagnostics_window
@@ -151,6 +155,83 @@ class GuiProjectResetTests(unittest.TestCase):
         self.app.open_diagnostics_window()
         self.assertTrue(hasattr(self.app, "diagnostics_reverify_button"))
         self.assertEqual(str(self.app.diagnostics_reverify_button.cget("text")), "Riverifica file problematici")
+
+    def test_diagnostics_winlive_checkboxes_exist_and_positioned_under_subfolders(self) -> None:
+        self.app.open_diagnostics_window()
+        self.assertTrue(hasattr(self.app, "diagnostics_winlive_checkbox"))
+        self.assertTrue(hasattr(self.app, "diagnostics_winlive_autocorrect_checkbox"))
+
+        subfolders_row = int(self.app.diagnostics_subfolders_checkbox.grid_info().get("row", 0))
+        winlive_row = int(self.app.diagnostics_winlive_checkbox.grid_info().get("row", 0))
+        autocorrect_row = int(self.app.diagnostics_winlive_autocorrect_checkbox.grid_info().get("row", 0))
+        output_row = int(self.app.diagnostics_output_entry.grid_info().get("row", 0))
+
+        self.assertEqual(winlive_row, subfolders_row + 2)
+        self.assertEqual(autocorrect_row, winlive_row + 1)
+        self.assertGreater(output_row, autocorrect_row)
+
+    def test_diagnostics_winlive_autocorrect_starts_disabled(self) -> None:
+        self.app.open_diagnostics_window()
+        self.assertEqual(str(self.app.diagnostics_winlive_checkbox.cget("text")), "Verifica TAG WinLive")
+        self.assertEqual(
+            str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("text")),
+            "Correggi automaticamente\ngli errori normalizzabili",
+        )
+        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
+
+    def test_diagnostics_winlive_toggle_enables_and_disables_autocorrect(self) -> None:
+        self.app.open_diagnostics_window()
+
+        self.app.diagnostics_verify_winlive_var.set(True)
+        self.app._on_diagnostics_winlive_toggle()
+        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "normal")
+
+        self.app.diagnostics_winlive_autocorrect_var.set(True)
+        self.app._on_diagnostics_winlive_autocorrect_toggle()
+        self.assertTrue(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+
+        self.app.diagnostics_verify_winlive_var.set(False)
+        self.app._on_diagnostics_winlive_toggle()
+        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
+        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+
+    def test_diagnostics_winlive_tooltips_exist(self) -> None:
+        self.app.open_diagnostics_window()
+        tooltip_texts = [tip.text for tip in self.app.tooltips]
+        self.assertIn(
+            "Controlla la presenza e la correttezza\n"
+            "dei TAG WinLive (testo e accordi)\n"
+            "e include i risultati nei report.",
+            tooltip_texts,
+        )
+        self.assertIn(
+            "Applica esclusivamente\n"
+            "le normalizzazioni sicure\n"
+            "previste dal motore WinLive.",
+            tooltip_texts,
+        )
+
+    def test_diagnostics_winlive_settings_are_saved_and_restored(self) -> None:
+        saved_payload: dict[str, object] = {}
+        original_save = self.app.settings_manager.save
+        self.app.settings_manager.save = lambda payload: saved_payload.update(dict(payload))
+        try:
+            self.app.diagnostics_verify_winlive_var.set(True)
+            self.app.diagnostics_winlive_autocorrect_var.set(True)
+            self.app.save_settings()
+        finally:
+            self.app.settings_manager.save = original_save
+
+        self.assertTrue(bool(saved_payload.get("diagnostics_verify_winlive")))
+        self.assertTrue(bool(saved_payload.get("diagnostics_winlive_autocorrect")))
+
+        self.app.settings["diagnostics_verify_winlive"] = True
+        self.app.settings["diagnostics_winlive_autocorrect"] = True
+        self.app._load_settings_into_ui()
+        self.app.open_diagnostics_window()
+        self.assertTrue(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertTrue(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "normal")
 
     def test_diagnostics_reverify_button_disabled_while_running(self) -> None:
         self.app.open_diagnostics_window()
