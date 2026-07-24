@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypedDict
 
 from audio_engine import (
     AudioEngine,
@@ -34,6 +34,12 @@ ErrorCallback = Callable[[str], None]
 CancelledCallback = Callable[[str], None]
 ExtractCompletedCallback = Callable[[dict[str, Any]], None]
 DiagnosticsCompletedCallback = Callable[[dict[str, Any]], None]
+
+
+class DiagnosticsRunResult(TypedDict, total=False):
+    summary: dict[str, Any]
+    report_paths: dict[str, str]
+    diagnostic_results: list[Any]
 
 
 class MixWorker:
@@ -301,6 +307,7 @@ class MP3DiagnosticsWorker:
         repair_mode: bool,
         placement_mode: str,
         selected_input_files: Optional[list[Path]] = None,
+        verify_winlive: bool = False,
     ) -> None:
         if self._running:
             raise RuntimeError("È già in corso una diagnostica MP3.")
@@ -317,6 +324,7 @@ class MP3DiagnosticsWorker:
                 "repair_mode": repair_mode,
                 "placement_mode": placement_mode,
                 "selected_input_files": selected_input_files,
+                "verify_winlive": verify_winlive,
             },
             daemon=True,
         )
@@ -327,12 +335,12 @@ class MP3DiagnosticsWorker:
             return
         self._cancel_event.set()
 
-    def _run(self, **kwargs) -> None:
+    def _run(self, **kwargs: Any) -> None:
         try:
             self._emit_progress(0, 100, "Inizializzazione diagnostica MP3...")
 
             self._engine = MP3DiagnosticsEngine()
-            summary = self._engine.run_diagnostics(
+            result: DiagnosticsRunResult = self._engine.run_diagnostics(
                 progress_callback=self._emit_progress,
                 cancel_event=self._cancel_event,
                 **kwargs,
@@ -347,7 +355,7 @@ class MP3DiagnosticsWorker:
                 f"{error}"
             )
         else:
-            self._emit_completed(summary)
+            self._emit_completed(result)
         finally:
             self._engine = None
             self._running = False
@@ -357,7 +365,7 @@ class MP3DiagnosticsWorker:
         if self.on_progress is not None:
             self.on_progress(current, total, message)
 
-    def _emit_completed(self, summary: dict[str, Any]) -> None:
+    def _emit_completed(self, summary: DiagnosticsRunResult) -> None:
         if self.on_completed is not None:
             self.on_completed(summary)
 
