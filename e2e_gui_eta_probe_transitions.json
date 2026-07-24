@@ -1,0 +1,30 @@
+[
+  {
+    "state": "before_start",
+    "eta": "Tempo stimato: --"
+  },
+  {
+    "state": "preparing",
+    "eta": "Tempo stimato: calcolo in corso..."
+  },
+  {
+    "state": "after_first_file",
+    "eta": "Tempo stimato: 16 secondi"
+  },
+  {
+    "state": "after_second_file",
+    "eta": "Tempo stimato: 6 secondi"
+  },
+  {
+    "state": "completed",
+    "eta": "Tempo stimato: completato"
+  },
+  {
+    "state": "cancelled",
+    "eta": "Tempo stimato: annullato"
+  },
+  {
+    "state": "error",
+    "eta": "Tempo stimato: non disponibile"
+  }
+]

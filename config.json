@@ -1,0 +1,15 @@
+{
+    "input_folder": "C:/TestMP3",
+    "output_folder": "C:/TestMP3",
+    "output_name": "MixFinale",
+    "clip_seconds": 50,
+    "crossfade_seconds": 3,
+    "fade_in_seconds": 2,
+    "fade_out_seconds": 2,
+    "bitrate": "320k",
+    "cut_mode": "casuale",
+    "random_order": true,
+    "normalize_audio": true,
+    "continue_short_tracks": true,
+    "appearance_mode": "Dark"
+}
