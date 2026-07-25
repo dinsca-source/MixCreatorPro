@@ -22,9 +22,12 @@ from mp3_diagnostics import (
     MP3DiagnosticsCancelled,
     MP3DiagnosticsEngine,
     OUTPUT_FOLDER_OK,
+    OUTPUT_FOLDER_INTEGRITY_ROOT,
     OUTPUT_FOLDER_REPAIRED,
+    OUTPUT_FOLDER_REPORT,
     OUTPUT_FOLDER_UNRECOVERABLE,
     OUTPUT_FOLDER_PROCESSED_ORIGINALS,
+    OUTPUT_SESSION_PREFIX,
     OUTPUT_FOLDER_TEMP,
     PLACEMENT_MODE_COPY,
     PLACEMENT_MODE_MOVE,
@@ -176,6 +179,12 @@ class _ScenarioEngine(MP3DiagnosticsEngine):
         return metrics
 
 
+class _FixedSessionScenarioEngine(_ScenarioEngine):
+    @staticmethod
+    def _session_timestamp_token() -> str:
+        return "2026-01-02_03-04-05"
+
+
 class MP3DiagnosticsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -209,6 +218,9 @@ class MP3DiagnosticsTests(unittest.TestCase):
         path = Path(result["report_paths"]["csv_problems"])
         with path.open("r", encoding="utf-8", newline="") as handle:
             return list(csv.DictReader(handle))
+
+    def _session_root(self, result: dict[str, object]) -> Path:
+        return Path(result["summary"]["output_folder"])
 
     def _issue(self, key: str, start: str, detail: str) -> DiagnosticIssue:
         return DiagnosticIssue(
@@ -582,11 +594,43 @@ class MP3DiagnosticsTests(unittest.TestCase):
             selected_input_files=[selected],
         )
         row = self._summary_rows(result)[0]
+        session_root = self._session_root(result)
+        integrity_root = session_root / OUTPUT_FOLDER_INTEGRITY_ROOT
 
-        self.assertTrue((self.output_dir / OUTPUT_FOLDER_OK).is_dir())
-        self.assertTrue((self.output_dir / OUTPUT_FOLDER_REPAIRED).is_dir())
-        self.assertTrue((self.output_dir / OUTPUT_FOLDER_UNRECOVERABLE).is_dir())
+        self.assertTrue(session_root.name.startswith(OUTPUT_SESSION_PREFIX))
+        self.assertTrue((integrity_root / OUTPUT_FOLDER_OK).is_dir())
+        self.assertTrue((integrity_root / OUTPUT_FOLDER_REPAIRED).is_dir())
+        self.assertTrue((integrity_root / OUTPUT_FOLDER_UNRECOVERABLE).is_dir())
+        self.assertTrue((session_root / OUTPUT_FOLDER_PROCESSED_ORIGINALS).is_dir())
+        self.assertTrue((session_root / OUTPUT_FOLDER_REPORT).is_dir())
         self.assertEqual(row["Categoria finale"], OUTPUT_FOLDER_OK)
+
+    def test_session_timestamp_is_reused_across_output_paths(self) -> None:
+        engine = _FixedSessionScenarioEngine(
+            before_issues=[],
+            after_issues=[],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=self.default_bounds,
+            issue_stats={},
+        )
+        result = engine.run_diagnostics(
+            input_folder=str(self.input_dir),
+            include_subfolders=False,
+            output_folder=str(self.output_dir),
+            repair_mode=False,
+            placement_mode=PLACEMENT_MODE_COPY,
+        )
+        session_root = self._session_root(result)
+        row = self._summary_rows(result)[0]
+
+        self.assertEqual(session_root.name, "Diagnostica_MP3_2026-01-02_03-04-05")
+        self.assertTrue(Path(result["report_paths"]["csv_summary"]).is_relative_to(session_root))
+        self.assertEqual(Path(result["report_paths"]["csv_summary"]).name, "report_diagnostica_2026-01-02_03-04-05.csv")
+        self.assertEqual(Path(result["report_paths"]["xlsx"]).name, "report_diagnostica_2026-01-02_03-04-05.xlsx")
+        self.assertEqual(Path(result["report_paths"]["html"]).name, "report_diagnostica.html")
+        self.assertTrue(Path(row["Percorso finale"]).is_relative_to(session_root))
 
     def test_final_counts_three_categories_are_consistent(self) -> None:
         issue = self._issue("undecodable_frames", "00:00:15.000", "center")
@@ -734,6 +778,87 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertEqual(row["Categoria finale"], OUTPUT_FOLDER_REPAIRED)
         self.assertEqual(row["Originale conservato"], "SI")
         self.assertIn(OUTPUT_FOLDER_PROCESSED_ORIGINALS, row["Percorso originale conservato"])
+
+    def test_copy_mode_repaired_keeps_original_in_safety_folder(self) -> None:
+        issue = self._issue("undecodable_frames", "00:00:15.000", "center")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[],
+            repair_ok=True,
+            significant_blocking_before=True,
+            significant_blocking_after=False,
+            bounds=self.default_bounds,
+            issue_stats={"center": (-20.0, -10.0)},
+        )
+        result = engine.run_diagnostics(
+            input_folder=str(self.input_dir),
+            include_subfolders=False,
+            output_folder=str(self.output_dir),
+            repair_mode=True,
+            placement_mode=PLACEMENT_MODE_COPY,
+        )
+        row = self._summary_rows(result)[0]
+
+        self.assertEqual(row["Categoria finale"], OUTPUT_FOLDER_REPAIRED)
+        self.assertEqual(row["Originale conservato"], "SI")
+        self.assertIn(OUTPUT_FOLDER_PROCESSED_ORIGINALS, row["Percorso originale conservato"])
+        self.assertTrue(Path(row["Percorso originale conservato"]).is_file())
+
+    def test_copy_mode_unmodified_does_not_create_safety_backup(self) -> None:
+        engine = _ScenarioEngine(
+            before_issues=[],
+            after_issues=[],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=self.default_bounds,
+            issue_stats={},
+        )
+        result = engine.run_diagnostics(
+            input_folder=str(self.input_dir),
+            include_subfolders=False,
+            output_folder=str(self.output_dir),
+            repair_mode=False,
+            placement_mode=PLACEMENT_MODE_COPY,
+        )
+        session_root = self._session_root(result)
+        safety_dir = session_root / OUTPUT_FOLDER_PROCESSED_ORIGINALS
+
+        self.assertTrue(safety_dir.is_dir())
+        self.assertEqual(list(safety_dir.rglob("*.mp3")), [])
+
+    def test_safety_backup_handles_duplicate_names_without_overwrite(self) -> None:
+        first = self.input_dir / "disc_a" / "song.mp3"
+        second = self.input_dir / "disc_b" / "song.mp3"
+        first.parent.mkdir(parents=True, exist_ok=True)
+        second.parent.mkdir(parents=True, exist_ok=True)
+        first.write_bytes(b"broken-a")
+        second.write_bytes(b"broken-b")
+
+        issue = self._issue("undecodable_frames", "00:00:15.000", "center")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[],
+            repair_ok=True,
+            significant_blocking_before=True,
+            significant_blocking_after=False,
+            bounds=self.default_bounds,
+            issue_stats={"center": (-20.0, -10.0)},
+        )
+        result = engine.run_diagnostics(
+            input_folder=str(self.input_dir),
+            include_subfolders=False,
+            output_folder=str(self.output_dir),
+            repair_mode=True,
+            placement_mode=PLACEMENT_MODE_COPY,
+            selected_input_files=[first, second],
+        )
+        session_root = self._session_root(result)
+        safety_dir = session_root / OUTPUT_FOLDER_PROCESSED_ORIGINALS
+        safety_files = sorted(safety_dir.glob("song*.mp3"), key=lambda p: p.name)
+
+        self.assertEqual(len(safety_files), 2)
+        self.assertNotEqual(safety_files[0].name, safety_files[1].name)
 
     def test_cancel_during_segmented_localization(self) -> None:
         class _CancelEngine(_ScenarioEngine):

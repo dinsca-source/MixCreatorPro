@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import tempfile
+import hashlib
+import time
 from dataclasses import dataclass
 from enum import Enum
 
@@ -22,7 +24,10 @@ from winlive_tags import (
     WinLiveStructureState,
     parse_winlive_blocks_strict,
 )
-from winlive_validation import AudioHashResult, ByteRegion, compute_mpeg_audio_hash, parse_audio_hash_plan
+from winlive_validation import (
+    ByteRegion,
+    validate_normalized_winlive_file,
+)
 
 
 class WinLiveWriteErrorCode(str, Enum):
@@ -80,6 +85,9 @@ class WinLiveWriteValidationResult:
     encoding_used: str | None
     encoding_converted: bool
     encoding_lossless: bool
+    rewrite_metrics: dict[str, object]
+    phase_times_ms: dict[str, float]
+    diagnostic_counters: dict[str, int]
 
 
 def detect_text_encoding(raw_bytes: bytes, preferred_encoding: str | None = None) -> EncodingReport:
@@ -163,25 +171,53 @@ def write_normalized_winlive_copy(
 ) -> WinLiveWriteValidationResult:
     notes: list[str] = []
     temp_path: str | None = None
+    phase_times_ms: dict[str, float] = {}
+    counters: dict[str, int] = {
+        "read_original": 0,
+        "parse_original": 0,
+        "normalize": 0,
+        "idempotence_normalize": 0,
+        "write_temp": 0,
+        "read_temp": 0,
+        "parse_temp": 0,
+        "significant_text_extract": 0,
+        "compare_chord": 0,
+        "hash_segments": 0,
+        "retry_write": 0,
+        "retry_read": 0,
+        "retry_delete": 0,
+        "copy_promote": 0,
+    }
+    safe_write_start = time.perf_counter()
 
     try:
+        read_start = time.perf_counter()
         with open(source_path, "rb") as source_file:
             original_data = source_file.read()
+        counters["read_original"] += 1
+        phase_times_ms["lettura_file"] = max(0.0, (time.perf_counter() - read_start) * 1000.0)
     except OSError as exc:
         return _result_error(
             code=WinLiveWriteErrorCode.READ_FAILED,
             message=f"Lettura originale fallita: {exc}",
             notes=notes,
             temporary_path=None,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
+    parse_start = time.perf_counter()
     parsed = parse_winlive_blocks_strict(original_data)
+    counters["parse_original"] += 1
+    phase_times_ms["ricerca_blocchi_wl5"] = max(0.0, (time.perf_counter() - parse_start) * 1000.0)
     if parsed.synct.state != WinLiveStructureState.VALID or parsed.chord.state != WinLiveStructureState.VALID:
         return _result_error(
             code=WinLiveWriteErrorCode.INVALID_STRUCTURE,
             message="Struttura WinLive non valida: scrittura temporanea rifiutata.",
             notes=notes,
             temporary_path=None,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     if parsed.synct.open_offset is None or parsed.synct.close_offset is None:
@@ -190,6 +226,8 @@ def write_normalized_winlive_copy(
             message="Offset SYNCT mancanti.",
             notes=notes,
             temporary_path=None,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     if parsed.chord.open_offset is None or parsed.chord.close_offset is None:
@@ -198,22 +236,20 @@ def write_normalized_winlive_copy(
             message="Offset CHORD mancanti.",
             notes=notes,
             temporary_path=None,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
-    if not (parsed.synct.open_offset < parsed.synct.close_offset < parsed.chord.open_offset < parsed.chord.close_offset):
+    synct_block_start = int(parsed.synct.open_offset)
+    synct_block_end = int(parsed.synct.close_offset) + len(TAG_SYNCT_CLOSE)
+    if synct_block_end <= synct_block_start:
         return _result_error(
             code=WinLiveWriteErrorCode.AMBIGUOUS_STRUCTURE,
-            message="Offset blocchi WinLive incoerenti o sovrapposti.",
+            message="Offset WL5SYNCT incoerenti.",
             notes=notes,
             temporary_path=None,
-        )
-
-    if _contains_winlive_markers(parsed.trailing_bytes) or _contains_winlive_markers(parsed.between_bytes):
-        return _result_error(
-            code=WinLiveWriteErrorCode.AMBIGUOUS_STRUCTURE,
-            message="Marker WinLive extra rilevati fuori dai blocchi autorizzati.",
-            notes=notes,
-            temporary_path=None,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     synct_raw = parsed.synct.content_bytes or b""
@@ -227,6 +263,7 @@ def write_normalized_winlive_copy(
             notes=notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
         )
 
     chord_decoded = decode_text_lossless(chord_raw, preferred_encoding=synct_decoded.report.used_encoding)
@@ -237,9 +274,11 @@ def write_normalized_winlive_copy(
             notes=notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
         )
 
     normalized = normalize_synct_content(synct_decoded.text)
+    counters["normalize"] += 1
     if not normalized.text_semantically_valid:
         return _result_error(
             code=WinLiveWriteErrorCode.NORMALIZATION_INVALID,
@@ -247,9 +286,12 @@ def write_normalized_winlive_copy(
             notes=notes + normalized.notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     second_pass = normalize_synct_content(normalized.normalized_text)
+    counters["idempotence_normalize"] += 1
     if second_pass.normalized_text != normalized.normalized_text or not second_pass.text_semantically_valid:
         return _result_error(
             code=WinLiveWriteErrorCode.NON_IDEMPOTENT_NORMALIZATION,
@@ -257,6 +299,8 @@ def write_normalized_winlive_copy(
             notes=notes + second_pass.notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     if synct_decoded.report.used_encoding is None:
@@ -266,6 +310,8 @@ def write_normalized_winlive_copy(
             notes=notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     encoded_synct, encode_error = encode_text_strict(normalized.normalized_text, synct_decoded.report.used_encoding)
@@ -276,34 +322,40 @@ def write_normalized_winlive_copy(
             notes=notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
-    rebuilt = (
-        parsed.prefix_bytes
-        + TAG_SYNCT_OPEN
-        + encoded_synct
-        + TAG_SYNCT_CLOSE
-        + parsed.between_bytes
-        + TAG_CHORD_OPEN
-        + chord_raw
-        + TAG_CHORD_CLOSE
-        + parsed.trailing_bytes
-    )
+    build_start = time.perf_counter()
+    new_synct_block = TAG_SYNCT_OPEN + encoded_synct + TAG_SYNCT_CLOSE
+    rebuilt = original_data[:synct_block_start] + new_synct_block + original_data[synct_block_end:]
+    phase_times_ms["costruzione_nuovi_bytes"] = max(0.0, (time.perf_counter() - build_start) * 1000.0)
 
     try:
+        write_start = time.perf_counter()
         temp_path = _write_temp_file(rebuilt, temp_dir)
+        counters["write_temp"] += 1
+        phase_times_ms["scrittura_temporaneo_totale_ms"] = max(0.0, (time.perf_counter() - write_start) * 1000.0)
+        phase_times_ms.update(_LAST_TEMP_WRITE_PHASES)
     except OSError as exc:
+        if isinstance(exc, PermissionError):
+            notes.append(f"WRITE_TEMP PermissionError: {exc}")
         return _result_error(
             code=WinLiveWriteErrorCode.WRITE_FAILED,
             message=f"Scrittura temporanea fallita: {exc}",
             notes=notes,
             temporary_path=None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     try:
+        readback_start = time.perf_counter()
         with open(temp_path, "rb") as temp_file:
             copy_data = temp_file.read()
+        counters["read_temp"] += 1
+        phase_times_ms["rilettura_temporaneo"] = max(0.0, (time.perf_counter() - readback_start) * 1000.0)
     except OSError as exc:
         _cleanup_if_needed(temp_path, keep_temporary_on_failure)
         return _result_error(
@@ -312,7 +364,17 @@ def write_normalized_winlive_copy(
             notes=notes,
             temporary_path=temp_path if keep_temporary_on_failure else None,
             encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
+
+    rewrite_metrics = _build_rewrite_metrics(
+        original_data=original_data,
+        copy_data=copy_data,
+        original_synct_start=synct_block_start,
+        original_synct_end=synct_block_end,
+        new_synct_block=new_synct_block,
+    )
 
     validation_result = _validate_written_copy(
         original_data=original_data,
@@ -322,11 +384,18 @@ def write_normalized_winlive_copy(
         original_encoding=synct_decoded.report,
         temporary_path=temp_path,
         text_was_modified=normalized.changed,
+        rewrite_metrics=rewrite_metrics,
+        phase_times_ms=phase_times_ms,
+        counters=counters,
     )
 
     if validation_result.error_code is not None and not keep_temporary_on_failure:
         cleanup_temporary_copy(temp_path)
+        counters["retry_delete"] += 0
         validation_result.temporary_path = None
+
+    validation_result.phase_times_ms["safe_write_totale_ms"] = (time.perf_counter() - safe_write_start) * 1000.0
+    validation_result.phase_times_ms["tempo_non_attribuito_ms"] = _compute_unattributed_time(validation_result.phase_times_ms)
 
     return validation_result
 
@@ -347,14 +416,33 @@ def _contains_winlive_markers(data: bytes) -> bool:
 
 
 def _write_temp_file(content: bytes, temp_dir: str) -> str:
+    global _LAST_TEMP_WRITE_PHASES
+    _LAST_TEMP_WRITE_PHASES = {
+        "apertura_temporaneo": 0.0,
+        "scrittura_bytes_temporaneo": 0.0,
+        "flush_temporaneo": 0.0,
+        "fsync_temporaneo": 0.0,
+        "chiusura_temporaneo": 0.0,
+        "attesa_disponibilita_temporaneo": 0.0,
+    }
+    open_start = time.perf_counter()
     handle = tempfile.NamedTemporaryFile(mode="wb", suffix=".tmp", prefix="wl5_", dir=temp_dir, delete=False)
+    _LAST_TEMP_WRITE_PHASES["apertura_temporaneo"] = (time.perf_counter() - open_start) * 1000.0
     try:
+        write_start = time.perf_counter()
         handle.write(content)
+        _LAST_TEMP_WRITE_PHASES["scrittura_bytes_temporaneo"] = (time.perf_counter() - write_start) * 1000.0
+        flush_start = time.perf_counter()
         handle.flush()
+        _LAST_TEMP_WRITE_PHASES["flush_temporaneo"] = (time.perf_counter() - flush_start) * 1000.0
         if hasattr(os, "fsync"):
+            fsync_start = time.perf_counter()
             os.fsync(handle.fileno())
+            _LAST_TEMP_WRITE_PHASES["fsync_temporaneo"] = (time.perf_counter() - fsync_start) * 1000.0
     finally:
+        close_start = time.perf_counter()
         handle.close()
+        _LAST_TEMP_WRITE_PHASES["chiusura_temporaneo"] = (time.perf_counter() - close_start) * 1000.0
     return handle.name
 
 
@@ -366,11 +454,47 @@ def _validate_written_copy(
     original_encoding: EncodingReport,
     temporary_path: str,
     text_was_modified: bool,
+    rewrite_metrics: dict[str, object],
+    phase_times_ms: dict[str, float],
+    counters: dict[str, int],
 ) -> WinLiveWriteValidationResult:
     notes: list[str] = []
+    validation_start = time.perf_counter()
 
+    strict_start = time.perf_counter()
+    strict_validation = validate_normalized_winlive_file(
+        original_data=original_data,
+        candidate_data=copy_data,
+    )
+    phase_times_ms["validazione_strict_struttura"] = (time.perf_counter() - strict_start) * 1000.0
+    counters["parse_temp"] += 1
+    counters["significant_text_extract"] += 2
+    if not strict_validation.valid:
+        code = WinLiveWriteErrorCode.READBACK_INVALID_STRUCTURE
+        if strict_validation.reason_code in {"MEANINGFUL_TEXT_LOST", "MEANINGFUL_TEXT_CHANGED"}:
+            code = WinLiveWriteErrorCode.TEXT_MISMATCH
+        elif strict_validation.reason_code == "CHORD_CHANGED":
+            code = WinLiveWriteErrorCode.CHORD_MISMATCH
+        notes.append(f"{strict_validation.reason_code}: {strict_validation.reason_message}")
+        return _result_error(
+            code=code,
+            message=strict_validation.reason_message,
+            notes=notes,
+            temporary_path=temporary_path,
+            encoding_report=original_encoding,
+            write_succeeded=True,
+            readback_succeeded=True,
+            winlive_structure_valid=False,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
+        )
+
+    parse_temp_start = time.perf_counter()
     parsed_original = parse_winlive_blocks_strict(original_data)
     parsed_copy = parse_winlive_blocks_strict(copy_data)
+    phase_times_ms["ricerca_blocchi_temporaneo"] = (time.perf_counter() - parse_temp_start) * 1000.0
+    counters["parse_temp"] += 2
 
     structure_ok = (
         parsed_copy.synct.state == WinLiveStructureState.VALID
@@ -395,6 +519,9 @@ def _validate_written_copy(
             write_succeeded=True,
             readback_succeeded=True,
             winlive_structure_valid=False,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     copy_synct_raw = parsed_copy.synct.content_bytes or b""
@@ -411,6 +538,9 @@ def _validate_written_copy(
             write_succeeded=True,
             readback_succeeded=True,
             winlive_structure_valid=True,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     copy_synct_decoded = _decode_with_encoding(copy_synct_raw, encoding_used)
@@ -424,6 +554,9 @@ def _validate_written_copy(
             write_succeeded=True,
             readback_succeeded=True,
             winlive_structure_valid=True,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     copy_chord_decoded = _decode_with_encoding(copy_chord_raw, encoding_used)
@@ -437,6 +570,9 @@ def _validate_written_copy(
             write_succeeded=True,
             readback_succeeded=True,
             winlive_structure_valid=True,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
     text_matches = copy_synct_decoded == expected_synct_text
@@ -451,8 +587,12 @@ def _validate_written_copy(
             readback_succeeded=True,
             winlive_structure_valid=True,
             text_matches_expected=False,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
+    counters["compare_chord"] += 1
     chords_match = copy_chord_decoded == expected_chord_text
     if not chords_match:
         return _result_error(
@@ -466,9 +606,15 @@ def _validate_written_copy(
             winlive_structure_valid=True,
             text_matches_expected=True,
             chords_match_expected=False,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
+    idempotence_start = time.perf_counter()
     idempotence_check = normalize_synct_content(copy_synct_decoded)
+    phase_times_ms["idempotenza_seconda_normalizzazione"] = (time.perf_counter() - idempotence_start) * 1000.0
+    counters["idempotence_normalize"] += 1
     idempotent = idempotence_check.normalized_text == copy_synct_decoded and idempotence_check.text_semantically_valid
     if not idempotent:
         return _result_error(
@@ -483,12 +629,14 @@ def _validate_written_copy(
             text_matches_expected=True,
             chords_match_expected=True,
             normalization_idempotent=False,
+            rewrite_metrics=rewrite_metrics,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
         )
 
-    audio_original = compute_mpeg_audio_hash(original_data)
-    audio_copy = compute_mpeg_audio_hash(copy_data)
-    audio_identical = _audio_results_match(audio_original, audio_copy)
+    audio_identical = bool(rewrite_metrics.get("prefix_equal")) and bool(rewrite_metrics.get("suffix_equal"))
 
+    metadata_start = time.perf_counter()
     metadata_preserved, prefix_preserved, postfix_preserved, metadata_notes = _compare_non_winlive_regions(
         original_data,
         copy_data,
@@ -498,7 +646,9 @@ def _validate_written_copy(
         parsed_copy.trailing_bytes,
         parsed_original.between_bytes,
         parsed_copy.between_bytes,
+        counters,
     )
+    phase_times_ms["confronto_prefisso_suffisso_metadati"] = (time.perf_counter() - metadata_start) * 1000.0
     notes.extend(metadata_notes)
 
     error_code: WinLiveWriteErrorCode | None = None
@@ -510,6 +660,10 @@ def _validate_written_copy(
     if not metadata_preserved and error_code is None:
         error_code = WinLiveWriteErrorCode.METADATA_MISMATCH
         error_message = "Regioni non WinLive modificate."
+
+    if not bool(rewrite_metrics.get("length_equation_ok", False)) and error_code is None:
+        error_code = WinLiveWriteErrorCode.METADATA_MISMATCH
+        error_message = "Lunghezza finale incoerente con il delta del blocco SYNCT."
 
     post_status = PostNormalizationValidationStatus.OK
     if error_code is not None:
@@ -525,6 +679,8 @@ def _validate_written_copy(
         )
     )
 
+    phase_times_ms["validazione_totale_ms"] = (time.perf_counter() - validation_start) * 1000.0
+
     return WinLiveWriteValidationResult(
         write_succeeded=True,
         readback_succeeded=True,
@@ -532,8 +688,8 @@ def _validate_written_copy(
         text_matches_expected=True,
         chords_match_expected=True,
         normalization_idempotent=True,
-        original_audio_hash=audio_original.audio_hash_sha256,
-        copy_audio_hash=audio_copy.audio_hash_sha256,
+        original_audio_hash=None,
+        copy_audio_hash=None,
         audio_identical=audio_identical,
         metadata_preserved=metadata_preserved,
         prefix_preserved=prefix_preserved,
@@ -547,22 +703,10 @@ def _validate_written_copy(
         encoding_used=original_encoding.used_encoding,
         encoding_converted=original_encoding.converted,
         encoding_lossless=original_encoding.lossless,
+        rewrite_metrics=rewrite_metrics,
+        phase_times_ms=phase_times_ms,
+        diagnostic_counters=counters,
     )
-
-
-def _audio_results_match(original: AudioHashResult, copy: AudioHashResult) -> bool:
-    if original.status != copy.status:
-        return False
-    if original.frames_count != copy.frames_count:
-        return False
-    if original.audio_bytes_hashed != copy.audio_bytes_hashed:
-        return False
-    if original.audio_hash_sha256 != copy.audio_hash_sha256:
-        return False
-
-    original_signature = [(frame.offset, frame.length, frame.version, frame.layer, frame.sample_rate_hz) for frame in original.frame_sequence]
-    copy_signature = [(frame.offset, frame.length, frame.version, frame.layer, frame.sample_rate_hz) for frame in copy.frame_sequence]
-    return original_signature == copy_signature
 
 
 def _compare_non_winlive_regions(
@@ -574,6 +718,7 @@ def _compare_non_winlive_regions(
     copy_postfix: bytes,
     original_between: bytes,
     copy_between: bytes,
+    counters: dict[str, int],
 ) -> tuple[bool, bool, bool, list[str]]:
     notes: list[str] = []
 
@@ -588,12 +733,13 @@ def _compare_non_winlive_regions(
     if not between_ok:
         notes.append("Regione intermedia tra SYNCT e CHORD modificata")
 
-    plan_original = parse_audio_hash_plan(original_data)
-    plan_copy = parse_audio_hash_plan(copy_data)
+    plan_original = _detect_metadata_regions(original_data)
+    plan_copy = _detect_metadata_regions(copy_data)
 
     id3v2_ok = _compare_optional_region_bytes(original_data, copy_data, plan_original.id3v2_region, plan_copy.id3v2_region)
     ape_ok = _compare_optional_region_bytes(original_data, copy_data, plan_original.ape_region, plan_copy.ape_region)
     id3v1_ok = _compare_optional_region_bytes(original_data, copy_data, plan_original.id3v1_region, plan_copy.id3v1_region)
+    counters["hash_segments"] += 3
 
     if not id3v2_ok:
         notes.append("ID3v2 modificato")
@@ -654,6 +800,9 @@ def _result_error(
     text_matches_expected: bool = False,
     chords_match_expected: bool = False,
     normalization_idempotent: bool = False,
+    rewrite_metrics: dict[str, object] | None = None,
+    phase_times_ms: dict[str, float] | None = None,
+    diagnostic_counters: dict[str, int] | None = None,
 ) -> WinLiveWriteValidationResult:
     detected = None
     used = None
@@ -682,9 +831,131 @@ def _result_error(
         error=message,
         notes=notes,
         temporary_path=temporary_path,
-        suggested_outcome=WinLiveOutcome.NORMALIZATION_NOT_VALIDATED,
+        suggested_outcome=WinLiveOutcome.MODIFICATION_NOT_INTEGRAL,
         encoding_detected=detected,
         encoding_used=used,
         encoding_converted=converted,
         encoding_lossless=lossless,
+        rewrite_metrics=dict(rewrite_metrics or {}),
+        phase_times_ms=dict(phase_times_ms or {}),
+        diagnostic_counters=dict(diagnostic_counters or {}),
     )
+
+
+def _build_rewrite_metrics(
+    *,
+    original_data: bytes,
+    copy_data: bytes,
+    original_synct_start: int,
+    original_synct_end: int,
+    new_synct_block: bytes,
+) -> dict[str, object]:
+    parsed_copy = parse_winlive_blocks_strict(copy_data)
+    if parsed_copy.synct.open_offset is None or parsed_copy.synct.close_offset is None:
+        return {
+            "original_file_len": len(original_data),
+            "temporary_file_len": len(copy_data),
+            "error": "SYNCT non parsabile nel temporaneo",
+        }
+
+    temporary_synct_start = int(parsed_copy.synct.open_offset)
+    temporary_synct_end = int(parsed_copy.synct.close_offset) + len(TAG_SYNCT_CLOSE)
+    original_block_len = original_synct_end - original_synct_start
+    new_block_len = len(new_synct_block)
+    delta_len = new_block_len - original_block_len
+    expected_len = len(original_data) - original_block_len + new_block_len
+
+    original_prefix = original_data[:original_synct_start]
+    temporary_prefix = copy_data[:temporary_synct_start]
+    original_suffix = original_data[original_synct_end:]
+    temporary_suffix = copy_data[temporary_synct_end:]
+
+    def _sha256(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    metrics: dict[str, object] = {
+        "original_file_len": len(original_data),
+        "temporary_file_len": len(copy_data),
+        "original_synct_start": original_synct_start,
+        "original_synct_end": original_synct_end,
+        "temporary_synct_start": temporary_synct_start,
+        "temporary_synct_end": temporary_synct_end,
+        "original_synct_block_len": original_block_len,
+        "new_synct_block_len": new_block_len,
+        "delta_len": delta_len,
+        "expected_file_len": expected_len,
+        "length_equation_ok": len(copy_data) == expected_len,
+        "prefix_equal": original_prefix == temporary_prefix,
+        "suffix_equal": original_suffix == temporary_suffix,
+        "prefix_hash_original": _sha256(original_prefix),
+        "prefix_hash_temporary": _sha256(temporary_prefix),
+        "suffix_hash_original": _sha256(original_suffix),
+        "suffix_hash_temporary": _sha256(temporary_suffix),
+    }
+
+    parsed_original = parse_winlive_blocks_strict(original_data)
+    original_chord = parsed_original.chord.content_bytes or b""
+    temporary_chord = parsed_copy.chord.content_bytes or b""
+    metrics["chord_equal"] = original_chord == temporary_chord
+    metrics["chord_hash_original"] = _sha256(original_chord)
+    metrics["chord_hash_temporary"] = _sha256(temporary_chord)
+    return metrics
+
+
+@dataclass(slots=True)
+class _MetadataRegions:
+    id3v2_region: ByteRegion | None
+    id3v1_region: ByteRegion | None
+    ape_region: ByteRegion | None
+
+
+def _detect_metadata_regions(data: bytes) -> _MetadataRegions:
+    return _MetadataRegions(
+        id3v2_region=_detect_id3v2_region(data),
+        id3v1_region=_detect_id3v1_region(data),
+        ape_region=_detect_apev2_footer_region(data),
+    )
+
+
+def _detect_id3v2_region(data: bytes) -> ByteRegion | None:
+    if len(data) < 10 or data[0:3] != b"ID3":
+        return None
+    size = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | ((data[8] & 0x7F) << 7) | (data[9] & 0x7F)
+    total = min(10 + size, len(data))
+    return ByteRegion(start=0, end=total)
+
+
+def _detect_id3v1_region(data: bytes) -> ByteRegion | None:
+    if len(data) < 128 or data[-128:-125] != b"TAG":
+        return None
+    return ByteRegion(start=len(data) - 128, end=len(data))
+
+
+def _detect_apev2_footer_region(data: bytes) -> ByteRegion | None:
+    marker = b"APETAGEX"
+    index = data.rfind(marker)
+    if index < 0 or index + 16 > len(data):
+        return None
+    size = int.from_bytes(data[index + 12 : index + 16], byteorder="little", signed=False)
+    if size <= 0:
+        return None
+    start = max(0, index - max(0, size - 32))
+    end = min(len(data), index + 32)
+    return ByteRegion(start=start, end=end)
+
+
+def _compute_unattributed_time(phase_times_ms: dict[str, float]) -> float:
+    total = float(phase_times_ms.get("safe_write_totale_ms", 0.0))
+    attributable_keys = (
+        "lettura_file",
+        "ricerca_blocchi_wl5",
+        "costruzione_nuovi_bytes",
+        "scrittura_temporaneo_totale_ms",
+        "rilettura_temporaneo",
+        "validazione_totale_ms",
+    )
+    subtotal = sum(float(phase_times_ms.get(key, 0.0)) for key in attributable_keys)
+    return max(0.0, total - subtotal)
+
+
+_LAST_TEMP_WRITE_PHASES: dict[str, float] = {}

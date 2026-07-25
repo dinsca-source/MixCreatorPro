@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import gui as gui_module
 from gui import MixCreatorApp
@@ -138,6 +139,18 @@ class GuiProjectResetTests(unittest.TestCase):
         self.assertEqual(str(self.app.diagnostics_placement_mode_var.get()), "copy")
 
     def test_diagnostics_winlive_defaults_are_disabled(self) -> None:
+        self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+
+    def test_diagnostics_defaults_restored_after_manual_change_and_reset(self) -> None:
+        self.app.diagnostics_verify_mp3_integrity_var.set(False)
+        self.app.diagnostics_verify_winlive_var.set(True)
+        self.app.diagnostics_winlive_autocorrect_var.set(True)
+
+        self.app._reset_to_initial_state()
+
+        self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
         self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
         self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
 
@@ -158,15 +171,18 @@ class GuiProjectResetTests(unittest.TestCase):
 
     def test_diagnostics_winlive_checkboxes_exist_and_positioned_under_subfolders(self) -> None:
         self.app.open_diagnostics_window()
+        self.assertTrue(hasattr(self.app, "diagnostics_integrity_checkbox"))
         self.assertTrue(hasattr(self.app, "diagnostics_winlive_checkbox"))
         self.assertTrue(hasattr(self.app, "diagnostics_winlive_autocorrect_checkbox"))
 
         subfolders_row = int(self.app.diagnostics_subfolders_checkbox.grid_info().get("row", 0))
+        integrity_row = int(self.app.diagnostics_integrity_checkbox.grid_info().get("row", 0))
         winlive_row = int(self.app.diagnostics_winlive_checkbox.grid_info().get("row", 0))
         autocorrect_row = int(self.app.diagnostics_winlive_autocorrect_checkbox.grid_info().get("row", 0))
         output_row = int(self.app.diagnostics_output_entry.grid_info().get("row", 0))
 
-        self.assertEqual(winlive_row, subfolders_row + 2)
+        self.assertEqual(integrity_row, subfolders_row + 1)
+        self.assertEqual(winlive_row, subfolders_row + 3)
         self.assertEqual(autocorrect_row, winlive_row + 1)
         self.assertGreater(output_row, autocorrect_row)
 
@@ -195,6 +211,53 @@ class GuiProjectResetTests(unittest.TestCase):
         self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
         self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
 
+    def test_diagnostics_both_on_is_allowed(self) -> None:
+        self.app.open_diagnostics_window()
+        self.app.diagnostics_verify_mp3_integrity_var.set(True)
+        self.app._on_diagnostics_integrity_toggle()
+        self.app.diagnostics_verify_winlive_var.set(True)
+        self.app._on_diagnostics_winlive_toggle()
+        self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
+        self.assertTrue(bool(self.app.diagnostics_verify_winlive_var.get()))
+
+    def test_turning_off_last_active_integrity_is_reverted(self) -> None:
+        self.app.open_diagnostics_window()
+        self.app.diagnostics_verify_winlive_var.set(False)
+        self.app._on_diagnostics_winlive_toggle()
+        self.app.diagnostics_verify_mp3_integrity_var.set(False)
+
+        infos: list[str] = []
+        original_showinfo = gui_module.messagebox.showinfo
+        try:
+            gui_module.messagebox.showinfo = lambda _title, message, **kwargs: infos.append(str(message))
+            self.app._on_diagnostics_integrity_toggle()
+        finally:
+            gui_module.messagebox.showinfo = original_showinfo
+
+        self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertIn("Almeno un controllo diagnostico deve rimanere attivo.", infos[-1])
+
+    def test_turning_off_last_active_winlive_is_reverted(self) -> None:
+        self.app.open_diagnostics_window()
+        self.app.diagnostics_verify_winlive_var.set(True)
+        self.app._on_diagnostics_winlive_toggle()
+        self.app.diagnostics_verify_mp3_integrity_var.set(False)
+        self.app._on_diagnostics_integrity_toggle()
+        self.app.diagnostics_verify_winlive_var.set(False)
+
+        infos: list[str] = []
+        original_showinfo = gui_module.messagebox.showinfo
+        try:
+            gui_module.messagebox.showinfo = lambda _title, message, **kwargs: infos.append(str(message))
+            self.app._on_diagnostics_winlive_toggle()
+        finally:
+            gui_module.messagebox.showinfo = original_showinfo
+
+        self.assertTrue(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
+        self.assertIn("Almeno un controllo diagnostico deve rimanere attivo.", infos[-1])
+
     def test_diagnostics_winlive_tooltips_exist(self) -> None:
         self.app.open_diagnostics_window()
         tooltip_texts = [tip.text for tip in self.app.tooltips]
@@ -217,21 +280,160 @@ class GuiProjectResetTests(unittest.TestCase):
         self.app.settings_manager.save = lambda payload: saved_payload.update(dict(payload))
         try:
             self.app.diagnostics_verify_winlive_var.set(True)
+            self.app.diagnostics_verify_mp3_integrity_var.set(False)
             self.app.diagnostics_winlive_autocorrect_var.set(True)
             self.app.save_settings()
         finally:
             self.app.settings_manager.save = original_save
 
+        self.assertFalse(bool(saved_payload.get("diagnostics_verify_mp3_integrity")))
         self.assertTrue(bool(saved_payload.get("diagnostics_verify_winlive")))
         self.assertTrue(bool(saved_payload.get("diagnostics_winlive_autocorrect")))
 
+        self.app.settings["diagnostics_verify_mp3_integrity"] = False
         self.app.settings["diagnostics_verify_winlive"] = True
         self.app.settings["diagnostics_winlive_autocorrect"] = True
         self.app._load_settings_into_ui()
         self.app.open_diagnostics_window()
-        self.assertTrue(bool(self.app.diagnostics_verify_winlive_var.get()))
-        self.assertTrue(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
-        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "normal")
+        self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
+
+    def test_diagnostics_invalid_saved_both_off_recovers_with_integrity_on(self) -> None:
+        self.app.settings["diagnostics_verify_mp3_integrity"] = False
+        self.app.settings["diagnostics_verify_winlive"] = False
+        self.app._load_settings_into_ui()
+        self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
+        self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
+
+    def test_diagnostics_winlive_flags_not_propagated_when_verify_disabled(self) -> None:
+        self.app.open_diagnostics_window()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir) / "in"
+            output_dir = Path(temp_dir) / "out"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            self.app._set_diagnostics_entry_values(input_folder=str(input_dir), output_folder=str(output_dir))
+            self.app.diagnostics_verify_winlive_var.set(False)
+            self.app.diagnostics_winlive_autocorrect_var.set(True)
+
+            captured: dict[str, object] = {}
+            original_start = self.app.diagnostics_worker.start
+            try:
+                self.app.diagnostics_worker.start = lambda **kwargs: captured.update(kwargs)
+                self.app.start_diagnostics_analysis()
+            finally:
+                self.app.diagnostics_worker.start = original_start
+
+            self.assertIn("verify_winlive", captured)
+            self.assertFalse(bool(captured["verify_winlive"]))
+            self.assertIn("verify_mp3_integrity", captured)
+            self.assertTrue(bool(captured["verify_mp3_integrity"]))
+            self.assertIn("winlive_autocorrect", captured)
+            self.assertFalse(bool(captured["winlive_autocorrect"]))
+
+    def test_diagnostics_winlive_flags_are_propagated_when_enabled(self) -> None:
+        self.app.open_diagnostics_window()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_dir = Path(temp_dir) / "in"
+            output_dir = Path(temp_dir) / "out"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            self.app._set_diagnostics_entry_values(input_folder=str(input_dir), output_folder=str(output_dir))
+            self.app.diagnostics_verify_winlive_var.set(True)
+            self.app.diagnostics_verify_mp3_integrity_var.set(False)
+            self.app.diagnostics_winlive_autocorrect_var.set(True)
+
+            captured: dict[str, object] = {}
+            original_start = self.app.diagnostics_worker.start
+            try:
+                self.app.diagnostics_worker.start = lambda **kwargs: captured.update(kwargs)
+                self.app.start_diagnostics_repair()
+            finally:
+                self.app.diagnostics_worker.start = original_start
+
+            self.assertFalse(bool(captured["verify_mp3_integrity"]))
+            self.assertTrue(bool(captured["verify_winlive"]))
+            self.assertTrue(bool(captured["winlive_autocorrect"]))
+
+    def test_diagnostics_actions_disabled_when_both_verifications_disabled(self) -> None:
+        self.app.open_diagnostics_window()
+        self.app.diagnostics_verify_mp3_integrity_var.set(False)
+        self.app.diagnostics_verify_winlive_var.set(False)
+        self.app._update_controls_state()
+        self.assertEqual(str(self.app.diagnostics_analyze_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.diagnostics_repair_button.cget("state")), "disabled")
+
+    def test_diagnostics_winlive_completion_updates_log_and_final_stats(self) -> None:
+        self.app.open_diagnostics_window()
+
+        result_ok = SimpleNamespace(
+            file_name="ok.mp3",
+            winlive=SimpleNamespace(
+                verifica_winlive_eseguita=True,
+                stato_winlive_finale=SimpleNamespace(value="FILE GIA' OK"),
+                normalizzazione_validata=False,
+                errore_winlive="",
+                errore_winlive_code="",
+            ),
+        )
+        result_norm = SimpleNamespace(
+            file_name="norm.mp3",
+            winlive=SimpleNamespace(
+                verifica_winlive_eseguita=True,
+                stato_winlive_finale=SimpleNamespace(value="NORMALIZZATO"),
+                normalizzazione_validata=True,
+                errore_winlive="",
+                errore_winlive_code="",
+            ),
+        )
+        result_err = SimpleNamespace(
+            file_name="err.mp3",
+            winlive=SimpleNamespace(
+                verifica_winlive_eseguita=True,
+                stato_winlive_finale=SimpleNamespace(value="NON INTEGRO DOPO MODIFICA"),
+                normalizzazione_validata=False,
+                errore_winlive="forced failure",
+                errore_winlive_code="FORCED",
+            ),
+        )
+
+        info_messages: list[str] = []
+        original_showinfo = gui_module.messagebox.showinfo
+        try:
+            gui_module.messagebox.showinfo = lambda _title, message, **kwargs: info_messages.append(str(message))
+            self.app._handle_diagnostics_worker_completed(
+                {
+                    "summary": {
+                        "category_ok_files": 1,
+                        "category_repaired_files": 1,
+                        "category_unrecoverable_files": 1,
+                        "ignored_silent_anomalies": 0,
+                        "analyzed_files": 3,
+                    },
+                    "report_paths": {},
+                    "diagnostic_results": [result_ok, result_norm, result_err],
+                }
+            )
+        finally:
+            gui_module.messagebox.showinfo = original_showinfo
+
+        self.assertTrue(info_messages)
+        final_message = info_messages[-1]
+        self.assertIn("WinLive verificati: 3", final_message)
+        self.assertIn("WinLive normalizzati: 1", final_message)
+        self.assertIn("Errori WinLive: 1", final_message)
+
+        self.app.diagnostics_log_box.configure(state="normal")
+        log_text = self.app.diagnostics_log_box.get("1.0", "end")
+        self.app.diagnostics_log_box.configure(state="disabled")
+        self.assertIn("Verifica WinLive completata.", log_text)
+        self.assertIn("FILE GIA' OK", log_text)
+        self.assertIn("NORMALIZZATO", log_text)
+        self.assertIn("NON INTEGRO DOPO MODIFICA", log_text)
 
     def test_diagnostics_reverify_button_disabled_while_running(self) -> None:
         self.app.open_diagnostics_window()

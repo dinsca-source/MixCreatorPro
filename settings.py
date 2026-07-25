@@ -33,6 +33,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "normalize_audio": True,
     "continue_short_tracks": False,
     "exclude_unrecoverable_from_mix": False,
+    "diagnostics_verify_mp3_integrity": True,
     "diagnostics_verify_winlive": False,
     "diagnostics_winlive_autocorrect": False,
     "diagnostics_placement_mode": "copy",

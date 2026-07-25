@@ -6,6 +6,7 @@ import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 
+from winlive_normalizer import extract_significant_text
 from winlive_tags import TAG_CHORD_CLOSE, TAG_SYNCT_CLOSE, WinLiveStructureState, parse_winlive_blocks_strict
 
 
@@ -14,6 +15,21 @@ class AudioHashStatus(str, Enum):
     PARTIAL_AUDIO_STREAM = "PARTIAL_AUDIO_STREAM"
     NO_AUDIO_STREAM = "NO_AUDIO_STREAM"
     AMBIGUOUS_AUDIO_STREAM = "AMBIGUOUS_AUDIO_STREAM"
+
+
+@dataclass(slots=True)
+class WinLiveNormalizedFileValidationResult:
+    valid: bool
+    reason_code: str
+    reason_message: str
+    synct_present_before: bool
+    synct_present_after: bool
+    chord_present_before: bool
+    chord_present_after: bool
+    meaningful_text_equal: bool
+    chord_unchanged: bool
+    terminator_preserved: bool
+    initial_value_preserved: bool
 
 
 @dataclass(slots=True)
@@ -467,3 +483,172 @@ def _lookup_bitrate_kbps(version_bits: int, layer_bits: int, bitrate_index: int)
     if layer_bits == 0x03:
         return mpeg2_l1[bitrate_index]
     return mpeg2_l23[bitrate_index]
+
+
+def validate_normalized_winlive_file(
+    *,
+    original_data: bytes,
+    candidate_data: bytes,
+) -> WinLiveNormalizedFileValidationResult:
+    parsed_before = parse_winlive_blocks_strict(original_data)
+    parsed_after = parse_winlive_blocks_strict(candidate_data)
+
+    before_synct_valid = parsed_before.synct.state == WinLiveStructureState.VALID
+    after_synct_valid = parsed_after.synct.state == WinLiveStructureState.VALID
+    before_chord_valid = parsed_before.chord.state == WinLiveStructureState.VALID
+    after_chord_valid = parsed_after.chord.state == WinLiveStructureState.VALID
+
+    if not after_synct_valid:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="SYNCT_MISSING_OR_INVALID_AFTER",
+            reason_message="Blocco WL5SYNCT assente o non valido nel file risultante.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=False,
+            chord_unchanged=False,
+            terminator_preserved=False,
+            initial_value_preserved=False,
+        )
+
+    if not after_chord_valid and before_chord_valid:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="CHORD_MISSING_OR_INVALID_AFTER",
+            reason_message="Blocco WL5CHORD perso o non valido nel file risultante.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=False,
+            chord_unchanged=False,
+            terminator_preserved=False,
+            initial_value_preserved=False,
+        )
+
+    before_synct_raw = parsed_before.synct.content_bytes or b""
+    after_synct_raw = parsed_after.synct.content_bytes or b""
+    before_chord_raw = parsed_before.chord.content_bytes or b""
+    after_chord_raw = parsed_after.chord.content_bytes or b""
+
+    before_text = _decode_lossy_for_validation(before_synct_raw)
+    after_text = _decode_lossy_for_validation(after_synct_raw)
+
+    before_initial = _extract_initial_prefix(before_text)
+    after_initial = _extract_initial_prefix(after_text)
+    initial_value_preserved = before_initial == after_initial if before_initial else True
+    if before_initial and not initial_value_preserved:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="SYNCT_INITIAL_VALUE_CHANGED",
+            reason_message="Valore iniziale WL5SYNCT alterato.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=False,
+            chord_unchanged=False,
+            terminator_preserved=False,
+            initial_value_preserved=False,
+        )
+
+    before_has_terminator = before_text.rstrip().endswith("|0||")
+    terminator_preserved = after_text.rstrip().endswith("|0||") if before_has_terminator else True
+    if before_has_terminator and not terminator_preserved:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="SYNCT_TERMINATOR_MISSING",
+            reason_message="Terminator finale '|0||/<WL5SYNCT>' non preservato nel blocco SYNCT.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=False,
+            chord_unchanged=False,
+            terminator_preserved=False,
+            initial_value_preserved=True,
+        )
+
+    meaningful_before = extract_significant_text(before_text)
+    meaningful_after = extract_significant_text(after_text)
+    meaningful_equal = meaningful_before == meaningful_after
+    if meaningful_before and not meaningful_after:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="MEANINGFUL_TEXT_LOST",
+            reason_message="Perdita completa del testo significativo nel blocco WL5SYNCT.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=False,
+            chord_unchanged=False,
+            terminator_preserved=True,
+            initial_value_preserved=True,
+        )
+
+    if not meaningful_equal:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="MEANINGFUL_TEXT_CHANGED",
+            reason_message="Testo significativo WL5SYNCT alterato dalla normalizzazione.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=False,
+            chord_unchanged=False,
+            terminator_preserved=True,
+            initial_value_preserved=True,
+        )
+
+    chord_unchanged = before_chord_raw == after_chord_raw
+    if not chord_unchanged:
+        return WinLiveNormalizedFileValidationResult(
+            valid=False,
+            reason_code="CHORD_CHANGED",
+            reason_message="Blocco WL5CHORD alterato: deve rimanere byte-per-byte invariato.",
+            synct_present_before=before_synct_valid,
+            synct_present_after=after_synct_valid,
+            chord_present_before=before_chord_valid,
+            chord_present_after=after_chord_valid,
+            meaningful_text_equal=True,
+            chord_unchanged=False,
+            terminator_preserved=True,
+            initial_value_preserved=True,
+        )
+
+    return WinLiveNormalizedFileValidationResult(
+        valid=True,
+        reason_code="OK",
+        reason_message="Validazione post-scrittura WinLive superata.",
+        synct_present_before=before_synct_valid,
+        synct_present_after=after_synct_valid,
+        chord_present_before=before_chord_valid,
+        chord_present_after=after_chord_valid,
+        meaningful_text_equal=True,
+        chord_unchanged=True,
+        terminator_preserved=True,
+        initial_value_preserved=True,
+    )
+
+
+def _decode_lossy_for_validation(raw: bytes) -> str:
+    for encoding in ("utf-8", "cp1252"):
+        try:
+            return raw.decode(encoding, errors="strict")
+        except UnicodeError:
+            continue
+    return raw.decode("latin-1", errors="replace")
+
+
+def _extract_initial_prefix(text: str) -> str:
+    separator_index = text.find("|")
+    if separator_index <= 0:
+        return ""
+    prefix = text[: separator_index + 1]
+    if not prefix[:-1].isdigit():
+        return ""
+    return prefix

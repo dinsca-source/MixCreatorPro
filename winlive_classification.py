@@ -7,14 +7,16 @@ from enum import Enum
 
 
 class WinLiveOutcome(str, Enum):
-    MISSING_TEXT_AND_UNRECOGNIZED_CHORDS = "MANCA TAG TESTO E ACCORDI NON RICONOSCIUTI"
-    UNRECOGNIZED_CHORDS = "FILE CON ACCORDI NON RICONOSCIUTI"
-    MISSING_TEXT_AND_CHORDS = "MANCA TAG TESTO E TAG ACCORDI"
-    MISSING_TEXT_ONLY = "MANCA SOLO IL TAG DI TESTO"
-    MISSING_CHORDS_ONLY = "MANCA SOLO IL TAG ACCORDI"
-    FILE_NORMALIZED = "FILE NORMALIZZATO"
-    FILE_ALREADY_OK = "FILE GIA' OK"
-    NORMALIZATION_NOT_VALIDATED = "NORMALIZZAZIONE NON VALIDATA"
+    STRUCTURE_ERROR = "ERRORI STRUTTURA WINLIVE"
+    MISSING_TEXT_AND_CHORDS = "SENZA TAG DI TESTO E DI ACCORDI"
+    MISSING_TEXT_ONLY = "SENZA TAG DI TESTO"
+    MISSING_CHORDS_ONLY = "SENZA TAG ACCORDI"
+    MISSING_TEXT_AND_UNRECOGNIZED_CHORDS = "SENZA TAG DI TESTO + ACCORDI NON RICONOSCIUTI"
+    UNRECOGNIZED_CHORDS = "ACCORDI NON RICONOSCIUTI"
+    MODIFICATION_NOT_INTEGRAL = "NON INTEGRO DOPO MODIFICA"
+    FILE_NORMALIZED = "NORMALIZZATO"
+    REQUIRES_NORMALIZATION = "RICHIEDE NORMALIZZAZIONE"
+    FILE_ALREADY_OK = "CONFORME"
 
 
 class PostNormalizationValidationStatus(str, Enum):
@@ -30,6 +32,11 @@ class WinLiveClassificationInput:
     chord_unrecognized_count: int
     text_was_modified: bool
     post_validation_status: PostNormalizationValidationStatus
+    structure_valid: bool = True
+    synct_present: bool = True
+    chord_present: bool = True
+    normalization_required: bool = False
+    normalization_attempted: bool = False
 
 
 @dataclass(slots=True)
@@ -39,52 +46,75 @@ class WinLiveClassificationResult:
 
 
 def classify_winlive(input_data: WinLiveClassificationInput) -> WinLiveClassificationResult:
-    text_missing = not input_data.text_valid
-    chord_missing = not input_data.chord_valid
-    has_unrecognized = input_data.chord_valid and input_data.chord_unrecognized_count > 0
-
-    if text_missing and has_unrecognized:
+    if not input_data.structure_valid:
         return WinLiveClassificationResult(
-            outcome=WinLiveOutcome.MISSING_TEXT_AND_UNRECOGNIZED_CHORDS,
-            reason="Testo non valido e accordi con '?' presenti.",
+            outcome=WinLiveOutcome.STRUCTURE_ERROR,
+            reason="Struttura WinLive non parsabile o ambigua.",
         )
 
-    if has_unrecognized:
-        return WinLiveClassificationResult(
-            outcome=WinLiveOutcome.UNRECOGNIZED_CHORDS,
-            reason="Accordi validi con '?' presenti.",
-        )
+    text_missing = not input_data.synct_present
+    chord_missing = not input_data.chord_present
+    has_unrecognized = input_data.chord_present and input_data.chord_unrecognized_count > 0
+
+    # 1. errore strutturale originale
+    # 2. assenza di entrambi i blocchi
+    # 3. assenza WL5SYNCT
+    # 4. assenza WL5CHORD
+    # 5. accordi non riconosciuti
+    # 6. modifica tentata ma validazione fallita
+    # 7. modifica applicata e validata
+    # 8. richiede normalizzazione in sola analisi
+    # 9. conforme
 
     if text_missing and chord_missing:
         return WinLiveClassificationResult(
             outcome=WinLiveOutcome.MISSING_TEXT_AND_CHORDS,
-            reason="Tag testo e accordi non validi.",
+            reason="Assenti sia WL5SYNCT che WL5CHORD.",
+        )
+
+    if text_missing and has_unrecognized:
+        return WinLiveClassificationResult(
+            outcome=WinLiveOutcome.MISSING_TEXT_AND_UNRECOGNIZED_CHORDS,
+            reason="WL5SYNCT assente e accordi non riconosciuti presenti.",
         )
 
     if text_missing and not chord_missing:
         return WinLiveClassificationResult(
             outcome=WinLiveOutcome.MISSING_TEXT_ONLY,
-            reason="Tag testo non valido, accordi validi.",
+            reason="WL5SYNCT assente.",
         )
 
     if chord_missing and not text_missing:
         return WinLiveClassificationResult(
             outcome=WinLiveOutcome.MISSING_CHORDS_ONLY,
-            reason="Tag accordi non valido, testo valido.",
+            reason="WL5CHORD assente.",
         )
 
-    if input_data.text_was_modified:
-        if input_data.post_validation_status == PostNormalizationValidationStatus.OK:
-            return WinLiveClassificationResult(
-                outcome=WinLiveOutcome.FILE_NORMALIZED,
-                reason="File modificato e validato.",
-            )
+    if has_unrecognized:
         return WinLiveClassificationResult(
-            outcome=WinLiveOutcome.NORMALIZATION_NOT_VALIDATED,
-            reason="File modificato ma validazione post-normalizzazione non OK.",
+            outcome=WinLiveOutcome.UNRECOGNIZED_CHORDS,
+            reason="Rilevati accordi non riconosciuti nel blocco WL5CHORD.",
+        )
+
+    if input_data.normalization_attempted and input_data.post_validation_status == PostNormalizationValidationStatus.FAILED:
+        return WinLiveClassificationResult(
+            outcome=WinLiveOutcome.MODIFICATION_NOT_INTEGRAL,
+            reason="Normalizzazione tentata ma validazione post-modifica fallita.",
+        )
+
+    if input_data.normalization_attempted and input_data.post_validation_status == PostNormalizationValidationStatus.OK:
+        return WinLiveClassificationResult(
+            outcome=WinLiveOutcome.FILE_NORMALIZED,
+            reason="File normalizzato e validato.",
+        )
+
+    if input_data.normalization_required:
+        return WinLiveClassificationResult(
+            outcome=WinLiveOutcome.REQUIRES_NORMALIZATION,
+            reason="File valido ma richiede normalizzazione WinLive.",
         )
 
     return WinLiveClassificationResult(
         outcome=WinLiveOutcome.FILE_ALREADY_OK,
-        reason="Tutto valido e nessuna modifica necessaria.",
+        reason="Struttura WinLive conforme senza modifiche necessarie.",
     )

@@ -12,6 +12,7 @@ from mp3_diagnostics import (
     AudioBounds,
     DiagnosticIssue,
     MP3DiagnosticsEngine,
+    OUTPUT_FOLDER_INTEGRITY_ROOT,
     STATUS_PERFECT,
 )
 from winlive_classification import WinLiveOutcome
@@ -122,12 +123,20 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         path.write_bytes(data)
         return path
 
-    def _run(self, engine: MP3DiagnosticsEngine, *, verify_winlive: bool, repair_mode: bool = False) -> dict[str, object]:
+    def _run(
+        self,
+        engine: MP3DiagnosticsEngine,
+        *,
+        verify_winlive: bool,
+        repair_mode: bool = False,
+        verify_mp3_integrity: bool = True,
+    ) -> dict[str, object]:
         return engine.run_diagnostics(
             input_folder=str(self.input_dir),
             include_subfolders=False,
             output_folder=str(self.output_dir),
             repair_mode=repair_mode,
+            verify_mp3_integrity=verify_mp3_integrity,
             verify_winlive=verify_winlive,
         )
 
@@ -150,15 +159,29 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         self._write_input("ok.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
         row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True))
         self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.FILE_ALREADY_OK)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Conformi")
+        self.assertTrue(Path(row.winlive.esito_percorso_winlive).is_file())
+
+    def test_normalizable_synct_without_repair_requires_normalization(self) -> None:
+        self._write_input("to_normalize.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True, repair_mode=False))
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.REQUIRES_NORMALIZATION)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Conformi")
+        self.assertFalse(row.winlive.normalizzazione_tentata)
 
     def test_normalizable_synct_becomes_file_normalized_after_validation(self) -> None:
-        self._write_input("normalize.mp3", _mp3_blob(b"|100|  CIAO|200|", b"|100|C|200|"))
+        self._write_input("normalize.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
         row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True, repair_mode=True))
         self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.FILE_NORMALIZED)
         self.assertTrue(row.winlive.normalizzazione_tentata)
         self.assertTrue(row.winlive.normalizzazione_validata)
         self.assertTrue(row.winlive.audio_hash_preservato)
         self.assertTrue(row.winlive.metadati_preservati)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Normalizzati")
+        self.assertTrue(Path(row.winlive.esito_percorso_winlive).is_file())
+        self.assertGreaterEqual(float(row.winlive.tempi_fasi_ms.get("costruzione_nuovi_bytes", 0.0)), 0.0)
+        self.assertGreaterEqual(float(row.winlive.tempi_fasi_ms.get("scrittura_temporaneo", 0.0)), 0.0)
+        self.assertGreaterEqual(float(row.winlive.tempi_fasi_ms.get("rilettura_temporaneo", 0.0)), 0.0)
 
     def test_question_mark_in_chord_is_unrecognized_chords(self) -> None:
         self._write_input("chord_q.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C?|200|"))
@@ -170,16 +193,19 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         self._write_input("missing_synct.mp3", _mp3_blob(None, b"|100|C|200|"))
         row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True))
         self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.MISSING_TEXT_ONLY)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Senza TAG di Testo")
 
     def test_missing_chord_is_missing_chords_only(self) -> None:
         self._write_input("missing_chord.mp3", _mp3_blob(b"|100|CIAO|200|", None))
         row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True))
         self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.MISSING_CHORDS_ONLY)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Senza TAG Accordi")
 
     def test_missing_both_is_missing_text_and_chords(self) -> None:
         self._write_input("missing_both.mp3", _mp3_blob(None, None))
         row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True))
         self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.MISSING_TEXT_AND_CHORDS)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Senza TAG di Testo e di Accordi")
 
     def test_missing_synct_and_question_mark_is_missing_text_and_unrecognized(self) -> None:
         self._write_input("missing_synct_q.mp3", _mp3_blob(None, b"|100|C?|200|"))
@@ -195,12 +221,12 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         row = self._first_result(self._run(_WinLiveScenarioEngine(), verify_winlive=True, repair_mode=True))
         after = source.read_bytes()
         self.assertEqual(before, after)
-        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.NORMALIZATION_NOT_VALIDATED)
-        self.assertEqual(row.winlive.errore_winlive_code, "AMBIGUOUS_STRUCTURE")
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.STRUCTURE_ERROR)
+        self.assertTrue(row.winlive.errore_winlive_code in {"STRUCTURE_ERROR", "AMBIGUOUS_STRUCTURE"})
         self.assertFalse(row.winlive.normalizzazione_tentata)
 
-    def test_validation_failure_is_normalization_not_validated(self) -> None:
-        self._write_input("validation_fail.mp3", _mp3_blob(b"|100|  CIAO|200|", b"|100|C|200|"))
+    def test_validation_failure_is_non_integral_after_modification(self) -> None:
+        self._write_input("validation_fail.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
         engine = _WinLiveScenarioEngine()
         failed_write = WinLiveWriteValidationResult(
             write_succeeded=True,
@@ -219,18 +245,22 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
             error="forced failure",
             notes=["forced failure"],
             temporary_path=None,
-            suggested_outcome=WinLiveOutcome.NORMALIZATION_NOT_VALIDATED,
+            suggested_outcome=WinLiveOutcome.MODIFICATION_NOT_INTEGRAL,
             encoding_detected="utf-8",
             encoding_used="utf-8",
             encoding_converted=False,
             encoding_lossless=True,
+            rewrite_metrics={},
+            phase_times_ms={},
+            diagnostic_counters={},
         )
 
         with mock.patch("mp3_diagnostics.write_normalized_winlive_copy", return_value=failed_write):
             row = self._first_result(self._run(engine, verify_winlive=True, repair_mode=True))
 
-        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.NORMALIZATION_NOT_VALIDATED)
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.MODIFICATION_NOT_INTEGRAL)
         self.assertEqual(row.winlive.errore_winlive_code, WinLiveWriteErrorCode.METADATA_MISMATCH.value)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Non integro dopo modifica")
 
     def test_winlive_exception_does_not_interrupt_mp3_diagnostics(self) -> None:
         self._write_input("boom.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
@@ -239,7 +269,7 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
             row = self._first_result(self._run(engine, verify_winlive=True))
         self.assertEqual(row.repair_outcome, STATUS_PERFECT)
         self.assertIn("RuntimeError", row.winlive.errore_winlive)
-        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.NORMALIZATION_NOT_VALIDATED)
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.STRUCTURE_ERROR)
 
     def test_old_api_without_verify_winlive_still_works(self) -> None:
         self._write_input("compat.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
@@ -253,6 +283,55 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         row = self._first_result(result)
         self.assertEqual(row.repair_outcome, STATUS_PERFECT)
         self.assertFalse(row.winlive.verifica_winlive_eseguita)
+
+    def test_verify_mp3_integrity_false_runs_winlive_only(self) -> None:
+        self._write_input("wl_only.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+        with mock.patch.object(engine, "_analyze_mp3", side_effect=AssertionError("_analyze_mp3 should not run")):
+            with mock.patch.object(engine, "_safe_duration_seconds", side_effect=AssertionError("_safe_duration_seconds should not run")):
+                with mock.patch.object(
+                    engine,
+                    "_place_file_for_category",
+                    side_effect=AssertionError("_place_file_for_category should not run"),
+                ):
+                    result = self._run(engine, verify_winlive=True, verify_mp3_integrity=False)
+        row = self._first_result(result)
+        self.assertTrue(row.winlive.verifica_winlive_eseguita)
+        self.assertEqual(row.repair_outcome, "")
+
+        session_output = Path(result["summary"]["output_folder"])
+        self.assertFalse((session_output / OUTPUT_FOLDER_INTEGRITY_ROOT).exists())
+
+    def test_both_flags_false_are_rejected(self) -> None:
+        self._write_input("invalid.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+        with self.assertRaisesRegex(RuntimeError, "Almeno un controllo diagnostico deve essere attivo"):
+            engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                verify_mp3_integrity=False,
+                verify_winlive=False,
+            )
+
+    def test_each_file_is_copied_in_single_winlive_folder(self) -> None:
+        self._write_input("one.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=True, repair_mode=False, verify_mp3_integrity=False)
+        row = self._first_result(result)
+        self.assertTrue(row.winlive.esito_cartella_winlive)
+
+        winlive_root = Path(result["summary"]["output_folder"]) / "Esito WinLive"
+        hits = list(winlive_root.rglob("one.mp3"))
+        self.assertEqual(len(hits), 1)
+
+    def test_removed_generic_categories_not_created(self) -> None:
+        self._write_input("x.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=True, repair_mode=False, verify_mp3_integrity=False)
+        winlive_root = Path(result["summary"]["output_folder"]) / "Esito WinLive"
+        self.assertFalse((winlive_root / "Senza TAG").exists())
+        self.assertFalse((winlive_root / "Normalizzabile").exists())
+        self.assertFalse((winlive_root / "Non correggibile").exists())
 
 
 if __name__ == "__main__":

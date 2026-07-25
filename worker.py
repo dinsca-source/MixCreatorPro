@@ -307,10 +307,15 @@ class MP3DiagnosticsWorker:
         repair_mode: bool,
         placement_mode: str,
         selected_input_files: Optional[list[Path]] = None,
+        verify_mp3_integrity: bool = True,
         verify_winlive: bool = False,
+        winlive_autocorrect: bool = True,
     ) -> None:
         if self._running:
             raise RuntimeError("È già in corso una diagnostica MP3.")
+
+        if not verify_mp3_integrity and not verify_winlive:
+            raise RuntimeError("Almeno un controllo diagnostico deve essere attivo.")
 
         self._cancel_event.clear()
         self._running = True
@@ -324,7 +329,9 @@ class MP3DiagnosticsWorker:
                 "repair_mode": repair_mode,
                 "placement_mode": placement_mode,
                 "selected_input_files": selected_input_files,
+                "verify_mp3_integrity": verify_mp3_integrity,
                 "verify_winlive": verify_winlive,
+                "winlive_autocorrect": winlive_autocorrect,
             },
             daemon=True,
         )

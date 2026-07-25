@@ -106,6 +106,7 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         "Numero",
         "File",
         "Percorso originale",
+        "Controllo integrità MP3 eseguito",
         "Stato finale file",
         "Categoria finale",
         "Integrita operativa iniziale",
@@ -142,15 +143,26 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
     WINLIVE_HEADERS = [
         "Verifica WinLive",
         "Stato WinLive",
+        "Presenza WL5SYNCT",
+        "Presenza WL5CHORD",
         "Testo presente",
         "Accordi presenti",
         "Accordi non riconosciuti",
+        "Token accordi non riconosciuti",
         "Normalizzazione richiesta",
         "Normalizzazione tentata",
         "Normalizzazione validata",
+        "Motivo validazione post-modifica",
         "Note WinLive",
         "Codice errore WinLive",
         "Errore WinLive",
+        "Cartella esito WinLive",
+        "Percorso esito WinLive",
+        "Operazione esito WinLive",
+        "Catene temporali rilevate",
+        "Tag temporali rimossi",
+        "Righe solo temporali rilevate",
+        "Righe solo temporali eliminate",
     ]
 
     def setUp(self) -> None:
@@ -167,13 +179,14 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
     def _write_input(self, name: str, data: bytes) -> None:
         (self.input_dir / name).write_bytes(data)
 
-    def _run(self, *, verify_winlive: bool, repair_mode: bool = False) -> dict[str, object]:
+    def _run(self, *, verify_winlive: bool, repair_mode: bool = False, verify_mp3_integrity: bool = True) -> dict[str, object]:
         engine = _ReportScenarioEngine()
         return engine.run_diagnostics(
             input_folder=str(self.input_dir),
             include_subfolders=False,
             output_folder=str(self.output_dir),
             repair_mode=repair_mode,
+            verify_mp3_integrity=verify_mp3_integrity,
             verify_winlive=verify_winlive,
         )
 
@@ -239,12 +252,13 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
 
     def test_winlive_categories_are_exported_in_summary(self) -> None:
         self._write_input("ok.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
-        self._write_input("norm.mp3", _mp3_blob(b"|100|  CIAO|200|", b"|100|C|200|"))
+        self._write_input("norm.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
         self._write_input("unrec.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C?|200|"))
         self._write_input("m_txt.mp3", _mp3_blob(None, b"|100|C|200|"))
         self._write_input("m_chr.mp3", _mp3_blob(b"|100|CIAO|200|", None))
         self._write_input("m_both.mp3", _mp3_blob(None, None))
         self._write_input("m_txt_unrec.mp3", _mp3_blob(None, b"|100|C?|200|"))
+        self._write_input("to_norm.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
         self._write_input(
             "not_validated.mp3",
             _frame() + _frame() + _frame() + b"<WL5SYNCT>|1|A|2|<WL5SYNCT>|3|B|4|/<WL5SYNCT>",
@@ -261,7 +275,7 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         self.assertIn(WinLiveOutcome.MISSING_CHORDS_ONLY.value, exported)
         self.assertIn(WinLiveOutcome.MISSING_TEXT_AND_CHORDS.value, exported)
         self.assertIn(WinLiveOutcome.MISSING_TEXT_AND_UNRECOGNIZED_CHORDS.value, exported)
-        self.assertIn(WinLiveOutcome.NORMALIZATION_NOT_VALIDATED.value, exported)
+        self.assertIn(WinLiveOutcome.STRUCTURE_ERROR.value, exported)
 
     def test_winlive_notes_and_errors_are_exported(self) -> None:
         self._write_input("boom.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
@@ -289,7 +303,7 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         report_dir = self.output_dir / "REPORT"
         report_dir.mkdir(parents=True, exist_ok=True)
 
-        report_paths = engine._write_reports([], report_dir)
+        report_paths = engine._write_reports([], report_dir, "2026-01-02_03-04-05", include_integrity=True)
 
         self.assertTrue(Path(report_paths["csv_summary"]).is_file())
         self.assertTrue(Path(report_paths["csv_problems"]).is_file())
@@ -305,6 +319,37 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
 
         xlsx_headers = self._xlsx_sheet_headers(result["report_paths"]["xlsx"])
         self.assertEqual(xlsx_headers, self.LEGACY_SUMMARY_HEADERS)
+
+    def test_winlive_only_summary_excludes_integrity_columns(self) -> None:
+        self._write_input("winlive_only.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False)
+        headers, rows = self._read_csv_rows(result["report_paths"]["csv_summary"])
+        self.assertIn("Controllo integrità MP3 eseguito", headers)
+        self.assertEqual(rows[0]["Controllo integrità MP3 eseguito"], "NO")
+        self.assertNotIn("Integrita operativa iniziale", headers)
+        self.assertEqual(result["report_paths"].get("integrity_index", ""), "")
+
+    def test_winlive_only_problems_sheet_contains_winlive_rows(self) -> None:
+        self._write_input("wlp.mp3", _mp3_blob(b"0|\n|100||200|CIAO|300|\n|350|\n|300|MONDO|500|\n|0||", b"|100|C|200|"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False, repair_mode=True)
+        headers, rows = self._read_csv_rows(result["report_paths"]["csv_problems"])
+
+        self.assertIn("Tipo controllo", headers)
+        self.assertIn("Codice", headers)
+        self.assertIn("Decisione finale", headers)
+        self.assertGreaterEqual(len(rows), 1)
+        self.assertTrue(any((r.get("Tipo controllo") or "") == "WinLive" for r in rows))
+
+    def test_human_report_includes_safe_write_split_and_counters(self) -> None:
+        self._write_input("song.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False, repair_mode=True)
+
+        log_path = Path(result["report_paths"]["html"]).parent / "Log.txt"
+        report_text = log_path.read_text(encoding="utf-8")
+        self.assertIn("Safe-write totale (ms):", report_text)
+        self.assertIn("Validazione totale (ms):", report_text)
+        self.assertIn("Tempo non attribuito (ms):", report_text)
+        self.assertIn("Contatori diagnostici WinLive:", report_text)
 
 
 if __name__ == "__main__":

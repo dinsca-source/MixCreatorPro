@@ -154,6 +154,46 @@ class SelectiveReverifyParsingTests(unittest.TestCase):
         self.assertEqual(len(result.missing_originals), 1)
         self.assertIn("cartella generata", result.missing_originals[0].reason)
 
+    def test_excludes_new_session_generated_folders(self) -> None:
+        generated = self._make_file(
+            "output/Diagnostica_MP3_2026-01-02_03-04-05/Esito integrità MP3/File riparati/sample.mp3"
+        )
+        csv_path = self._write_csv(
+            "Riepilogo_File.csv",
+            ["Stato finale file", "Percorso originale", "File"],
+            [
+                {
+                    "Stato finale file": "Riparato",
+                    "Percorso originale": str(generated),
+                    "File": "sample.mp3",
+                }
+            ],
+        )
+
+        result = prepare_selective_reverify_selection(csv_path)
+
+        self.assertEqual(result.final_reverify_count, 0)
+        self.assertEqual(len(result.missing_originals), 1)
+        self.assertIn("cartella generata", result.missing_originals[0].reason)
+
+    def test_historical_report_path_outside_generated_folders_still_valid(self) -> None:
+        original = self._make_file("music/live_original.mp3")
+        csv_path = self._write_csv(
+            "Riepilogo_File.csv",
+            ["Stato finale file", "Percorso originale", "File"],
+            [
+                {
+                    "Stato finale file": "Riparato",
+                    "Percorso originale": str(original),
+                    "File": "live_original.mp3",
+                }
+            ],
+        )
+
+        result = prepare_selective_reverify_selection(csv_path)
+
+        self.assertEqual(result.final_reverify_count, 1)
+
     def test_marks_missing_originals_without_substitution(self) -> None:
         csv_path = self._write_csv(
             "Riepilogo_File.csv",

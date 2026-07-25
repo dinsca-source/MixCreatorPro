@@ -77,7 +77,9 @@ class MP3DiagnosticsWorkerTests(unittest.TestCase):
         self.assertIsNone(self.error_payload)
         self.assertIsNotNone(self.completed_payload)
         kwargs = _FakeDiagnosticsEngine.last_kwargs
+        self.assertTrue(kwargs["verify_mp3_integrity"])
         self.assertFalse(kwargs["verify_winlive"])
+        self.assertTrue(kwargs["winlive_autocorrect"])
         self.assertIn("diagnostic_results", self.completed_payload)
 
     def test_verify_winlive_true_is_forwarded_and_callbacks_propagated(self) -> None:
@@ -93,11 +95,15 @@ class MP3DiagnosticsWorkerTests(unittest.TestCase):
                 repair_mode=True,
                 placement_mode="move",
                 selected_input_files=[Path("a.mp3")],
+                verify_mp3_integrity=False,
                 verify_winlive=True,
+                winlive_autocorrect=False,
             )
 
         kwargs = _FakeDiagnosticsEngine.last_kwargs
+        self.assertFalse(kwargs["verify_mp3_integrity"])
         self.assertTrue(kwargs["verify_winlive"])
+        self.assertFalse(kwargs["winlive_autocorrect"])
         self.assertIs(kwargs["progress_callback"].__self__, w)
         self.assertEqual(kwargs["progress_callback"].__func__.__name__, "_emit_progress")
         self.assertIs(kwargs["cancel_event"], w._cancel_event)
@@ -143,6 +149,19 @@ class MP3DiagnosticsWorkerTests(unittest.TestCase):
         self.assertEqual(self.cancelled_payload, "cancelled")
         self.assertFalse(w.is_running)
         self.assertFalse(w._cancel_event.is_set())
+
+    def test_start_rejects_both_checks_disabled(self) -> None:
+        w = self._build_worker()
+        with self.assertRaisesRegex(RuntimeError, "Almeno un controllo diagnostico deve essere attivo"):
+            w.start(
+                input_folder="in",
+                include_subfolders=False,
+                output_folder="out",
+                repair_mode=False,
+                placement_mode="copy",
+                verify_mp3_integrity=False,
+                verify_winlive=False,
+            )
 
 
 if __name__ == "__main__":

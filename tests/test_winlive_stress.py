@@ -53,7 +53,7 @@ class WinLiveStressTests(unittest.TestCase):
         self.assertLess(peak, 300 * 1024 * 1024)
 
     def test_massive_consecutive_times_and_long_text(self) -> None:
-        times = "|".join(str(i) for i in range(3000, 3400))
+        times = "||".join(str(i) for i in range(3000, 3400))
         long_text = "A" * 20000 + " citta\u00e0 \u6f22\u5b57"
         content = f"|{times}|{long_text}|5000|"
         result = normalize_synct_content(content)

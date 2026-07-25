@@ -22,6 +22,10 @@ _FORBIDDEN_GENERATED_FOLDERS = {
     "file già rilevati ok",
     "file gia rilevati ok",
     "originali dei file elaborati",
+    "esito integrità mp3",
+    "esito integrita mp3",
+    "esito winlive",
+    "report",
 }
 
 _REQUIRED_COLUMNS = (
@@ -210,4 +214,6 @@ def _is_in_generated_folder(path_text: str) -> bool:
     if not value:
         return False
     parts = [segment.strip().casefold() for segment in PureWindowsPath(value).parts if segment.strip()]
-    return any(part in _FORBIDDEN_GENERATED_FOLDERS for part in parts)
+    if any(part in _FORBIDDEN_GENERATED_FOLDERS for part in parts):
+        return True
+    return any(part.startswith("diagnostica_mp3_") for part in parts)
