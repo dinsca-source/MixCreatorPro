@@ -1,5 +1,17 @@
 # MixCreator PRO - CHANGELOG
 
+## v4.3.0-winlive-stable
+
+- FASE 4D.3 completata
+- Nuovo parser WinLive
+- Normalizzazione WL5SYNCT completa
+- Allineamento timestamp tra righe
+- Eliminazione righe solo temporali
+- Safe Write transazionale
+- Nuova classificazione Esito WinLive
+- Report Problemi dettagliato
+- Ottimizzazione prestazioni (9 minuti -> 6 secondi)
+
 ## v1.2.01 (In sviluppo)
 
 -   Aggiunta firma "Created by Dino S." (prevista)

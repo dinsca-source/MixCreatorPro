@@ -53,8 +53,8 @@ from selective_reverify import (
 )
 
 
-APP_VERSION = "1.3.05"
-APP_BUILD = "2026.07.15.009"
+APP_VERSION = "4.3.0-winlive-stable"
+APP_BUILD = "2026.07.25.001"
 CREATOR_TEXT = "Created by Dino S."
 EXTRACT_SONG_TOOLTIP = (
     "Estrae le clip dell'ultimo mix quando sono disponibili i dati temporali. "
@@ -121,6 +121,7 @@ class MixCreatorApp(ctk.CTk):
         self._display_track_names: list[str] = []
         self.track_filter_var = tk.StringVar(value=FILTER_ALL)
         self.diagnostics_include_subfolders_var = tk.BooleanVar(value=False)
+        self.diagnostics_verify_mp3_integrity_var = tk.BooleanVar(value=True)
         self.diagnostics_verify_winlive_var = tk.BooleanVar(value=False)
         self.diagnostics_winlive_autocorrect_var = tk.BooleanVar(value=False)
         self.diagnostics_placement_mode_var = tk.StringVar(
@@ -134,6 +135,7 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_window: ctk.CTkToplevel | None = None
         self.diagnostics_run_mode = "normal"
         self.diagnostics_reverify_selection: SelectiveReverifySelection | None = None
+        self._diagnostics_toggle_guard = False
 
         self.current_project_path: str | None = None
         self.project_dirty = False
@@ -623,12 +625,20 @@ class MixCreatorApp(ctk.CTk):
         )
         self.diagnostics_subfolders_checkbox.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=4)
 
+        self.diagnostics_integrity_checkbox = ctk.CTkCheckBox(
+            diag_card,
+            text="Verifica integrità MP3",
+            variable=self.diagnostics_verify_mp3_integrity_var,
+            command=self._on_diagnostics_integrity_toggle,
+        )
+        self.diagnostics_integrity_checkbox.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=2)
+
         self.diagnostics_winlive_group_label = ctk.CTkLabel(
             diag_card,
             text="Verifica WinLive",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.diagnostics_winlive_group_label.grid(row=3, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
+        self.diagnostics_winlive_group_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(6, 2))
 
         self.diagnostics_winlive_checkbox = ctk.CTkCheckBox(
             diag_card,
@@ -636,7 +646,7 @@ class MixCreatorApp(ctk.CTk):
             variable=self.diagnostics_verify_winlive_var,
             command=self._on_diagnostics_winlive_toggle,
         )
-        self.diagnostics_winlive_checkbox.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=2)
+        self.diagnostics_winlive_checkbox.grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=2)
         self._add_tooltip(
             self.diagnostics_winlive_checkbox,
             "Controlla la presenza e la correttezza\n"
@@ -650,7 +660,7 @@ class MixCreatorApp(ctk.CTk):
             variable=self.diagnostics_winlive_autocorrect_var,
             command=self._on_diagnostics_winlive_autocorrect_toggle,
         )
-        self.diagnostics_winlive_autocorrect_checkbox.grid(row=5, column=0, columnspan=3, sticky="w", padx=30, pady=(0, 4))
+        self.diagnostics_winlive_autocorrect_checkbox.grid(row=6, column=0, columnspan=3, sticky="w", padx=30, pady=(0, 4))
         self._add_tooltip(
             self.diagnostics_winlive_autocorrect_checkbox,
             "Applica esclusivamente\n"
@@ -659,15 +669,15 @@ class MixCreatorApp(ctk.CTk):
         )
         self._sync_diagnostics_winlive_controls_state()
 
-        ctk.CTkLabel(diag_card, text="Cartella di output").grid(row=6, column=0, sticky="w", padx=10, pady=5)
+        ctk.CTkLabel(diag_card, text="Cartella di output").grid(row=7, column=0, sticky="w", padx=10, pady=5)
         self.diagnostics_output_entry = ctk.CTkEntry(diag_card)
-        self.diagnostics_output_entry.grid(row=6, column=1, sticky="ew", padx=6, pady=5)
+        self.diagnostics_output_entry.grid(row=7, column=1, sticky="ew", padx=6, pady=5)
         ctk.CTkButton(diag_card, text="Sfoglia", width=84, command=self.select_diagnostics_output).grid(
-            row=6, column=2, sticky="e", padx=10, pady=5
+            row=7, column=2, sticky="e", padx=10, pady=5
         )
 
         ctk.CTkLabel(diag_card, text="Al termine dell'analisi:").grid(
-            row=7,
+            row=8,
             column=0,
             sticky="w",
             padx=10,
@@ -680,7 +690,7 @@ class MixCreatorApp(ctk.CTk):
             value="copy",
             command=self._on_diagnostics_placement_mode_changed,
         )
-        self.diagnostics_placement_copy_radio.grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=2)
+        self.diagnostics_placement_copy_radio.grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=2)
 
         self.diagnostics_placement_move_radio = ctk.CTkRadioButton(
             diag_card,
@@ -689,10 +699,10 @@ class MixCreatorApp(ctk.CTk):
             value="move",
             command=self._on_diagnostics_placement_mode_changed,
         )
-        self.diagnostics_placement_move_radio.grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.diagnostics_placement_move_radio.grid(row=10, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
         buttons_frame = ctk.CTkFrame(diag_card, fg_color="transparent")
-        buttons_frame.grid(row=10, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
+        buttons_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
         buttons_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self.diagnostics_analyze_button = ctk.CTkButton(
@@ -725,14 +735,14 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_stop_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
 
         self.diagnostics_progress = ctk.CTkProgressBar(diag_card)
-        self.diagnostics_progress.grid(row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
+        self.diagnostics_progress.grid(row=12, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
         self.diagnostics_progress.set(0)
 
         self.diagnostics_status_label = ctk.CTkLabel(diag_card, text="Pronto", anchor="w")
-        self.diagnostics_status_label.grid(row=12, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 2))
+        self.diagnostics_status_label.grid(row=13, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 2))
 
         counters_frame = ctk.CTkFrame(diag_card, fg_color="transparent")
-        counters_frame.grid(row=13, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
+        counters_frame.grid(row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
         counters_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.diagnostics_count_label = ctk.CTkLabel(counters_frame, text="File analizzati: 0 / 0", anchor="w")
@@ -743,11 +753,36 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_eta_label.grid(row=0, column=2, sticky="w")
 
         self.diagnostics_log_box = ctk.CTkTextbox(diag_card, height=130)
-        self.diagnostics_log_box.grid(row=14, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
+        self.diagnostics_log_box.grid(row=15, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 10))
         self.diagnostics_log_box.configure(state="disabled")
 
     def _on_diagnostics_placement_mode_changed(self) -> None:
         self.save_settings()
+
+    def _enforce_at_least_one_diagnostic_check(self, changed: str) -> bool:
+        if self._diagnostics_toggle_guard:
+            return True
+
+        verify_integrity = bool(self.diagnostics_verify_mp3_integrity_var.get())
+        verify_winlive = bool(self.diagnostics_verify_winlive_var.get())
+        if verify_integrity or verify_winlive:
+            return True
+
+        self._diagnostics_toggle_guard = True
+        try:
+            if changed == "integrity":
+                self.diagnostics_verify_mp3_integrity_var.set(True)
+            else:
+                self.diagnostics_verify_winlive_var.set(True)
+        finally:
+            self._diagnostics_toggle_guard = False
+
+        messagebox.showinfo(
+            "Diagnostica MP3",
+            "Almeno un controllo diagnostico deve rimanere attivo.",
+            parent=self._diagnostics_dialog_parent(),
+        )
+        return False
 
     def _sync_diagnostics_winlive_controls_state(self) -> None:
         main_enabled = bool(self.diagnostics_verify_winlive_var.get())
@@ -758,8 +793,21 @@ class MixCreatorApp(ctk.CTk):
             self.diagnostics_winlive_autocorrect_checkbox.configure(
                 state="normal" if main_enabled else "disabled"
             )
+        self._update_controls_state()
+
+    def _on_diagnostics_integrity_toggle(self) -> None:
+        if not self._enforce_at_least_one_diagnostic_check("integrity"):
+            self._update_controls_state()
+            self.save_settings()
+            return
+        self._update_controls_state()
+        self.save_settings()
 
     def _on_diagnostics_winlive_toggle(self) -> None:
+        if not self._enforce_at_least_one_diagnostic_check("winlive"):
+            self._sync_diagnostics_winlive_controls_state()
+            self.save_settings()
+            return
         self._sync_diagnostics_winlive_controls_state()
         self.save_settings()
 
@@ -1237,17 +1285,18 @@ class MixCreatorApp(ctk.CTk):
             else:
                 self.exclude_unrecoverable_checkbox.deselect()
 
-            self.diagnostics_verify_winlive_var.set(bool(self.settings.get("diagnostics_verify_winlive", False)))
-            self.diagnostics_winlive_autocorrect_var.set(bool(self.settings.get("diagnostics_winlive_autocorrect", False)))
+            verify_mp3 = True
+            verify_winlive = False
+
+            self.diagnostics_verify_mp3_integrity_var.set(verify_mp3)
+            self.diagnostics_verify_winlive_var.set(verify_winlive)
+            self.diagnostics_winlive_autocorrect_var.set(False)
             self._sync_diagnostics_winlive_controls_state()
 
             placement_mode = str(self.settings.get("diagnostics_placement_mode", "copy")).strip().lower()
             if placement_mode not in ("copy", "move"):
                 placement_mode = "copy"
             self.diagnostics_placement_mode_var.set(placement_mode)
-            self.diagnostics_verify_winlive_var.set(bool(self.settings.get("diagnostics_verify_winlive", False)))
-            self.diagnostics_winlive_autocorrect_var.set(bool(self.settings.get("diagnostics_winlive_autocorrect", False)))
-            self._sync_diagnostics_winlive_controls_state()
 
             self.reuse_previous_clips_var.set(False)
             self.appearance_combo.set(self.settings["appearance_mode"])
@@ -1321,9 +1370,11 @@ class MixCreatorApp(ctk.CTk):
                 self._extract_song_tooltip.text = EXTRACT_SONG_TOOLTIP
 
         if hasattr(self, "diagnostics_analyze_button"):
-            self.diagnostics_analyze_button.configure(state="disabled" if is_diag_running else "normal")
+            diagnostics_enabled = self._diagnostics_actions_enabled()
+            self.diagnostics_analyze_button.configure(state="normal" if diagnostics_enabled and not is_diag_running else "disabled")
         if hasattr(self, "diagnostics_repair_button"):
-            self.diagnostics_repair_button.configure(state="disabled" if is_diag_running else "normal")
+            diagnostics_enabled = self._diagnostics_actions_enabled()
+            self.diagnostics_repair_button.configure(state="normal" if diagnostics_enabled and not is_diag_running else "disabled")
         if hasattr(self, "diagnostics_reverify_button"):
             self.diagnostics_reverify_button.configure(state="disabled" if is_diag_running else "normal")
         if hasattr(self, "diagnostics_stop_button"):
@@ -1339,6 +1390,11 @@ class MixCreatorApp(ctk.CTk):
             self.diagnostics_winlive_autocorrect_checkbox.configure(
                 state="normal" if can_edit_autocorrect else "disabled"
             )
+
+    def _diagnostics_actions_enabled(self) -> bool:
+        verify_mp3 = bool(self.diagnostics_verify_mp3_integrity_var.get())
+        verify_winlive = bool(self.diagnostics_verify_winlive_var.get())
+        return verify_mp3 or verify_winlive
 
     def _mark_project_dirty(self) -> None:
         if self._suspend_project_dirty_tracking:
@@ -1386,6 +1442,21 @@ class MixCreatorApp(ctk.CTk):
             return int(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _safe_bool_setting(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ("1", "true", "yes", "on"):
+                return True
+            if normalized in ("0", "false", "no", "off", ""):
+                return False
+            return default
+        return default
 
     @staticmethod
     def _has_new_temporal_fields(item: dict[str, Any]) -> bool:
@@ -1802,6 +1873,11 @@ class MixCreatorApp(ctk.CTk):
                 self.exclude_unrecoverable_checkbox.select()
             else:
                 self.exclude_unrecoverable_checkbox.deselect()
+
+            self.diagnostics_verify_mp3_integrity_var.set(True)
+            self.diagnostics_verify_winlive_var.set(False)
+            self.diagnostics_winlive_autocorrect_var.set(False)
+            self._sync_diagnostics_winlive_controls_state()
 
             self.last_generated_mix_data = None
             self._reusable_previous_clips = {}
@@ -2472,9 +2548,21 @@ class MixCreatorApp(ctk.CTk):
         selected_input = input_folder or self._diagnostics_input_value() or self.input_entry.get().strip()
         selected_output = output_folder or self._diagnostics_output_value() or self.output_entry.get().strip()
         selected_subfolders = bool(self.diagnostics_include_subfolders_var.get()) if include_subfolders is None else bool(include_subfolders)
+        verify_mp3_integrity = bool(self.diagnostics_verify_mp3_integrity_var.get())
+        verify_winlive = bool(self.diagnostics_verify_winlive_var.get())
+        winlive_autocorrect = bool(self.diagnostics_winlive_autocorrect_var.get()) if verify_winlive else False
         placement_mode = str(self.diagnostics_placement_mode_var.get() or "copy").strip().lower()
         if placement_mode not in ("copy", "move"):
             placement_mode = "copy"
+
+        if not verify_mp3_integrity and not verify_winlive:
+            messagebox.showerror(
+                "Diagnostica MP3",
+                "Almeno un controllo diagnostico deve essere attivo.",
+                parent=self._diagnostics_dialog_parent(),
+            )
+            self._raise_diagnostics_window()
+            return
 
         if not selected_input or not Path(selected_input).is_dir():
             messagebox.showerror(
@@ -2519,6 +2607,21 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_elapsed_label.configure(text="Tempo: 00:00:00")
         self.diagnostics_eta_label.configure(text="Tempo stimato: calcolo in corso...")
         self._append_diagnostics_log(log_message)
+        self._append_diagnostics_log(
+            f"Integrità MP3: {'ATTIVA' if verify_mp3_integrity else 'DISATTIVA'}"
+        )
+        self._append_diagnostics_log(
+            f"WinLive: {'ATTIVO' if verify_winlive else 'DISATTIVO'}"
+        )
+        self._append_diagnostics_log(
+            f"Correzione automatica WinLive: {'ATTIVA' if winlive_autocorrect else 'DISATTIVA'}"
+        )
+        if verify_winlive:
+            self._append_diagnostics_log("Verifica WinLive attivata.")
+            if winlive_autocorrect:
+                self._append_diagnostics_log("Correzione automatica WinLive attivata.")
+            else:
+                self._append_diagnostics_log("Correzione automatica WinLive disattivata.")
         self._start_diagnostics_timer()
 
         try:
@@ -2529,6 +2632,9 @@ class MixCreatorApp(ctk.CTk):
                 repair_mode=repair_mode,
                 placement_mode=placement_mode,
                 selected_input_files=selected_input_files,
+                verify_mp3_integrity=verify_mp3_integrity,
+                verify_winlive=verify_winlive,
+                winlive_autocorrect=winlive_autocorrect,
             )
         except Exception as error:
             self.diagnostics_run_mode = "normal"
@@ -2572,10 +2678,13 @@ class MixCreatorApp(ctk.CTk):
 
         summary = payload.get("summary", {}) if isinstance(payload, dict) else {}
         report_paths = payload.get("report_paths", {}) if isinstance(payload, dict) else {}
+        diagnostic_results = payload.get("diagnostic_results", []) if isinstance(payload, dict) else []
+        winlive_summary = self._build_winlive_runtime_summary(diagnostic_results)
         self._append_diagnostics_log("Diagnostica completata.")
         self._append_diagnostics_log(f"Report CSV: {report_paths.get('csv', '')}")
         self._append_diagnostics_log(f"Report XLSX: {report_paths.get('xlsx', '')}")
         self._append_diagnostics_log(f"Report HTML: {report_paths.get('html', '')}")
+        self._append_winlive_completion_logs(diagnostic_results, winlive_summary)
 
         comparative_path = ""
         comparative_error = ""
@@ -2593,14 +2702,30 @@ class MixCreatorApp(ctk.CTk):
         self.update_preview()
 
         title = "Riverifica file problematici" if self.diagnostics_run_mode == "selective_reverify" else "Diagnostica MP3"
-        base_message = (
-            "Diagnostica completata.\n\n"
-            f"File già rilevati OK: {summary.get('category_ok_files', 0)}\n"
-            f"File riparati: {summary.get('category_repaired_files', 0)}\n"
-            f"File non recuperabili: {summary.get('category_unrecoverable_files', 0)}\n\n"
-            f"Anomalie tecniche ignorate in zone silenziose: {summary.get('ignored_silent_anomalies', 0)}\n"
-            f"Totale analizzati: {summary.get('analyzed_files', 0)}"
-        )
+        verify_integrity = bool(summary.get("verify_mp3_integrity", True))
+        if verify_integrity:
+            base_message = (
+                "Diagnostica completata.\n\n"
+                f"File già rilevati OK: {summary.get('category_ok_files', 0)}\n"
+                f"File riparati: {summary.get('category_repaired_files', 0)}\n"
+                f"File non recuperabili: {summary.get('category_unrecoverable_files', 0)}\n\n"
+                f"Anomalie tecniche ignorate in zone silenziose: {summary.get('ignored_silent_anomalies', 0)}\n"
+                f"Totale analizzati: {summary.get('analyzed_files', 0)}"
+            )
+        else:
+            base_message = (
+                "Diagnostica completata.\n\n"
+                "Controllo integrità MP3 eseguito: No\n"
+                f"Totale analizzati: {summary.get('analyzed_files', 0)}"
+            )
+
+        if winlive_summary["verified"] > 0:
+            base_message += (
+                "\n\n"
+                f"WinLive verificati: {winlive_summary['verified']}\n"
+                f"WinLive normalizzati: {winlive_summary['normalized']}\n"
+                f"Errori WinLive: {winlive_summary['errors']}"
+            )
 
         if comparative_path:
             base_message += f"\n\nReport comparativo: {comparative_path}"
@@ -2620,6 +2745,62 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_reverify_selection = None
         self.diagnostics_eta_label.configure(text="Tempo stimato: completato")
         self._raise_diagnostics_window()
+
+    @staticmethod
+    def _build_winlive_runtime_summary(diagnostic_results: Any) -> dict[str, int]:
+        verified = 0
+        normalized = 0
+        errors = 0
+        for item in diagnostic_results if isinstance(diagnostic_results, list) else []:
+            winlive = getattr(item, "winlive", None)
+            if winlive is None or not bool(getattr(winlive, "verifica_winlive_eseguita", False)):
+                continue
+            verified += 1
+
+            outcome = getattr(winlive, "stato_winlive_finale", None)
+            outcome_value = getattr(outcome, "value", "") if outcome is not None else ""
+            if bool(getattr(winlive, "normalizzazione_validata", False)) or outcome_value == "NORMALIZZATO":
+                normalized += 1
+
+            error_text = str(getattr(winlive, "errore_winlive", "") or "").strip()
+            error_code = str(getattr(winlive, "errore_winlive_code", "") or "").strip()
+            if error_text or error_code:
+                errors += 1
+
+        return {
+            "verified": verified,
+            "normalized": normalized,
+            "errors": errors,
+        }
+
+    def _append_winlive_completion_logs(self, diagnostic_results: Any, winlive_summary: dict[str, int]) -> None:
+        if not isinstance(diagnostic_results, list):
+            return
+        if winlive_summary.get("verified", 0) <= 0:
+            return
+
+        self._append_diagnostics_log("Verifica WinLive completata.")
+        for item in diagnostic_results:
+            winlive = getattr(item, "winlive", None)
+            if winlive is None or not bool(getattr(winlive, "verifica_winlive_eseguita", False)):
+                continue
+
+            file_name = str(getattr(item, "file_name", "") or "")
+            outcome = getattr(winlive, "stato_winlive_finale", None)
+            outcome_text = str(getattr(outcome, "value", "") or "").strip()
+            if outcome_text:
+                prefix = f"{file_name}: " if file_name else ""
+                self._append_diagnostics_log(f"{prefix}{outcome_text}")
+
+        self._append_diagnostics_log(
+            f"WinLive verificati: {int(winlive_summary.get('verified', 0))}"
+        )
+        self._append_diagnostics_log(
+            f"WinLive normalizzati: {int(winlive_summary.get('normalized', 0))}"
+        )
+        self._append_diagnostics_log(
+            f"Errori WinLive: {int(winlive_summary.get('errors', 0))}"
+        )
 
     def _diagnostics_worker_error(self, message: str) -> None:
         self.after(0, self._handle_diagnostics_worker_error, message)
@@ -2868,19 +3049,29 @@ class MixCreatorApp(ctk.CTk):
     def _find_latest_diagnostics_index_file(self, preferred_output_folder: str | None = None) -> Path | None:
         candidates: list[Path] = []
 
+        def _add_candidates(root_text: str) -> None:
+            root = Path(root_text).expanduser()
+            candidates.append(root / "REPORT" / "IntegrityIndex.json")
+            candidates.append(root / "Report" / "IntegrityIndex.json")
+            for session_dir in sorted(root.glob("Diagnostica_MP3_*")):
+                if not session_dir.is_dir():
+                    continue
+                candidates.append(session_dir / "REPORT" / "IntegrityIndex.json")
+                candidates.append(session_dir / "Report" / "IntegrityIndex.json")
+
         output_folder = (preferred_output_folder or "").strip()
         if output_folder:
-            candidates.append(Path(output_folder).expanduser() / "REPORT" / "IntegrityIndex.json")
+            _add_candidates(output_folder)
 
         if hasattr(self, "diagnostics_output_entry"):
             entry_folder = self.diagnostics_output_entry.get().strip()
             if entry_folder:
-                candidates.append(Path(entry_folder).expanduser() / "REPORT" / "IntegrityIndex.json")
+                _add_candidates(entry_folder)
 
         if hasattr(self, "output_entry"):
             generic_output = self.output_entry.get().strip()
             if generic_output:
-                candidates.append(Path(generic_output).expanduser() / "REPORT" / "IntegrityIndex.json")
+                _add_candidates(generic_output)
 
         if candidates:
             for item in candidates:
@@ -4282,6 +4473,7 @@ class MixCreatorApp(ctk.CTk):
                 "normalize_audio": bool(self.normalize_checkbox.get()),
                 "continue_short_tracks": bool(self.short_checkbox.get()),
                 "exclude_unrecoverable_from_mix": bool(self.exclude_unrecoverable_var.get()),
+                "diagnostics_verify_mp3_integrity": bool(self.diagnostics_verify_mp3_integrity_var.get()),
                 "diagnostics_verify_winlive": bool(self.diagnostics_verify_winlive_var.get()),
                 "diagnostics_winlive_autocorrect": bool(self.diagnostics_winlive_autocorrect_var.get()),
                 "diagnostics_placement_mode": str(self.diagnostics_placement_mode_var.get() or "copy").strip().lower(),

@@ -1,5 +1,17 @@
 # MixCreatorPro
 
+## v4.3.0-winlive-stable
+
+- FASE 4D.3 completata
+- nuovo parser WinLive
+- normalizzazione WL5SYNCT completa
+- allineamento timestamp tra righe
+- eliminazione righe solo temporali
+- safe write transazionale
+- nuova classificazione Esito WinLive
+- report Problemi dettagliato
+- ottimizzazione prestazioni WinLive (9 minuti -> 6 secondi)
+
 ## Build 2.1
 
 - rinominato il pulsante “Elimina dal mix” in “Elimina"
@@ -38,3 +50,14 @@
 - abilitati i pulsanti di avanzamento e arretramento durante la riproduzione
 - migliorata la gestione degli stati play, pausa, stop e anteprima
 - corretti i limiti temporali durante l'ascolto della clip
+
+## Build 2.2B - FASE 4D.3 COMPLETATA
+
+- integrato il nuovo parser WinLive
+- completata la normalizzazione WL5SYNCT
+- aggiunto l'allineamento timestamp tra righe
+- eliminazione delle righe solo temporali
+- introdotto il Safe Write transazionale
+- aggiornata la classificazione Esito WinLive
+- esteso il report problemi con dettaglio WinLive
+- ottimizzate le prestazioni del flusso WinLive (circa 9 minuti -> circa 6 secondi nello scenario di benchmark)
