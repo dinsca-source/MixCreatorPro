@@ -18,6 +18,7 @@ import time
 import csv
 import json
 import os
+import io
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, SINGLE, filedialog, messagebox
@@ -39,7 +40,7 @@ from project_manager import (
 )
 from settings import SettingsManager
 from tooltip import Tooltip
-from utils import scan_mp3_files
+from utils import AdaptiveTimeEstimator, scan_mp3_files
 from worker import MixWorker, SongExtractionWorker, MP3DiagnosticsWorker
 from mp3_diagnostics import (
     STATUS_PERFECT,
@@ -57,8 +58,8 @@ APP_VERSION = "4.3.0-winlive-stable"
 APP_BUILD = "2026.07.25.001"
 CREATOR_TEXT = "Created by Dino S."
 EXTRACT_SONG_TOOLTIP = (
-    "Estrae le clip dell'ultimo mix quando sono disponibili i dati temporali. "
-    "In alternativa esporta l'elenco ordinato delle Song."
+    "Esporta Elenco_Mix.csv con i tempi reali dell'ultimo mix. "
+    "Disponibile solo quando sono presenti dati temporali validi."
 )
 INTEGRITY_TOOLTIP_TEXT = "Integrita MP3 dalla diagnostica piu recente."
 
@@ -120,10 +121,12 @@ class MixCreatorApp(ctk.CTk):
         self._diagnostics_stable_index: dict[str, dict[str, Any]] = {}
         self._display_track_names: list[str] = []
         self.track_filter_var = tk.StringVar(value=FILTER_ALL)
+        self.mix_include_subfolders_var = tk.BooleanVar(
+            value=bool(self.settings.get("mix_include_subfolders", True))
+        )
         self.diagnostics_include_subfolders_var = tk.BooleanVar(value=False)
         self.diagnostics_verify_mp3_integrity_var = tk.BooleanVar(value=True)
         self.diagnostics_verify_winlive_var = tk.BooleanVar(value=False)
-        self.diagnostics_winlive_autocorrect_var = tk.BooleanVar(value=False)
         self.diagnostics_placement_mode_var = tk.StringVar(
             value=str(self.settings.get("diagnostics_placement_mode", "copy"))
         )
@@ -132,6 +135,7 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_worker_start_time: float | None = None
         self.diagnostics_timer_job = None
         self.diagnostics_last_progress = 0
+        self.diagnostics_eta_estimator = AdaptiveTimeEstimator(initial_seconds_per_unit=8.0)
         self.diagnostics_window: ctk.CTkToplevel | None = None
         self.diagnostics_run_mode = "normal"
         self.diagnostics_reverify_selection: SelectiveReverifySelection | None = None
@@ -146,6 +150,8 @@ class MixCreatorApp(ctk.CTk):
         self.start_time: float | None = None
         self.timer_job = None
         self.last_progress_percent = 0
+        self.mix_eta_estimator = AdaptiveTimeEstimator(initial_seconds_per_unit=8.0)
+        self.mix_eta_phase = ""
 
         self.worker = MixWorker(
             on_progress=self._worker_progress,
@@ -374,8 +380,24 @@ class MixCreatorApp(ctk.CTk):
             self.select_input,
             self.refresh_input_folder,
             browse_tooltip="Seleziona la cartella contenente i file MP3 da utilizzare.",
-            refresh_tooltip="Rilegge gli MP3 presenti direttamente nella cartella selezionata.",
+            refresh_tooltip="Rilegge gli MP3 nella cartella selezionata, rispettando l'opzione sottocartelle.",
             entry_tooltip="Cartella contenente i file MP3 da utilizzare."
+        )
+        row += 1
+
+        self.mix_subfolders_checkbox = ctk.CTkCheckBox(
+            self.left_panel,
+            text="Ricerca nelle sottocartelle (CREA MIX)",
+            variable=self.mix_include_subfolders_var,
+            command=self._on_mix_subfolders_toggled,
+        )
+        self.mix_subfolders_checkbox.grid(
+            row=row, column=0, columnspan=3,
+            padx=10, pady=(0, 8), sticky="w"
+        )
+        self._add_tooltip(
+            self.mix_subfolders_checkbox,
+            "Se attivo include gli MP3 nelle sottocartelle, escludendo automaticamente le cartelle di output diagnostica.",
         )
         row += 1
 
@@ -557,42 +579,6 @@ class MixCreatorApp(ctk.CTk):
             row=row, column=0, columnspan=3,
             padx=10, pady=(7, 10), sticky="w"
         )
-        row += 1
-
-        self._build_diagnostics_launcher(row)
-
-    def _build_diagnostics_launcher(self, row: int) -> None:
-        card = ctk.CTkFrame(self.left_panel)
-        card.grid(
-            row=row,
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            padx=8,
-            pady=(10, 8),
-        )
-        card.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            card,
-            text="Diagnostica MP3",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            anchor="w",
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(8, 4))
-
-        ctk.CTkLabel(
-            card,
-            text="Apri la finestra dedicata per analisi, riparazione e report.",
-            anchor="w",
-        ).grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
-
-        button = ctk.CTkButton(
-            card,
-            text="Apri Diagnostica e Riparazione MP3",
-            command=self.open_diagnostics_window,
-            height=34,
-        )
-        button.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
 
     def _build_diagnostics_section(self, parent, start_row: int = 0) -> None:
         diag_card = ctk.CTkFrame(parent)
@@ -654,19 +640,6 @@ class MixCreatorApp(ctk.CTk):
             "e include i risultati nei report.",
         )
 
-        self.diagnostics_winlive_autocorrect_checkbox = ctk.CTkCheckBox(
-            diag_card,
-            text="Correggi automaticamente\ngli errori normalizzabili",
-            variable=self.diagnostics_winlive_autocorrect_var,
-            command=self._on_diagnostics_winlive_autocorrect_toggle,
-        )
-        self.diagnostics_winlive_autocorrect_checkbox.grid(row=6, column=0, columnspan=3, sticky="w", padx=30, pady=(0, 4))
-        self._add_tooltip(
-            self.diagnostics_winlive_autocorrect_checkbox,
-            "Applica esclusivamente\n"
-            "le normalizzazioni sicure\n"
-            "previste dal motore WinLive.",
-        )
         self._sync_diagnostics_winlive_controls_state()
 
         ctk.CTkLabel(diag_card, text="Cartella di output").grid(row=7, column=0, sticky="w", padx=10, pady=5)
@@ -703,28 +676,25 @@ class MixCreatorApp(ctk.CTk):
 
         buttons_frame = ctk.CTkFrame(diag_card, fg_color="transparent")
         buttons_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
-        buttons_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
-
-        self.diagnostics_analyze_button = ctk.CTkButton(
-            buttons_frame,
-            text="Analizza",
-            command=self.start_diagnostics_analysis,
-        )
-        self.diagnostics_analyze_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        buttons_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.diagnostics_repair_button = ctk.CTkButton(
             buttons_frame,
-            text="Analizza e Ripara",
+            text="Analizza e ripara",
             command=self.start_diagnostics_repair,
         )
-        self.diagnostics_repair_button.grid(row=0, column=1, sticky="ew", padx=4)
+        self.diagnostics_repair_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._add_tooltip(
+            self.diagnostics_repair_button,
+            "Analizza i file selezionati, applica le correzioni disponibili quando necessarie e genera un'unica cartella di esito in base ai controlli attivati.",
+        )
 
         self.diagnostics_reverify_button = ctk.CTkButton(
             buttons_frame,
             text="Riverifica file problematici",
             command=self.start_selective_reverify,
         )
-        self.diagnostics_reverify_button.grid(row=0, column=2, sticky="ew", padx=4)
+        self.diagnostics_reverify_button.grid(row=0, column=1, sticky="ew", padx=4)
 
         self.diagnostics_stop_button = ctk.CTkButton(
             buttons_frame,
@@ -732,7 +702,7 @@ class MixCreatorApp(ctk.CTk):
             state="disabled",
             command=self.stop_diagnostics,
         )
-        self.diagnostics_stop_button.grid(row=0, column=3, sticky="ew", padx=(4, 0))
+        self.diagnostics_stop_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         self.diagnostics_progress = ctk.CTkProgressBar(diag_card)
         self.diagnostics_progress.grid(row=12, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
@@ -749,7 +719,7 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_count_label.grid(row=0, column=0, sticky="w")
         self.diagnostics_elapsed_label = ctk.CTkLabel(counters_frame, text="Tempo: 00:00:00", anchor="w")
         self.diagnostics_elapsed_label.grid(row=0, column=1, sticky="w")
-        self.diagnostics_eta_label = ctk.CTkLabel(counters_frame, text="Tempo stimato: --", anchor="w")
+        self.diagnostics_eta_label = ctk.CTkLabel(counters_frame, text="Tempo stimato restante: --", anchor="w")
         self.diagnostics_eta_label.grid(row=0, column=2, sticky="w")
 
         self.diagnostics_log_box = ctk.CTkTextbox(diag_card, height=130)
@@ -786,13 +756,6 @@ class MixCreatorApp(ctk.CTk):
 
     def _sync_diagnostics_winlive_controls_state(self) -> None:
         main_enabled = bool(self.diagnostics_verify_winlive_var.get())
-        if not main_enabled and bool(self.diagnostics_winlive_autocorrect_var.get()):
-            self.diagnostics_winlive_autocorrect_var.set(False)
-
-        if hasattr(self, "diagnostics_winlive_autocorrect_checkbox"):
-            self.diagnostics_winlive_autocorrect_checkbox.configure(
-                state="normal" if main_enabled else "disabled"
-            )
         self._update_controls_state()
 
     def _on_diagnostics_integrity_toggle(self) -> None:
@@ -809,9 +772,6 @@ class MixCreatorApp(ctk.CTk):
             self.save_settings()
             return
         self._sync_diagnostics_winlive_controls_state()
-        self.save_settings()
-
-    def _on_diagnostics_winlive_autocorrect_toggle(self) -> None:
         self.save_settings()
 
     def _build_right_panel(self) -> None:
@@ -1104,7 +1064,7 @@ class MixCreatorApp(ctk.CTk):
             timing_frame, 0, 1, "Trascorso", "00:00:00"
         )
         self.remaining_label = self._preview_item(
-            timing_frame, 0, 2, "Residuo", "--:--:--"
+            timing_frame, 0, 2, "Tempo stimato restante", "--:--:--"
         )
 
         self.status_label = ctk.CTkLabel(
@@ -1285,12 +1245,17 @@ class MixCreatorApp(ctk.CTk):
             else:
                 self.exclude_unrecoverable_checkbox.deselect()
 
+            self.mix_include_subfolders_var.set(bool(self.settings.get("mix_include_subfolders", True)))
+            if self.mix_include_subfolders_var.get():
+                self.mix_subfolders_checkbox.select()
+            else:
+                self.mix_subfolders_checkbox.deselect()
+
             verify_mp3 = True
             verify_winlive = False
 
             self.diagnostics_verify_mp3_integrity_var.set(verify_mp3)
             self.diagnostics_verify_winlive_var.set(verify_winlive)
-            self.diagnostics_winlive_autocorrect_var.set(False)
             self._sync_diagnostics_winlive_controls_state()
 
             placement_mode = str(self.settings.get("diagnostics_placement_mode", "copy")).strip().lower()
@@ -1365,13 +1330,14 @@ class MixCreatorApp(ctk.CTk):
             self.save_project_as_button.configure(state="normal" if has_folder else "disabled")
 
         if hasattr(self, "extract_song_button"):
-            self.extract_song_button.configure(state="normal")
+            has_temporal_data = self._has_valid_last_mix_temporal_data()
+            self.extract_song_button.configure(state="normal" if has_temporal_data else "disabled")
             if self._extract_song_tooltip is not None:
-                self._extract_song_tooltip.text = EXTRACT_SONG_TOOLTIP
+                if has_temporal_data:
+                    self._extract_song_tooltip.text = EXTRACT_SONG_TOOLTIP
+                else:
+                    self._extract_song_tooltip.text = "Non sono disponibili i dati temporali dell'ultimo mix."
 
-        if hasattr(self, "diagnostics_analyze_button"):
-            diagnostics_enabled = self._diagnostics_actions_enabled()
-            self.diagnostics_analyze_button.configure(state="normal" if diagnostics_enabled and not is_diag_running else "disabled")
         if hasattr(self, "diagnostics_repair_button"):
             diagnostics_enabled = self._diagnostics_actions_enabled()
             self.diagnostics_repair_button.configure(state="normal" if diagnostics_enabled and not is_diag_running else "disabled")
@@ -1385,11 +1351,6 @@ class MixCreatorApp(ctk.CTk):
             self.diagnostics_placement_move_radio.configure(state="disabled" if is_diag_running else "normal")
         if hasattr(self, "diagnostics_winlive_checkbox"):
             self.diagnostics_winlive_checkbox.configure(state="disabled" if is_diag_running else "normal")
-        if hasattr(self, "diagnostics_winlive_autocorrect_checkbox"):
-            can_edit_autocorrect = (not is_diag_running) and bool(self.diagnostics_verify_winlive_var.get())
-            self.diagnostics_winlive_autocorrect_checkbox.configure(
-                state="normal" if can_edit_autocorrect else "disabled"
-            )
 
     def _diagnostics_actions_enabled(self) -> bool:
         verify_mp3 = bool(self.diagnostics_verify_mp3_integrity_var.get())
@@ -1429,6 +1390,7 @@ class MixCreatorApp(ctk.CTk):
             "normalize_audio": bool(self.normalize_checkbox.get()),
             "continue_short_tracks": bool(self.short_checkbox.get()),
             "exclude_unrecoverable_from_mix": bool(self.exclude_unrecoverable_var.get()),
+            "mix_include_subfolders": bool(self.mix_include_subfolders_var.get()),
             "output_name": self.output_name_entry.get().strip() or "MixFinale",
             "output_folder": self.output_entry.get().strip(),
             "application_version": APP_VERSION
@@ -1770,6 +1732,12 @@ class MixCreatorApp(ctk.CTk):
             else:
                 self.exclude_unrecoverable_checkbox.deselect()
 
+            self.mix_include_subfolders_var.set(self._safe_bool_setting(settings.get("mix_include_subfolders"), True))
+            if self.mix_include_subfolders_var.get():
+                self.mix_subfolders_checkbox.select()
+            else:
+                self.mix_subfolders_checkbox.deselect()
+
             output_name = str(settings.get("output_name", self.output_name_entry.get().strip() or "MixFinale"))
             self._replace_entry(self.output_name_entry, output_name)
 
@@ -1874,9 +1842,14 @@ class MixCreatorApp(ctk.CTk):
             else:
                 self.exclude_unrecoverable_checkbox.deselect()
 
+            self.mix_include_subfolders_var.set(bool(self.settings.get("mix_include_subfolders", True)))
+            if self.mix_include_subfolders_var.get():
+                self.mix_subfolders_checkbox.select()
+            else:
+                self.mix_subfolders_checkbox.deselect()
+
             self.diagnostics_verify_mp3_integrity_var.set(True)
             self.diagnostics_verify_winlive_var.set(False)
-            self.diagnostics_winlive_autocorrect_var.set(False)
             self._sync_diagnostics_winlive_controls_state()
 
             self.last_generated_mix_data = None
@@ -1926,7 +1899,214 @@ class MixCreatorApp(ctk.CTk):
 
         self._open_project_from_path(project_path)
 
+    @staticmethod
+    def _normalize_relative_mp3_path(value: Any) -> str | None:
+        if value is None:
+            return None
+
+        raw = str(value).strip().replace("\\", "/")
+        if not raw:
+            return None
+
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            return None
+
+        normalized_parts: list[str] = []
+        for part in raw.split("/"):
+            item = part.strip()
+            if item in ("", "."):
+                continue
+            if item == "..":
+                return None
+            normalized_parts.append(item)
+
+        if not normalized_parts:
+            return None
+
+        normalized = Path(*normalized_parts).as_posix()
+        if Path(normalized).suffix.lower() != ".mp3":
+            return None
+        return normalized
+
+    @staticmethod
+    def _path_compare_key(relative_path: str) -> str:
+        return relative_path.casefold() if os.name == "nt" else relative_path
+
+    def _collect_saved_project_track_paths(self, loaded_project: dict[str, Any]) -> list[str]:
+        tracks = loaded_project.get("tracks")
+        if not isinstance(tracks, list):
+            return []
+
+        ordered_paths: list[str] = []
+        seen: set[str] = set()
+        for item in tracks:
+            if not isinstance(item, dict):
+                continue
+            relative = self._normalize_relative_mp3_path(item.get("relative_path"))
+            if relative is None:
+                relative = self._normalize_relative_mp3_path(item.get("file_name"))
+            if relative is None:
+                continue
+            key = self._path_compare_key(relative)
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered_paths.append(relative)
+
+        return ordered_paths
+
+    def _collect_saved_project_track_clip_info(self, loaded_project: dict[str, Any]) -> dict[str, ClipInfo]:
+        tracks = loaded_project.get("tracks")
+        if not isinstance(tracks, list):
+            return {}
+
+        clip_by_key: dict[str, ClipInfo] = {}
+        for item in tracks:
+            if not isinstance(item, dict):
+                continue
+            relative = self._normalize_relative_mp3_path(item.get("relative_path"))
+            if relative is None:
+                relative = self._normalize_relative_mp3_path(item.get("file_name"))
+            if relative is None:
+                continue
+            key = self._path_compare_key(relative)
+            if key in clip_by_key:
+                continue
+            clip_by_key[key] = ClipInfo.from_dict(item.get("clip_info"))
+        return clip_by_key
+
+    def _compare_project_tracks_with_folder(
+        self,
+        *,
+        loaded_project: dict[str, Any],
+        source_folder: str,
+        include_subfolders: bool,
+    ) -> tuple[list[str], list[str], list[str]]:
+        saved_paths = self._collect_saved_project_track_paths(loaded_project)
+        scanned_paths = self.scan_mp3_files(source_folder, include_subfolders=include_subfolders)
+
+        saved_map = {
+            self._path_compare_key(path): path
+            for path in saved_paths
+        }
+        scanned_map = {
+            self._path_compare_key(path): path
+            for path in scanned_paths
+        }
+
+        added_keys = [key for key in scanned_map.keys() if key not in saved_map]
+        missing_keys = [key for key in saved_map.keys() if key not in scanned_map]
+
+        added = [scanned_map[key] for key in added_keys]
+        missing = [saved_map[key] for key in missing_keys]
+        return added, missing, scanned_paths
+
+    @staticmethod
+    def _format_project_variation_lines(title: str, items: list[str], max_items: int = 10) -> list[str]:
+        lines = [title]
+        if not items:
+            lines.append("- Nessuno")
+            return lines
+
+        head = items[:max_items]
+        lines.extend(f"- {name}" for name in head)
+        extra = len(items) - len(head)
+        if extra > 0:
+            lines.append(f"... e altri {extra} file")
+        return lines
+
+    def _ask_project_source_variation_action(
+        self,
+        *,
+        added_files: list[str],
+        missing_files: list[str],
+    ) -> str:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Progetto modificato rispetto alla cartella sorgente")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        container = ctk.CTkFrame(dialog)
+        container.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(
+            container,
+            text="La cartella associata al progetto contiene variazioni rispetto all'elenco salvato.",
+            justify="left",
+            anchor="w",
+            wraplength=680,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(fill="x", padx=2, pady=(0, 10))
+
+        ctk.CTkLabel(
+            container,
+            text=(
+                f"File aggiunti: {len(added_files)}\n"
+                f"File mancanti: {len(missing_files)}\n\n"
+                "L'elenco dei brani del progetto potrebbe quindi risultare diverso da quello originale."
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=680,
+        ).pack(fill="x", padx=2, pady=(0, 10))
+
+        details = []
+        details.extend(self._format_project_variation_lines("File aggiunti:", added_files))
+        details.append("")
+        details.extend(self._format_project_variation_lines("File mancanti:", missing_files))
+
+        details_box = ctk.CTkTextbox(container, height=220, width=720)
+        details_box.pack(fill="both", expand=True)
+        details_box.insert("1.0", "\n".join(details))
+        details_box.configure(state="disabled")
+
+        result = {"value": "cancel"}
+
+        buttons = ctk.CTkFrame(container, fg_color="transparent")
+        buttons.pack(fill="x", pady=(12, 0))
+        buttons.grid_columnconfigure((0, 1, 2), weight=1)
+
+        def _set_and_close(value: str) -> None:
+            result["value"] = value
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        ctk.CTkButton(
+            buttons,
+            text="Mantieni elenco del progetto",
+            command=lambda: _set_and_close("keep"),
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            buttons,
+            text="Aggiorna elenco dalla cartella",
+            command=lambda: _set_and_close("refresh"),
+        ).grid(row=0, column=1, padx=6, sticky="ew")
+
+        ctk.CTkButton(
+            buttons,
+            text="Annulla apertura",
+            fg_color="#8f3a3a",
+            hover_color="#7c3232",
+            command=lambda: _set_and_close("cancel"),
+        ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _set_and_close("cancel"))
+        self.wait_window(dialog)
+        return str(result.get("value", "cancel"))
+
     def _open_project_from_path(self, project_path: str) -> None:
+        project_choice = "keep"
+        compared_added: list[str] = []
+        compared_missing: list[str] = []
+        scanned_paths_precheck: list[str] = []
+        include_subfolders = True
+        loaded: dict[str, Any] | None = None
         try:
             loaded = load_project_file(project_path)
             source_folder = Path(str(loaded.get("source_folder", ""))).expanduser()
@@ -1939,7 +2119,33 @@ class MixCreatorApp(ctk.CTk):
                 if not selected_folder:
                     return
 
-            result = resolve_project_files(loaded, selected_folder=selected_folder)
+            resolved_source_folder = str(Path(selected_folder or source_folder).expanduser())
+            loaded_settings = loaded.get("settings") if isinstance(loaded.get("settings"), dict) else {}
+            include_subfolders = self._safe_bool_setting(
+                loaded_settings.get("mix_include_subfolders"),
+                True,
+            )
+
+            compared_added, compared_missing, scanned_paths_precheck = self._compare_project_tracks_with_folder(
+                loaded_project=loaded,
+                source_folder=resolved_source_folder,
+                include_subfolders=include_subfolders,
+            )
+
+            if compared_added or compared_missing:
+                project_choice = self._ask_project_source_variation_action(
+                    added_files=compared_added,
+                    missing_files=compared_missing,
+                )
+                if project_choice == "cancel":
+                    return
+
+            result = resolve_project_files(
+                loaded,
+                selected_folder=selected_folder,
+                include_subfolders=include_subfolders,
+                auto_append_new=False,
+            )
 
         except ProjectValidationError as error:
             messagebox.showerror("Progetto non valido", str(error))
@@ -1951,16 +2157,58 @@ class MixCreatorApp(ctk.CTk):
             messagebox.showerror("Errore apertura progetto", str(error))
             return
 
-        new_order: list[str] = []
-        new_clip_info: dict[str, ClipInfo] = {}
+        restored_order: list[str] = []
+        restored_clip_info: dict[str, ClipInfo] = {}
         for item in result.tracks:
             file_name = str(item["file_name"])
-            new_order.append(file_name)
+            restored_order.append(file_name)
             clip_info = item.get("clip_info")
             if isinstance(clip_info, ClipInfo):
-                new_clip_info[file_name] = clip_info
+                restored_clip_info[file_name] = clip_info
             else:
-                new_clip_info[file_name] = ClipInfo.from_dict(clip_info)
+                restored_clip_info[file_name] = ClipInfo.from_dict(clip_info)
+
+        scanned_paths_runtime = self.scan_mp3_files(
+            result.source_folder,
+            include_subfolders=include_subfolders,
+        )
+
+        if project_choice == "refresh":
+            scan_for_refresh = scanned_paths_runtime if scanned_paths_runtime else scanned_paths_precheck
+            resolved_by_key: dict[str, ClipInfo] = {
+                self._path_compare_key(name): restored_clip_info.get(name, ClipInfo())
+                for name in restored_order
+            }
+            new_order = list(scan_for_refresh)
+            new_clip_info = {
+                name: resolved_by_key.get(self._path_compare_key(name), ClipInfo())
+                for name in new_order
+            }
+        else:
+            new_order = list(restored_order)
+            new_clip_info = dict(restored_clip_info)
+
+            # Fallback robusto per progetti legacy/ambigui: mantiene l'ordine salvato,
+            # includendo solo i file realmente disponibili oggi.
+            if not new_order and loaded is not None and scanned_paths_runtime:
+                saved_order = self._collect_saved_project_track_paths(loaded)
+                saved_clip_by_key = self._collect_saved_project_track_clip_info(loaded)
+                scanned_key_to_path = {
+                    self._path_compare_key(path): path
+                    for path in scanned_paths_runtime
+                }
+                fallback_order: list[str] = []
+                fallback_clip_info: dict[str, ClipInfo] = {}
+                for saved_path in saved_order:
+                    key = self._path_compare_key(saved_path)
+                    current_path = scanned_key_to_path.get(key)
+                    if current_path is None:
+                        continue
+                    fallback_order.append(current_path)
+                    fallback_clip_info[current_path] = saved_clip_by_key.get(key, ClipInfo())
+                if fallback_order:
+                    new_order = fallback_order
+                    new_clip_info = fallback_clip_info
 
         self._suspend_project_dirty_tracking = True
         try:
@@ -1996,18 +2244,26 @@ class MixCreatorApp(ctk.CTk):
         self._append_log(
             "Progetto caricato: "
             f"{len(new_order)} ripristinati, "
-            f"{len(result.missing_files)} mancanti, "
-            f"{len(result.new_files)} nuovi, "
+            f"{len(compared_missing or result.missing_files)} mancanti, "
+            f"{len(compared_added)} nuovi, "
             f"{len(result.modified_files)} modificati."
         )
 
-        if result.missing_files or result.new_files or result.modified_files or result.warnings:
+        if project_choice == "keep" and compared_missing:
+            warning_lines = [
+                "Alcuni file previsti dal progetto non sono disponibili nella cartella sorgente:",
+                "",
+            ]
+            warning_lines.extend(self._format_project_variation_lines("File mancanti:", compared_missing))
+            messagebox.showwarning("File mancanti nel progetto", "\n".join(warning_lines))
+
+        if result.missing_files or result.modified_files or result.warnings:
             summary_lines = [
                 "Progetto caricato.",
                 "",
                 f"Brani ripristinati: {len(new_order)}",
                 f"Brani mancanti: {len(result.missing_files)}",
-                f"Nuovi brani trovati: {len(result.new_files)}",
+                f"Nuovi brani trovati: {len(compared_added)}",
                 f"Brani modificati: {len(result.modified_files)}"
             ]
 
@@ -2087,6 +2343,19 @@ class MixCreatorApp(ctk.CTk):
     def _on_project_setting_toggled(self) -> None:
         self.update_preview()
         self._mark_project_dirty()
+
+    def _on_mix_subfolders_toggled(self) -> None:
+        self.update_preview()
+        self._mark_project_dirty()
+
+        if self._suspend_project_dirty_tracking:
+            return
+
+        self.save_settings()
+
+        folder = self.input_entry.get().strip()
+        if folder and Path(folder).is_dir():
+            self.load_mp3_list(mark_dirty=False)
 
     def _on_reuse_previous_toggled(self) -> None:
         self._update_controls_state()
@@ -2446,9 +2715,6 @@ class MixCreatorApp(ctk.CTk):
         self._set_diagnostics_entry_values(output_folder=folder)
         self._raise_diagnostics_window()
 
-    def start_diagnostics_analysis(self) -> None:
-        self._start_diagnostics_worker(repair_mode=False)
-
     def start_diagnostics_repair(self) -> None:
         self._start_diagnostics_worker(repair_mode=True)
 
@@ -2550,7 +2816,6 @@ class MixCreatorApp(ctk.CTk):
         selected_subfolders = bool(self.diagnostics_include_subfolders_var.get()) if include_subfolders is None else bool(include_subfolders)
         verify_mp3_integrity = bool(self.diagnostics_verify_mp3_integrity_var.get())
         verify_winlive = bool(self.diagnostics_verify_winlive_var.get())
-        winlive_autocorrect = bool(self.diagnostics_winlive_autocorrect_var.get()) if verify_winlive else False
         placement_mode = str(self.diagnostics_placement_mode_var.get() or "copy").strip().lower()
         if placement_mode not in ("copy", "move"):
             placement_mode = "copy"
@@ -2601,11 +2866,12 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_worker_total = 0
         self.diagnostics_last_progress = 0
         self.diagnostics_worker_start_time = time.monotonic()
+        self.diagnostics_eta_estimator.reset(total_units=0, initial_seconds_per_unit=8.0)
         self.diagnostics_progress.set(0)
         self.diagnostics_status_label.configure(text=start_message)
         self.diagnostics_count_label.configure(text="File analizzati: 0 / 0")
         self.diagnostics_elapsed_label.configure(text="Tempo: 00:00:00")
-        self.diagnostics_eta_label.configure(text="Tempo stimato: calcolo in corso...")
+        self.diagnostics_eta_label.configure(text="Tempo stimato restante: --")
         self._append_diagnostics_log(log_message)
         self._append_diagnostics_log(
             f"Integrità MP3: {'ATTIVA' if verify_mp3_integrity else 'DISATTIVA'}"
@@ -2613,15 +2879,8 @@ class MixCreatorApp(ctk.CTk):
         self._append_diagnostics_log(
             f"WinLive: {'ATTIVO' if verify_winlive else 'DISATTIVO'}"
         )
-        self._append_diagnostics_log(
-            f"Correzione automatica WinLive: {'ATTIVA' if winlive_autocorrect else 'DISATTIVA'}"
-        )
         if verify_winlive:
             self._append_diagnostics_log("Verifica WinLive attivata.")
-            if winlive_autocorrect:
-                self._append_diagnostics_log("Correzione automatica WinLive attivata.")
-            else:
-                self._append_diagnostics_log("Correzione automatica WinLive disattivata.")
         self._start_diagnostics_timer()
 
         try:
@@ -2634,7 +2893,6 @@ class MixCreatorApp(ctk.CTk):
                 selected_input_files=selected_input_files,
                 verify_mp3_integrity=verify_mp3_integrity,
                 verify_winlive=verify_winlive,
-                winlive_autocorrect=winlive_autocorrect,
             )
         except Exception as error:
             self.diagnostics_run_mode = "normal"
@@ -2658,6 +2916,12 @@ class MixCreatorApp(ctk.CTk):
     def _handle_diagnostics_worker_progress(self, current: int, total: int, message: str) -> None:
         self.diagnostics_worker_total = max(self.diagnostics_worker_total, int(total))
         self.diagnostics_last_progress = max(0, min(int(current), int(total) if total > 0 else int(current)))
+
+        if total > 0:
+            if current <= 0:
+                self.diagnostics_eta_estimator.reset(total_units=total, initial_seconds_per_unit=8.0)
+            else:
+                self.diagnostics_eta_estimator.observe(current, total_units=total)
 
         if total > 0:
             percent = max(0.0, min(1.0, current / float(total)))
@@ -2743,7 +3007,7 @@ class MixCreatorApp(ctk.CTk):
 
         self.diagnostics_run_mode = "normal"
         self.diagnostics_reverify_selection = None
-        self.diagnostics_eta_label.configure(text="Tempo stimato: completato")
+        self.diagnostics_eta_label.configure(text="Tempo stimato restante: completato")
         self._raise_diagnostics_window()
 
     @staticmethod
@@ -2808,7 +3072,7 @@ class MixCreatorApp(ctk.CTk):
     def _handle_diagnostics_worker_error(self, message: str) -> None:
         self._stop_diagnostics_timer()
         self.diagnostics_status_label.configure(text="Errore diagnostica MP3")
-        self.diagnostics_eta_label.configure(text="Tempo stimato: non disponibile")
+        self.diagnostics_eta_label.configure(text="Tempo stimato restante: non disponibile")
         self._append_diagnostics_log(f"ERRORE: {message}")
         self.diagnostics_run_mode = "normal"
         self.diagnostics_reverify_selection = None
@@ -2822,7 +3086,7 @@ class MixCreatorApp(ctk.CTk):
     def _handle_diagnostics_worker_cancelled(self, message: str) -> None:
         self._stop_diagnostics_timer()
         self.diagnostics_status_label.configure(text="Diagnostica MP3 interrotta")
-        self.diagnostics_eta_label.configure(text="Tempo stimato: annullato")
+        self.diagnostics_eta_label.configure(text="Tempo stimato restante: annullato")
         self._append_diagnostics_log(message)
         self.diagnostics_run_mode = "normal"
         self.diagnostics_reverify_selection = None
@@ -2952,38 +3216,42 @@ class MixCreatorApp(ctk.CTk):
         elapsed = max(0.0, time.monotonic() - self.diagnostics_worker_start_time)
         self.diagnostics_elapsed_label.configure(text=f"Tempo: {self._format_duration(elapsed)}")
         self._update_diagnostics_eta()
-        self.diagnostics_timer_job = self.after(1000, self._tick_diagnostics_timer)
+        self.diagnostics_timer_job = self.after(750, self._tick_diagnostics_timer)
 
     def _update_diagnostics_eta(self) -> None:
         if self.diagnostics_worker_start_time is None:
-            self.diagnostics_eta_label.configure(text="Tempo stimato: --")
+            self.diagnostics_eta_label.configure(text="Tempo stimato restante: --")
             return
 
         total = self.diagnostics_worker_total
         progress = self.diagnostics_last_progress
-        if total <= 0 or progress <= 0:
-            self.diagnostics_eta_label.configure(text="Tempo stimato: calcolo in corso...")
+        if total <= 0:
+            self.diagnostics_eta_label.configure(text="Tempo stimato restante: --")
             return
 
-        elapsed = max(0.0, time.monotonic() - self.diagnostics_worker_start_time)
-        avg_per_file = elapsed / float(progress)
-        remaining_files = max(0, total - progress)
-        remaining = max(0.0, avg_per_file * float(remaining_files))
-        if remaining < 60:
-            seconds_text = int(round(remaining))
-            self.diagnostics_eta_label.configure(text=f"Tempo stimato: {seconds_text} secondi")
-            return
+        remaining_text = self.diagnostics_eta_estimator.format_remaining()
+        if remaining_text == "calcolo in corso...":
+            if progress <= 0:
+                remaining = max(0.0, float(total) * 8.0)
+            else:
+                elapsed = max(0.0, time.monotonic() - self.diagnostics_worker_start_time)
+                avg_per_file = elapsed / float(progress)
+                remaining_files = max(0, total - progress)
+                remaining = max(0.0, avg_per_file * float(remaining_files))
 
-        if remaining >= 3600:
-            self.diagnostics_eta_label.configure(text=f"Tempo stimato: {self._format_duration(remaining)}")
-            return
+            if remaining < 60:
+                remaining_text = f"{int(round(remaining))} secondi"
+            elif remaining >= 3600:
+                remaining_text = self._format_duration(remaining)
+            else:
+                minutes = int(remaining // 60)
+                seconds = int(round(remaining % 60))
+                if seconds == 60:
+                    minutes += 1
+                    seconds = 0
+                remaining_text = f"{minutes:02d}:{seconds:02d}"
 
-        minutes = int(remaining // 60)
-        seconds = int(round(remaining % 60))
-        if seconds == 60:
-            minutes += 1
-            seconds = 0
-        self.diagnostics_eta_label.configure(text=f"Tempo stimato: {minutes:02d}:{seconds:02d}")
+        self.diagnostics_eta_label.configure(text=f"Tempo stimato restante: {remaining_text}")
 
     def _append_diagnostics_log(self, message: str) -> None:
         if not hasattr(self, "diagnostics_log_box"):
@@ -3033,6 +3301,13 @@ class MixCreatorApp(ctk.CTk):
             if not file_name:
                 continue
             by_name[file_name] = item
+            normalized_name = self._normalize_relative_mp3_path(file_name)
+            if normalized_name:
+                by_name[normalized_name] = item
+                by_name[self._path_compare_key(normalized_name)] = item
+            base_name = Path(file_name).name
+            if base_name:
+                by_name[base_name] = item
             status_map[file_name] = str(item.get("status", ""))
             if normalized_path:
                 by_path[normalized_path] = item
@@ -3133,6 +3408,18 @@ class MixCreatorApp(ctk.CTk):
     def _integrity_info_for_track(self, file_name: str) -> dict[str, Any] | None:
         if file_name in self._diagnostics_integrity_by_file:
             return self._diagnostics_integrity_by_file[file_name]
+
+        normalized_name = self._normalize_relative_mp3_path(file_name)
+        if normalized_name and normalized_name in self._diagnostics_integrity_by_file:
+            return self._diagnostics_integrity_by_file[normalized_name]
+
+        name_key = self._path_compare_key(normalized_name or file_name)
+        if name_key in self._diagnostics_integrity_by_file:
+            return self._diagnostics_integrity_by_file[name_key]
+
+        base_name = Path(file_name).name
+        if base_name in self._diagnostics_integrity_by_file:
+            return self._diagnostics_integrity_by_file[base_name]
 
         source_folder = self.input_entry.get().strip() if hasattr(self, "input_entry") else ""
         if source_folder:
@@ -3251,8 +3538,20 @@ class MixCreatorApp(ctk.CTk):
         self.track_clip_info = updated
 
     @staticmethod
-    def scan_mp3_files(folder_path: str | Path) -> list[str]:
-        return [path.name for path in scan_mp3_files(folder_path)]
+    def scan_mp3_files(folder_path: str | Path, *, include_subfolders: bool = False) -> list[str]:
+        folder = Path(folder_path).expanduser()
+        paths = scan_mp3_files(
+            folder,
+            include_subfolders=include_subfolders,
+            exclude_diagnostics_sessions=True,
+        )
+        names: list[str] = []
+        for path in paths:
+            try:
+                names.append(path.relative_to(folder).as_posix())
+            except ValueError:
+                names.append(path.name)
+        return names
 
     def _refresh_track_list_box(
         self,
@@ -3355,8 +3654,9 @@ class MixCreatorApp(ctk.CTk):
 
         current_order = self.get_ordered_track_names()
 
+        include_subfolders = bool(self.mix_include_subfolders_var.get())
         try:
-            disk_files = self.scan_mp3_files(folder)
+            disk_files = self.scan_mp3_files(folder, include_subfolders=include_subfolders)
         except (OSError, FileNotFoundError) as error:
             messagebox.showerror(
                 "Errore",
@@ -3401,7 +3701,8 @@ class MixCreatorApp(ctk.CTk):
             "Aggiornamento cartella completato: "
             f"+{len(new_files)} nuovi, "
             f"-{len(removed)} rimossi, "
-            f"totale {self.track_count}."
+            f"totale {self.track_count}; "
+            f"sottocartelle={'ON' if include_subfolders else 'OFF'}."
         )
 
         if new_files or removed:
@@ -3413,8 +3714,9 @@ class MixCreatorApp(ctk.CTk):
         self._update_controls_state()
 
     def load_mp3_list(self, mark_dirty: bool = False) -> None:
+        include_subfolders = bool(self.mix_include_subfolders_var.get())
         try:
-            files = self.scan_mp3_files(self.input_folder)
+            files = self.scan_mp3_files(self.input_folder, include_subfolders=include_subfolders)
         except (OSError, FileNotFoundError) as error:
             self.status_label.configure(text=f"Errore lettura cartella: {error}")
             return
@@ -3427,7 +3729,10 @@ class MixCreatorApp(ctk.CTk):
 
         self.status_label.configure(text=f"{len(files)} MP3 trovati")
         self.status_bar_label.configure(text=f"{len(files)} MP3 caricati")
-        self._append_log(f"Trovati {len(files)} file MP3.")
+        self._append_log(
+            f"Trovati {len(files)} file MP3 "
+            f"(sottocartelle={'ON' if include_subfolders else 'OFF'})."
+        )
         self.update_preview()
         self._update_tracks_count()
         self._update_controls_state()
@@ -3711,6 +4016,90 @@ class MixCreatorApp(ctk.CTk):
 
         return [name for name in names if not self._is_track_unrecoverable(name)]
 
+    @staticmethod
+    def _format_short_file_list(items: list[str], limit: int = 10) -> str:
+        if not items:
+            return "- Nessuno"
+        head = items[:limit]
+        lines = [f"- {name}" for name in head]
+        extra = len(items) - len(head)
+        if extra > 0:
+            lines.append(f"... e altri {extra} file")
+        return "\n".join(lines)
+
+    def _ask_unrecoverable_mix_action(self, files: list[str]) -> str:
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("File potenzialmente non recuperabili")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        container = ctk.CTkFrame(dialog)
+        container.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(
+            container,
+            text="Nell'elenco sono presenti file classificati come non recuperabili.",
+            anchor="w",
+            justify="left",
+            wraplength=700,
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(fill="x", pady=(0, 6))
+
+        ctk.CTkLabel(
+            container,
+            text=(
+                "La loro inclusione potrebbe provocare errori, interruzioni o anomalie "
+                "audio nel mix finale."
+            ),
+            anchor="w",
+            justify="left",
+            wraplength=700,
+        ).pack(fill="x", pady=(0, 10))
+
+        details_box = ctk.CTkTextbox(container, height=200, width=720)
+        details_box.pack(fill="both", expand=True)
+        details_box.insert("1.0", self._format_short_file_list(files, limit=10))
+        details_box.configure(state="disabled")
+
+        result = {"value": "cancel"}
+
+        actions = ctk.CTkFrame(container, fg_color="transparent")
+        actions.pack(fill="x", pady=(12, 0))
+        actions.grid_columnconfigure((0, 1, 2), weight=1)
+
+        def _set_and_close(value: str) -> None:
+            result["value"] = value
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+
+        ctk.CTkButton(
+            actions,
+            text="Escludi i file e continua",
+            command=lambda: _set_and_close("exclude"),
+        ).grid(row=0, column=0, padx=(0, 6), sticky="ew")
+
+        ctk.CTkButton(
+            actions,
+            text="Includi comunque",
+            command=lambda: _set_and_close("include"),
+        ).grid(row=0, column=1, padx=6, sticky="ew")
+
+        ctk.CTkButton(
+            actions,
+            text="Annulla",
+            fg_color="#8f3a3a",
+            hover_color="#7c3232",
+            command=lambda: _set_and_close("cancel"),
+        ).grid(row=0, column=2, padx=(6, 0), sticky="ew")
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _set_and_close("cancel"))
+        self.wait_window(dialog)
+        return str(result.get("value", "cancel"))
+
     def update_preview(self) -> None:
         clip_seconds = int(round(self.clip_slider.get()))
         crossfade_seconds = int(round(self.crossfade_slider.get()))
@@ -3805,6 +4194,8 @@ class MixCreatorApp(ctk.CTk):
 
         self.start_time = time.monotonic()
         self.last_progress_percent = 0
+        self.mix_eta_phase = ""
+        self.mix_eta_estimator.reset(total_units=0, initial_seconds_per_unit=8.0)
 
         self.create_button.configure(
             state="disabled",
@@ -3815,7 +4206,7 @@ class MixCreatorApp(ctk.CTk):
         self.percent_label.configure(text="0%")
         self.counter_label.configure(text=f"0 / {self.track_count}")
         self.elapsed_label.configure(text="00:00:00")
-        self.remaining_label.configure(text="--:--:--")
+        self.remaining_label.configure(text="Calcolo tempo stimato in corso...")
         self.status_label.configure(text="Avvio elaborazione...")
         self.status_bar_label.configure(text="Creazione mix in corso...")
         self._append_log("Avvio creazione mix.")
@@ -3826,7 +4217,41 @@ class MixCreatorApp(ctk.CTk):
         else:
             self._append_log("Utilizza clip generate in precedenza: disattivo.")
 
+        unrecoverable_files = [
+            file_name
+            for file_name in self.ordered_track_names
+            if self._is_track_unrecoverable(file_name)
+        ]
+
+        session_excluded_unrecoverable: set[str] = set()
+        session_isolated_unrecoverable: set[str] = set()
+        if unrecoverable_files:
+            nr_action = self._ask_unrecoverable_mix_action(unrecoverable_files)
+            if nr_action == "cancel":
+                self._restore_after_work()
+                self.status_bar_label.configure(text="Avvio mix annullato")
+                self._append_log("Creazione mix annullata: presenza file non recuperabili.")
+                return
+            if nr_action == "exclude":
+                session_excluded_unrecoverable = set(unrecoverable_files)
+                self._append_log(
+                    "Esclusione temporanea file non recuperabili per questa generazione: "
+                    f"{len(session_excluded_unrecoverable)} file."
+                )
+            elif nr_action == "include":
+                session_isolated_unrecoverable = set(unrecoverable_files)
+                self._append_log(
+                    "Inclusione autorizzata dall'utente per file non recuperabili: "
+                    f"{len(unrecoverable_files)} file."
+                )
+
         effective_track_names = self._effective_mix_track_names()
+        if session_excluded_unrecoverable:
+            effective_track_names = [
+                name for name in effective_track_names
+                if name not in session_excluded_unrecoverable
+            ]
+
         excluded_count = len(self.ordered_track_names) - len(effective_track_names)
         if excluded_count > 0:
             self._append_log(
@@ -3865,6 +4290,7 @@ class MixCreatorApp(ctk.CTk):
                     if reuse_enabled
                     else None
                 ),
+                isolated_input_names=sorted(session_isolated_unrecoverable) if session_isolated_unrecoverable else None,
             )
 
             self._start_timer()
@@ -3918,54 +4344,54 @@ class MixCreatorApp(ctk.CTk):
         rows: list[dict[str, str]] = []
         for index, item in enumerate(tracks_data, start=1):
             file_name = str(item.get("file_name", f"track_{index:03d}.mp3"))
-            source_path = str(item.get("source_path", ""))
             mix_start_ms = self._safe_int(item.get("mix_start_ms"))
-            mix_time = self._format_hhmmss_from_ms(mix_start_ms) if mix_start_ms is not None else "—"
+            mix_end_ms = self._safe_int(item.get("mix_end_ms"))
+            if mix_start_ms is None or mix_end_ms is None:
+                continue
+
+            start_ms = max(0, int(mix_start_ms))
+            end_ms = max(start_ms, int(mix_end_ms))
+            duration_ms = max(0, end_ms - start_ms)
+
             rows.append(
                 {
                     "number": f"{index:03d}",
-                    "title": Path(file_name).name,
-                    "path": source_path,
-                    "mix_time": mix_time,
+                    "title": Path(file_name).stem,
+                    "from": self._format_hhmmss_from_ms(start_ms),
+                    "to": self._format_hhmmss_from_ms(end_ms),
+                    "duration": self._format_hhmmss_from_ms(duration_ms),
                 }
             )
         return rows
 
-    def _write_song_list_files(self, target_folder: Path, rows: list[dict[str, str]]) -> dict[str, Any]:
-        target_folder.mkdir(parents=True, exist_ok=True)
-
-        txt_path = target_folder / "Elenco_Song.txt"
-        csv_path = target_folder / "Elenco_Song.csv"
-
-        missing_paths: list[str] = []
-        txt_lines: list[str] = []
+    @staticmethod
+    def _serialize_song_timeline(rows: list[dict[str, str]]) -> str:
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\n")
+        writer.writerow(["N", "Nome Song", "Da", "A", "Durata"])
         for row in rows:
-            txt_lines.append(f"{row['number']} - {row['title']}")
-            raw_path = row.get("path", "").strip()
-            if raw_path:
-                try:
-                    if not Path(raw_path).is_file():
-                        missing_paths.append(raw_path)
-                except OSError:
-                    missing_paths.append(raw_path)
+            writer.writerow([
+                row.get("number", ""),
+                row.get("title", ""),
+                row.get("from", "00:00:00"),
+                row.get("to", "00:00:00"),
+                row.get("duration", "00:00:00"),
+            ])
+        return buffer.getvalue()
 
-        txt_path.write_text("\n".join(txt_lines), encoding="utf-8")
+    def _write_song_timeline_files(self, base_folder: Path, rows: list[dict[str, str]]) -> dict[str, str]:
+        base_folder.mkdir(parents=True, exist_ok=True)
+        csv_path = base_folder / "Elenco_Mix.csv"
+        txt_path = base_folder / "Elenco_Mix.txt"
 
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(["Numero", "Titolo", "Percorso file", "Tempo nel mix"])
-            for row in rows:
-                writer.writerow([
-                    row.get("number", ""),
-                    row.get("title", ""),
-                    row.get("path", ""),
-                    row.get("mix_time", "—") or "—",
-                ])
+        content = self._serialize_song_timeline(rows)
+
+        csv_path.write_text(content, encoding="utf-8-sig", newline="")
+        txt_path.write_text(content, encoding="utf-8-sig", newline="")
 
         return {
-            "txt_path": str(txt_path),
             "csv_path": str(csv_path),
-            "missing_paths": missing_paths,
+            "txt_path": str(txt_path),
         }
 
     def _append_extract_log(self, message: str) -> None:
@@ -4060,97 +4486,49 @@ class MixCreatorApp(ctk.CTk):
             messagebox.showwarning("Operazione in corso", "È già in corso un'estrazione song.")
             return
 
-        has_temporal_data = self._has_valid_last_mix_temporal_data()
-        if has_temporal_data:
+        if not self._has_valid_last_mix_temporal_data():
             messagebox.showinfo(
                 "Estrai Song",
-                "Sono disponibili i dati temporali dell'ultimo mix. "
-                "Verranno estratte le clip audio effettivamente utilizzate."
+                "Non sono disponibili i dati temporali dell'ultimo mix."
             )
-        else:
-            messagebox.showinfo(
-                "Estrai Song",
-                "I dati temporali dell'ultimo mix non sono disponibili. "
-                "Verrà esportato esclusivamente l'elenco ordinato delle Song."
-            )
-
-        tracks_data = self._get_ordered_new_mix_tracks() if has_temporal_data else []
-
-        target_folder = self._resolve_song_extraction_folder()
-        try:
-            target_folder.mkdir(parents=True, exist_ok=True)
-        except OSError as error:
-            messagebox.showerror("Errore", f"Impossibile creare la cartella di output:\n{error}")
             return
 
-        if not has_temporal_data:
-            rows = self._build_song_rows_from_current_order()
-            try:
-                list_result = self._write_song_list_files(target_folder, rows)
-            except OSError as error:
-                messagebox.showerror("Errore", f"Impossibile esportare l'elenco Song:\n{error}")
-                return
-
-            missing_paths = list_result.get("missing_paths", [])
-            if not isinstance(missing_paths, list):
-                missing_paths = []
-
-            self._append_log(
-                "Elenco Song esportato senza dati temporali: "
-                f"{len(rows)} elementi in {target_folder}."
-            )
-
-            summary_lines = [
-                "Esportazione elenco Song completata.",
-                "",
-                f"Cartella output: {target_folder}",
-                f"File TXT: {list_result.get('txt_path', '')}",
-                f"File CSV: {list_result.get('csv_path', '')}",
-                f"Song in elenco: {len(rows)}",
-                f"Percorsi mancanti: {len(missing_paths)}",
-            ]
-            if missing_paths:
-                summary_lines.append("")
-                summary_lines.append("Alcuni file sorgente risultano mancanti:")
-                summary_lines.extend(f"- {path}" for path in missing_paths[:12])
-                if len(missing_paths) > 12:
-                    summary_lines.append(f"- ... altri {len(missing_paths) - 12}")
-
-            messagebox.showinfo("Estrai Song", "\n".join(summary_lines))
-            return
-
+        tracks_data = self._get_ordered_new_mix_tracks()
         if not tracks_data:
-            messagebox.showwarning(
-                "Estrai Song",
-                "I dati temporali risultano disponibili ma non utilizzabili. "
-                "Verrà esportato solo l'elenco Song."
-            )
-            rows = self._build_song_rows_from_current_order()
-            try:
-                self._write_song_list_files(target_folder, rows)
-            except OSError as error:
-                messagebox.showerror("Errore", f"Impossibile esportare l'elenco Song:\n{error}")
+            messagebox.showinfo("Estrai Song", "Non sono disponibili i dati temporali dell'ultimo mix.")
             return
 
-        self._extract_tracks_snapshot = list(tracks_data)
-        self._extract_has_temporal_mode = True
+        output_folder = self.output_entry.get().strip() if hasattr(self, "output_entry") else ""
+        if not output_folder:
+            output_folder = self.input_entry.get().strip() if hasattr(self, "input_entry") else ""
+        if not output_folder:
+            messagebox.showerror("Errore", "Cartella output non disponibile per esportare Elenco_Mix.csv")
+            return
 
-        self._show_extraction_progress_dialog(total=len(tracks_data), target_folder=target_folder)
-        self.status_label.configure(text="Estrazione song in corso...")
-        self.status_bar_label.configure(text="Estrazione song in corso...")
-        self._append_log("Avvio estrazione Song dall'ultimo mix generato.")
-        self._update_controls_state()
+        rows = self._build_song_rows_from_temporal_tracks(tracks_data)
+        if not rows:
+            messagebox.showinfo("Estrai Song", "Non sono disponibili i dati temporali dell'ultimo mix.")
+            return
 
+        target_folder = Path(output_folder)
         try:
-            self.extract_worker.start(
-                tracks_data=tracks_data,
-                output_folder=str(target_folder),
-                bitrate=self.bitrate_combo.get() or "320k",
-            )
-        except Exception as error:
-            self._close_extraction_progress_dialog()
-            self._update_controls_state()
-            messagebox.showerror("Errore", f"Impossibile avviare l'estrazione:\n{error}")
+            exported_paths = self._write_song_timeline_files(target_folder, rows)
+        except OSError as error:
+            messagebox.showerror("Errore", f"Impossibile esportare Elenco_Mix:\n{error}")
+            return
+
+        self._append_log(
+            "Esportazione Elenco_Mix completata: "
+            f"{len(rows)} righe in {exported_paths['csv_path']}."
+        )
+        self.status_bar_label.configure(text="Elenco_Mix esportato")
+        messagebox.showinfo(
+            "Estrai Song",
+            "Esportazione completata.\n\n"
+            f"CSV: {exported_paths['csv_path']}\n"
+            f"TXT: {exported_paths['txt_path']}\n"
+            f"Righe esportate: {len(rows)}"
+        )
 
     def cancel_song_extraction(self) -> None:
         if not self.extract_worker.is_running:
@@ -4293,6 +4671,16 @@ class MixCreatorApp(ctk.CTk):
         percentage = 0 if total <= 0 else max(0, min(100, int((current / total) * 100)))
         self.last_progress_percent = percentage
 
+        phase = "export" if message.startswith("Creazione mix") else "preparation"
+        if phase != self.mix_eta_phase:
+            self.mix_eta_phase = phase
+            initial_seconds = 1.0 if phase == "export" else 8.0
+            self.mix_eta_estimator.reset(total_units=max(0, int(total)), initial_seconds_per_unit=initial_seconds)
+
+        if total > 0 and current > 0:
+            sample_allowed = not message.startswith("Riutilizzo clip precedente")
+            self.mix_eta_estimator.observe(current, total_units=total, sample_allowed=sample_allowed)
+
         self.progress.set(percentage / 100)
         self.percent_label.configure(text=f"{percentage}%")
         self.status_label.configure(text=message)
@@ -4322,25 +4710,25 @@ class MixCreatorApp(ctk.CTk):
         self._update_remaining_time()
 
         self.timer_job = self.after(
-            1000,
+            750,
             self._tick_timer
         )
 
     def _update_remaining_time(self) -> None:
-        if self.start_time is None or self.last_progress_percent <= 0:
+        if self.start_time is None:
             self.remaining_label.configure(text="--:--:--")
             return
 
-        elapsed = time.monotonic() - self.start_time
-        fraction = self.last_progress_percent / 100
-
-        if fraction <= 0:
-            self.remaining_label.configure(text="--:--:--")
+        if self.last_progress_percent <= 0:
+            self.remaining_label.configure(text="Calcolo tempo stimato in corso...")
             return
 
-        estimated_total = elapsed / fraction
-        remaining = max(0, estimated_total - elapsed)
-        self.remaining_label.configure(text=self._format_duration(remaining))
+        remaining_text = self.mix_eta_estimator.format_remaining()
+        if remaining_text == "calcolo in corso...":
+            self.remaining_label.configure(text="Calcolo tempo stimato in corso...")
+            return
+
+        self.remaining_label.configure(text=remaining_text)
 
     def _worker_completed(self, output_path: Path, mix_report: dict[str, Any]) -> None:
         self.after(0, self._handle_worker_completed, output_path, mix_report)
@@ -4473,9 +4861,9 @@ class MixCreatorApp(ctk.CTk):
                 "normalize_audio": bool(self.normalize_checkbox.get()),
                 "continue_short_tracks": bool(self.short_checkbox.get()),
                 "exclude_unrecoverable_from_mix": bool(self.exclude_unrecoverable_var.get()),
+                "mix_include_subfolders": bool(self.mix_include_subfolders_var.get()),
                 "diagnostics_verify_mp3_integrity": bool(self.diagnostics_verify_mp3_integrity_var.get()),
                 "diagnostics_verify_winlive": bool(self.diagnostics_verify_winlive_var.get()),
-                "diagnostics_winlive_autocorrect": bool(self.diagnostics_winlive_autocorrect_var.get()),
                 "diagnostics_placement_mode": str(self.diagnostics_placement_mode_var.get() or "copy").strip().lower(),
                 "appearance_mode": self.appearance_combo.get()
             }

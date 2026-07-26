@@ -10,6 +10,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mp3_diagnostics import (
     AUDIO_WINDOW_MS,
@@ -31,6 +32,7 @@ from mp3_diagnostics import (
     OUTPUT_FOLDER_TEMP,
     PLACEMENT_MODE_COPY,
     PLACEMENT_MODE_MOVE,
+    PRECISION_500MS,
     PRECISION_UNKNOWN,
     SILENCE_PEAK_THRESHOLD_DB,
     SILENCE_RMS_THRESHOLD_DB,
@@ -232,6 +234,16 @@ class MP3DiagnosticsTests(unittest.TestCase):
             detail=detail,
         )
 
+    def _localized_issue(self, key: str, start: str, end: str, detail: str) -> DiagnosticIssue:
+        return DiagnosticIssue(
+            problem_key=key,
+            problem_type="Frame MP3 non decodificabile",
+            start=start,
+            end=end,
+            precision=PRECISION_500MS,
+            detail=detail,
+        )
+
     @staticmethod
     def _ffmpeg_path() -> Path:
         return MP3DiagnosticsEngine().ffmpeg.ffmpeg_path
@@ -370,6 +382,302 @@ class MP3DiagnosticsTests(unittest.TestCase):
         )
         row = self._summary_rows(result)[0]
         self.assertEqual(row["Stato finale file"], STATUS_REPAIRED)
+
+    def test_terminal_low_impact_header_missing_is_ignored_for_classification(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("header_missing", "00:02:59.000", "00:02:59.500", "tail-hm")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-hm": (-26.0, -14.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+        self.assertIn("coda finale", row["Motivo classificazione finale"].lower())
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0]["Motivo / dettaglio essenziale"], "tail-hm")
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertIn("coda finale", problems[0]["Motivo esclusione"].lower())
+
+    def test_terminal_low_impact_invalid_data_is_ignored_for_classification(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("invalid_data", "00:02:59.000", "00:02:59.500", "tail-id")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-id": (-26.0, -14.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0]["Motivo / dettaglio essenziale"], "tail-id")
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+
+    def test_two_terminal_low_impact_warnings_are_both_ignored(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue_h = self._localized_issue("header_missing", "00:02:59.000", "00:02:59.500", "tail-h")
+        issue_i = self._localized_issue("invalid_data", "00:02:59.000", "00:02:59.500", "tail-i")
+        engine = _ScenarioEngine(
+            before_issues=[issue_h, issue_i],
+            after_issues=[issue_h, issue_i],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-h": (-26.0, -14.0), "tail-i": (-26.0, -14.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+        details = " | ".join(p["Motivo / dettaglio essenziale"] for p in problems)
+        self.assertIn("tail-h", details)
+        self.assertIn("tail-i", details)
+        self.assertTrue(all(p["Problema ignorato ai fini dello stato"] == "SI" for p in problems))
+
+    def test_terminal_issue_high_level_is_not_tolerated(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("header_missing", "00:02:59.000", "00:02:59.500", "tail-loud")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-loud": (-20.0, -6.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
+
+    def test_issue_in_song_body_is_not_tolerated(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("header_missing", "00:01:30.000", "00:01:30.500", "mid-hm")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"mid-hm": (-26.0, -14.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
+
+    def test_terminal_issue_too_long_is_not_tolerated(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("header_missing", "00:02:59.000", "00:02:59.900", "tail-long")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-long": (-26.0, -14.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
+
+    def test_terminal_low_impact_plus_central_issue_keeps_central_blocking(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        tail_issue = self._localized_issue("header_missing", "00:02:59.000", "00:02:59.500", "tail-hm")
+        mid_issue = self._localized_issue("sync_errors", "00:01:20.000", "00:01:20.500", "mid-sync")
+        engine = _ScenarioEngine(
+            before_issues=[tail_issue, mid_issue],
+            after_issues=[tail_issue, mid_issue],
+            repair_ok=False,
+            significant_blocking_before=True,
+            significant_blocking_after=True,
+            bounds=bounds,
+            issue_stats={"tail-hm": (-26.0, -14.0), "mid-sync": (-18.0, -7.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
+        tail_rows = [p for p in problems if p["Motivo / dettaglio essenziale"] == "tail-hm"]
+        mid_rows = [p for p in problems if p["Motivo / dettaglio essenziale"] == "mid-sync"]
+        self.assertEqual(len(tail_rows), 1)
+        self.assertEqual(len(mid_rows), 1)
+        self.assertEqual(tail_rows[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertEqual(mid_rows[0]["Problema ignorato ai fini dello stato"], "NO")
+
+    def test_terminal_tolerance_not_applied_when_decoding_is_globally_unusable(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("header_missing", "00:02:59.000", "00:02:59.500", "tail-hm")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-hm": (-26.0, -14.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=0.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        problems = self._problem_rows(result)
+        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
 
     def test_boundary_overlap_not_ignored_automatically(self) -> None:
         issue = DiagnosticIssue(

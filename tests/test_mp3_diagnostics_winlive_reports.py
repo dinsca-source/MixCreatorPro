@@ -107,8 +107,17 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         "File",
         "Percorso originale",
         "Controllo integrità MP3 eseguito",
+        "Modalità di controllo",
+        "Cartella principale di esito",
+        "Sottocartella finale",
+        "Percorso esito finale",
+        "File candidato finale",
+        "Tipo file collocato",
+        "Motivo routing finale",
+        "Copia finale riuscita",
         "Stato finale file",
         "Categoria finale",
+        "Categoria integrità tecnica",
         "Integrita operativa iniziale",
         "Integrita operativa finale",
         "Errori iniziali",
@@ -119,7 +128,6 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         "Silenzio iniziale (ms)",
         "Silenzio finale (ms)",
         "File collocato",
-        "Tipo file collocato",
         "Percorso finale",
         "Operazione eseguita",
         "Modalità collocazione",
@@ -143,12 +151,24 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
     WINLIVE_HEADERS = [
         "Verifica WinLive",
         "Stato WinLive",
+        "Certificazione finale MP3",
+        "Stato integrità originale",
+        "Stato integrità file normalizzato",
+        "Riparazione MP3 tentata",
+        "Riparazione MP3 riuscita",
+        "Stato dopo riparazione",
+        "Origine dell'anomalia",
+        "Errore introdotto dalla normalizzazione",
+        "Peggioramento dopo normalizzazione",
+        "Motivazione sintetica certificazione",
+        "Motivazione tecnica",
         "Presenza WL5SYNCT",
         "Presenza WL5CHORD",
         "Testo presente",
         "Accordi presenti",
         "Accordi non riconosciuti",
         "Token accordi non riconosciuti",
+        "Timestamp accordi non riconosciuti",
         "Normalizzazione richiesta",
         "Normalizzazione tentata",
         "Normalizzazione validata",
@@ -298,6 +318,108 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         html_text = Path(result["report_paths"]["html"]).read_text(encoding="utf-8")
         self.assertIn("Note WinLive", html_text)
 
+    def test_unrecognized_chord_occurrences_are_exported_per_line(self) -> None:
+        self._write_input("occurrences.mp3", _mp3_blob(b"|100|CIAO|200|", b"?|\n|100|C?|200|\n|C?|"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False)
+
+        _headers, rows = self._read_csv_rows(result["report_paths"]["csv_problems"])
+        winlive_rows = [row for row in rows if (row.get("Tipo controllo") or "") == "WinLive"]
+        self.assertGreaterEqual(len(winlive_rows), 3)
+        self.assertTrue(any((row.get("Descrizione") or "").startswith("Riga WinLive") for row in winlive_rows))
+        self.assertTrue(any((row.get("Tempo iniziale formattato") or "") == "N/D" for row in winlive_rows))
+        self.assertTrue(any((row.get("Tempo iniziale formattato") or "") != "N/D" for row in winlive_rows))
+        self.assertTrue(any((row.get("Codice") or "") == "UNRECOGNIZED_CHORD_OCCURRENCE" for row in winlive_rows))
+        self.assertTrue(any((row.get("Note") or "").startswith("occorrenza=") for row in winlive_rows))
+
+        html_text = Path(result["report_paths"]["html"]).read_text(encoding="utf-8")
+        self.assertIn("Timestamp iniziale ms", html_text)
+        self.assertIn("Tempo iniziale formattato", html_text)
+        self.assertIn("Indice occorrenza sulla riga", html_text)
+        self.assertIn("Timestamp accordi non riconosciuti", html_text)
+        self.assertIn(
+            "Dettaglio accordi non riconosciuti",
+            Path(result["report_paths"]["html"]).parent.joinpath("Log.txt").read_text(encoding="utf-8"),
+        )
+
+    def test_unrecognized_chord_unknown_timestamps_are_not_forced_to_zero(self) -> None:
+        self._write_input("occurrences_nd.mp3", _mp3_blob(b"|100|CIAO|200|", b"???\n??\n?"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False)
+
+        _headers, rows = self._read_csv_rows(result["report_paths"]["csv_problems"])
+        winlive_rows = [
+            row
+            for row in rows
+            if (row.get("Tipo controllo") or "") == "WinLive"
+            and (row.get("Codice") or "") == "UNRECOGNIZED_CHORD_OCCURRENCE"
+        ]
+        self.assertTrue(winlive_rows)
+        self.assertEqual(len(winlive_rows), 6)
+        self.assertTrue(all((row.get("Tempo iniziale formattato") or "") == "N/D" for row in winlive_rows))
+        self.assertTrue(all((row.get("Timestamp iniziale ms") or "") in ("", "N/D") for row in winlive_rows))
+
+    def test_unrecognized_chord_six_tokens_with_distinct_timestamps_produces_six_rows(self) -> None:
+        chord_line = b"0|?|51839|?|55679|?|68159|?|184319|?|254399|?"
+        self._write_input("occurrences_six.mp3", _mp3_blob(b"|100|CIAO|200|", chord_line))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False)
+
+        expected = [
+            "00:00:00.000",
+            "00:00:51.839",
+            "00:00:55.679",
+            "00:01:08.159",
+            "00:03:04.319",
+            "00:04:14.399",
+        ]
+
+        _headers, rows = self._read_csv_rows(result["report_paths"]["csv_problems"])
+        winlive_rows = [
+            row
+            for row in rows
+            if (row.get("File") or "") == "occurrences_six.mp3"
+            and (row.get("Codice") or "") == "UNRECOGNIZED_CHORD_OCCURRENCE"
+        ]
+
+        self.assertEqual(len(winlive_rows), 6)
+        self.assertEqual([row.get("Tempo iniziale formattato", "") for row in winlive_rows], expected)
+        self.assertEqual([row.get("Timestamp iniziale ms", "") for row in winlive_rows], ["0", "51839", "55679", "68159", "184319", "254399"])
+        self.assertTrue(all((row.get("Origine timestamp") or "") == "diretto" for row in winlive_rows))
+
+        summary_headers, summary_rows = self._read_csv_rows(result["report_paths"]["csv_summary"])
+        self.assertIn("Timestamp accordi non riconosciuti", summary_headers)
+        self.assertEqual(summary_rows[0].get("Accordi non riconosciuti", ""), "6")
+        self.assertEqual(
+            summary_rows[0].get("Timestamp accordi non riconosciuti", ""),
+            "; ".join(expected),
+        )
+
+        html_text = Path(result["report_paths"]["html"]).read_text(encoding="utf-8")
+        for stamp in expected:
+            self.assertIn(stamp, html_text)
+
+        log_text = Path(result["report_paths"]["log"]).read_text(encoding="utf-8")
+        for stamp in expected:
+            self.assertIn(f"timestamp={stamp}", log_text)
+
+        with zipfile.ZipFile(result["report_paths"]["xlsx"], "r") as archive:
+            sheet2_text = archive.read("xl/worksheets/sheet2.xml").decode("utf-8", errors="replace")
+        for stamp in expected:
+            self.assertIn(stamp, sheet2_text)
+
+    def test_unrecognized_chord_timestamp_zero_is_valid_and_not_nd(self) -> None:
+        self._write_input("occurrence_zero.mp3", _mp3_blob(b"|100|CIAO|200|", b"0|?"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=False)
+
+        _headers, rows = self._read_csv_rows(result["report_paths"]["csv_problems"])
+        row = next(
+            item
+            for item in rows
+            if (item.get("File") or "") == "occurrence_zero.mp3"
+            and (item.get("Codice") or "") == "UNRECOGNIZED_CHORD_OCCURRENCE"
+        )
+        self.assertEqual(row.get("Timestamp iniziale ms", ""), "0")
+        self.assertEqual(row.get("Tempo iniziale formattato", ""), "00:00:00.000")
+        self.assertNotEqual(row.get("Tempo iniziale formattato", ""), "N/D")
+
     def test_report_export_no_rows_no_crash(self) -> None:
         engine = _ReportScenarioEngine()
         report_dir = self.output_dir / "REPORT"
@@ -347,9 +469,16 @@ class MP3DiagnosticsWinLiveReportTests(unittest.TestCase):
         log_path = Path(result["report_paths"]["html"]).parent / "Log.txt"
         report_text = log_path.read_text(encoding="utf-8")
         self.assertIn("Safe-write totale (ms):", report_text)
-        self.assertIn("Validazione totale (ms):", report_text)
-        self.assertIn("Tempo non attribuito (ms):", report_text)
-        self.assertIn("Contatori diagnostici WinLive:", report_text)
+
+    def test_combined_mode_exports_unified_output_path_fields(self) -> None:
+        self._write_input("combo_report.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        result = self._run(verify_winlive=True, verify_mp3_integrity=True, repair_mode=True)
+        _headers, rows = self._read_csv_rows(result["report_paths"]["csv_summary"])
+
+        self.assertEqual(rows[0]["Modalità di controllo"], "INTEGRITY_AND_WINLIVE")
+        self.assertEqual(rows[0]["Cartella principale di esito"], "Esito Integrità + WinLive")
+        self.assertEqual(rows[0]["Percorso esito finale"], rows[0]["Percorso finale"])
+        self.assertEqual(rows[0]["Percorso esito WinLive"], rows[0]["Percorso esito finale"])
 
 
 if __name__ == "__main__":

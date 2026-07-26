@@ -16,6 +16,8 @@ import os
 import random
 import subprocess
 import threading
+import tempfile
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -23,6 +25,20 @@ from ffmpeg_manager import FFmpegError, FFmpegManager
 from clip_info import ClipInfo
 
 ProgressCallback = Callable[[int, int, str], None]
+
+
+@dataclass(slots=True)
+class ClipPreparationSummary:
+    total_tracks: int
+    reusable_clips: int
+    clips_to_generate: int
+    reused_track_names: list[str]
+    tracks_to_process: list[str]
+    recalculated_clips: int
+    new_clips: int
+    modified_clips: int
+    previous_invalid_clips: int
+    full_track_clips: int
 
 
 class AudioEngineError(RuntimeError):
@@ -118,6 +134,7 @@ class AudioEngine:
         ordered_file_names: Optional[list[str]] = None,
         custom_clips: Optional[dict[str, ClipInfo]] = None,
         previous_resolved_clips: Optional[dict[str, dict[str, Any]]] = None,
+        isolated_input_names: Optional[list[str]] = None,
         progress_callback: Optional[ProgressCallback] = None,
         cancel_event: Optional[threading.Event] = None
     ) -> tuple[Path, dict[str, Any]]:
@@ -147,119 +164,144 @@ class AudioEngine:
         fade_in_seconds = max(0, int(fade_in_seconds))
         fade_out_seconds = max(0, int(fade_out_seconds))
 
-        track_data, reuse_summary = self._prepare_tracks(
-            files=files,
-            source_folder=source_folder,
-            clip_seconds=clip_seconds,
-            cut_mode=cut_mode,
-            custom_clips=custom_clips,
-            previous_resolved_clips=previous_resolved_clips,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event
-        )
+        isolated_input_keys: set[str] | None = None
+        isolation_temp_dir: tempfile.TemporaryDirectory[str] | None = None
+        if isolated_input_names:
+            isolated_input_keys = {
+                self._path_compare_key(str(name))
+                for name in isolated_input_names
+                if str(name).strip()
+            }
+            if isolated_input_keys:
+                isolation_temp_dir = tempfile.TemporaryDirectory(prefix="mixcreator_isolated_")
 
-        minimum_clip = min(item["duration"] for item in track_data)
-
-        if crossfade_seconds >= minimum_clip:
-            crossfade_seconds = max(0, int(minimum_clip) - 1)
-
-        if fade_in_seconds >= minimum_clip:
-            fade_in_seconds = max(0, int(minimum_clip) - 1)
-
-        if fade_out_seconds >= minimum_clip:
-            fade_out_seconds = max(0, int(minimum_clip) - 1)
-
-        total_output_duration = max(
-            0.1,
-            sum(float(item["duration"]) for item in track_data)
-            - (crossfade_seconds * max(0, len(track_data) - 1))
-        )
-
-        command = self._build_ffmpeg_command(
-            track_data=track_data,
-            output_path=output_path,
-            crossfade_seconds=crossfade_seconds,
-            fade_in_seconds=fade_in_seconds,
-            fade_out_seconds=fade_out_seconds,
-            bitrate=bitrate,
-            normalize_audio=normalize_audio
-        )
-
-        self._notify(
-            progress_callback,
-            0,
-            100,
-            "Avvio creazione del mix..."
-        )
-
-        self._run_ffmpeg_with_progress(
-            command=command,
-            output_path=output_path,
-            total_duration=total_output_duration,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event
-        )
-
-        if not output_path.is_file() or output_path.stat().st_size == 0:
-            raise AudioEngineError(
-                "FFmpeg ha terminato senza creare un file MP3 valido."
+        try:
+            track_data, reuse_summary, preparation_summary = self._prepare_tracks(
+                files=files,
+                source_folder=source_folder,
+                clip_seconds=clip_seconds,
+                cut_mode=cut_mode,
+                custom_clips=custom_clips,
+                previous_resolved_clips=previous_resolved_clips,
+                isolated_input_names=isolated_input_keys,
+                isolation_temp_dir=(Path(isolation_temp_dir.name) if isolation_temp_dir is not None else None),
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
             )
 
-        self._notify(
-            progress_callback,
-            100,
-            100,
-            f"Mix completato: {output_path.name}"
-        )
-
-        track_report: list[dict[str, Any]] = []
-        mix_cursor_seconds = 0.0
-        crossfade_ms = max(0, int(round(float(crossfade_seconds) * 1000)))
-        fade_in_ms = max(0, int(round(float(fade_in_seconds) * 1000)))
-        fade_out_ms = max(0, int(round(float(fade_out_seconds) * 1000)))
-
-        for index, item in enumerate(track_data, start=1):
-            source_start_ms = max(0, int(round(float(item["start"]) * 1000)))
-            clip_duration_ms = max(1, int(round(float(item["duration"]) * 1000)))
-            source_end_ms = source_start_ms + clip_duration_ms
-
-            mix_start_ms = max(0, int(round(mix_cursor_seconds * 1000)))
-            mix_end_seconds = mix_cursor_seconds + float(item["duration"])
-            mix_end_ms = max(mix_start_ms + 1, int(round(mix_end_seconds * 1000)))
-
-            crossfade_in_ms = crossfade_ms if index > 1 else 0
-            crossfade_out_ms = crossfade_ms if index < len(track_data) else 0
-
-            track_report.append(
-                {
-                    "file_name": str(item["file_name"]),
-                    "source_path": str(item["path"]),
-                    "start_ms": source_start_ms,
-                    "duration_ms": clip_duration_ms,
-                    "source_start_ms": source_start_ms,
-                    "source_end_ms": source_end_ms,
-                    "clip_duration_ms": clip_duration_ms,
-                    "mix_start_ms": mix_start_ms,
-                    "mix_end_ms": mix_end_ms,
-                    "crossfade_in_ms": crossfade_in_ms,
-                    "crossfade_out_ms": crossfade_out_ms,
-                    "fade_in_ms": fade_in_ms,
-                    "fade_out_ms": fade_out_ms,
-                    "mix_order": index,
-                    "source_mode": str(item.get("source_mode", "calculated")),
-                    "manual_clip": bool(item.get("manual_clip", False)),
-                }
+            self._notify(
+                progress_callback,
+                0,
+                100,
+                "Normalizzazione e composizione mix..."
             )
 
-            mix_cursor_seconds = max(0.0, mix_end_seconds - float(crossfade_seconds))
+            minimum_clip = min(item["duration"] for item in track_data)
 
-        mix_report = {
-            "tracks": track_report,
-            "reuse_summary": reuse_summary,
-            "reuse_enabled": previous_resolved_clips is not None,
-        }
+            if crossfade_seconds >= minimum_clip:
+                crossfade_seconds = max(0, int(minimum_clip) - 1)
 
-        return output_path, mix_report
+            if fade_in_seconds >= minimum_clip:
+                fade_in_seconds = max(0, int(minimum_clip) - 1)
+
+            if fade_out_seconds >= minimum_clip:
+                fade_out_seconds = max(0, int(minimum_clip) - 1)
+
+            total_output_duration = max(
+                0.1,
+                sum(float(item["duration"]) for item in track_data)
+                - (crossfade_seconds * max(0, len(track_data) - 1))
+            )
+
+            command = self._build_ffmpeg_command(
+                track_data=track_data,
+                output_path=output_path,
+                crossfade_seconds=crossfade_seconds,
+                fade_in_seconds=fade_in_seconds,
+                fade_out_seconds=fade_out_seconds,
+                bitrate=bitrate,
+                normalize_audio=normalize_audio,
+            )
+
+            self._notify(
+                progress_callback,
+                0,
+                100,
+                "Avvio creazione del mix..."
+            )
+
+            self._run_ffmpeg_with_progress(
+                command=command,
+                output_path=output_path,
+                total_duration=total_output_duration,
+                progress_callback=progress_callback,
+                cancel_event=cancel_event,
+            )
+
+            if not output_path.is_file() or output_path.stat().st_size == 0:
+                raise AudioEngineError(
+                    "FFmpeg ha terminato senza creare un file MP3 valido."
+                )
+
+            self._notify(
+                progress_callback,
+                100,
+                100,
+                f"Mix completato: {output_path.name}"
+            )
+
+            track_report: list[dict[str, Any]] = []
+            mix_cursor_seconds = 0.0
+            crossfade_ms = max(0, int(round(float(crossfade_seconds) * 1000)))
+            fade_in_ms = max(0, int(round(float(fade_in_seconds) * 1000)))
+            fade_out_ms = max(0, int(round(float(fade_out_seconds) * 1000)))
+
+            for index, item in enumerate(track_data, start=1):
+                source_start_ms = max(0, int(round(float(item["start"]) * 1000)))
+                clip_duration_ms = max(1, int(round(float(item["duration"]) * 1000)))
+                source_end_ms = source_start_ms + clip_duration_ms
+
+                mix_start_ms = max(0, int(round(mix_cursor_seconds * 1000)))
+                mix_end_seconds = mix_cursor_seconds + float(item["duration"])
+                mix_end_ms = max(mix_start_ms + 1, int(round(mix_end_seconds * 1000)))
+
+                crossfade_in_ms = crossfade_ms if index > 1 else 0
+                crossfade_out_ms = crossfade_ms if index < len(track_data) else 0
+
+                track_report.append(
+                    {
+                        "file_name": str(item["file_name"]),
+                        "source_path": str(item["path"]),
+                        "start_ms": source_start_ms,
+                        "duration_ms": clip_duration_ms,
+                        "source_start_ms": source_start_ms,
+                        "source_end_ms": source_end_ms,
+                        "clip_duration_ms": clip_duration_ms,
+                        "mix_start_ms": mix_start_ms,
+                        "mix_end_ms": mix_end_ms,
+                        "crossfade_in_ms": crossfade_in_ms,
+                        "crossfade_out_ms": crossfade_out_ms,
+                        "fade_in_ms": fade_in_ms,
+                        "fade_out_ms": fade_out_ms,
+                        "mix_order": index,
+                        "source_mode": str(item.get("source_mode", "calculated")),
+                        "manual_clip": bool(item.get("manual_clip", False)),
+                    }
+                )
+
+                mix_cursor_seconds = max(0.0, mix_end_seconds - float(crossfade_seconds))
+
+            mix_report = {
+                "tracks": track_report,
+                "reuse_summary": reuse_summary,
+                "reuse_enabled": previous_resolved_clips is not None,
+                "clip_preparation_summary": asdict(preparation_summary),
+            }
+
+            return output_path, mix_report
+        finally:
+            if isolation_temp_dir is not None:
+                isolation_temp_dir.cleanup()
 
     def extract_song_clips(
         self,
@@ -415,32 +457,50 @@ class AudioEngine:
         cut_mode: str,
         custom_clips: Optional[dict[str, ClipInfo]],
         previous_resolved_clips: Optional[dict[str, dict[str, Any]]],
-        progress_callback: Optional[ProgressCallback],
-        cancel_event: Optional[threading.Event]
-    ) -> tuple[list[dict], dict[str, int]]:
+        isolated_input_names: Optional[set[str]] = None,
+        isolation_temp_dir: Optional[Path] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+        cancel_event: Optional[threading.Event] = None
+    ) -> tuple[list[dict], dict[str, int], ClipPreparationSummary]:
         prepared: list[dict] = []
         file_list = list(files)
-        total = len(file_list)
         reuse_summary = {
             "reused": 0,
             "recalculated": 0,
             "new": 0,
+            "modified": 0,
+            "previous_invalid": 0,
         }
 
         previous_map = previous_resolved_clips or {}
+        staged_items: list[dict[str, Any]] = []
+        reused_track_names: list[str] = []
+        tracks_to_process: list[str] = []
+        recalculated_clips = 0
+        new_clips = 0
+        modified_clips = 0
+        previous_invalid_clips = 0
+        full_track_clips = 0
 
-        for index, file_path in enumerate(file_list, start=1):
+        for output_index, file_path in enumerate(file_list, start=1):
             self._check_cancel(cancel_event)
 
-            self._notify(
-                progress_callback,
-                index,
-                total,
-                f"Analisi {index}/{total}: {file_path.name}"
-            )
-
+            mix_input_path = file_path
             try:
-                full_duration = self.ffmpeg.get_duration(file_path)
+                relative_name = file_path.relative_to(source_folder).as_posix()
+                if (
+                    isolation_temp_dir is not None
+                    and isolated_input_names is not None
+                    and self._path_compare_key(relative_name) in isolated_input_names
+                ):
+                    mix_input_path = self._decode_isolated_input(
+                        source_path=file_path,
+                        temp_dir=isolation_temp_dir,
+                        output_index=output_index,
+                        cancel_event=cancel_event,
+                    )
+
+                full_duration = self.ffmpeg.get_duration(mix_input_path)
             except FFmpegError as error:
                 raise AudioEngineError(str(error)) from error
 
@@ -448,9 +508,12 @@ class AudioEngine:
             if custom_clips is not None:
                 clip_info = custom_clips.get(file_path.name)
 
-            source_mode = "calculated"
-            manual_clip = False
-            if clip_info is not None and clip_info.use_custom_clip:
+            manual_clip = bool(clip_info is not None and clip_info.use_custom_clip)
+            previous_item = previous_map.get(relative_name)
+            previous_was_present = previous_item is not None
+            previous_is_valid = False
+
+            if manual_clip:
                 try:
                     start, duration = clip_info.resolve_segment(
                         int(round(full_duration * 1000))
@@ -460,13 +523,9 @@ class AudioEngine:
                         f"Clip personalizzata non valida per {file_path.name}: {error}"
                     ) from error
                 source_mode = "manual"
-                manual_clip = True
+                modified_clips += 1
+                tracks_to_process.append(relative_name)
             else:
-                relative_name = file_path.relative_to(source_folder).as_posix()
-                previous_item = previous_map.get(relative_name)
-                reused = False
-                previous_was_present = previous_item is not None
-
                 if previous_item is not None:
                     try:
                         previous_start_ms = int(previous_item.get("start_ms", -1))
@@ -478,20 +537,18 @@ class AudioEngine:
                     previous_start = previous_start_ms / 1000.0
                     previous_duration = previous_duration_ms / 1000.0
                     remaining = max(0.0, full_duration - previous_start)
-
-                    if (
+                    previous_is_valid = (
                         previous_start >= 0.0
                         and previous_duration > 0.0
                         and previous_start < full_duration
                         and previous_duration <= remaining
-                    ):
-                        start = previous_start
-                        duration = previous_duration
-                        reused = True
+                    )
 
-                if reused:
+                if previous_is_valid:
+                    start = previous_start
+                    duration = previous_duration
                     source_mode = "previous"
-                    reuse_summary["reused"] += 1
+                    reused_track_names.append(relative_name)
                 else:
                     start, duration = self._calculate_segment(
                         full_duration=full_duration,
@@ -499,23 +556,164 @@ class AudioEngine:
                         cut_mode=cut_mode
                     )
                     source_mode = "calculated"
+                    tracks_to_process.append(relative_name)
                     if previous_was_present:
-                        reuse_summary["recalculated"] += 1
+                        recalculated_clips += 1
+                        previous_invalid_clips += 1
                     else:
-                        reuse_summary["new"] += 1
+                        new_clips += 1
 
-            prepared.append(
+            if duration >= max(0.0, full_duration - 1e-6):
+                full_track_clips += 1
+
+            staged_items.append(
                 {
                     "path": file_path,
+                    "input_path": mix_input_path,
                     "start": start,
                     "duration": duration,
-                    "file_name": file_path.relative_to(source_folder).as_posix(),
+                    "file_name": relative_name,
                     "source_mode": source_mode,
                     "manual_clip": manual_clip,
+                    "previous_was_present": previous_was_present,
                 }
             )
 
-        return prepared, reuse_summary
+        preparation_summary = ClipPreparationSummary(
+            total_tracks=len(file_list),
+            reusable_clips=len(reused_track_names),
+            clips_to_generate=len(tracks_to_process),
+            reused_track_names=reused_track_names,
+            tracks_to_process=tracks_to_process,
+            recalculated_clips=recalculated_clips,
+            new_clips=new_clips,
+            modified_clips=modified_clips,
+            previous_invalid_clips=previous_invalid_clips,
+            full_track_clips=full_track_clips,
+        )
+
+        real_total = preparation_summary.clips_to_generate
+        real_current = 0
+
+        for item in staged_items:
+            self._check_cancel(cancel_event)
+
+            source_mode = str(item["source_mode"])
+            file_path = item["path"]
+            if source_mode == "previous":
+                self._notify(
+                    progress_callback,
+                    real_current,
+                    real_total,
+                    f"Riutilizzo clip precedente: {file_path.name}"
+                )
+                reuse_summary["reused"] += 1
+            else:
+                real_current += 1
+                manual_clip = bool(item["manual_clip"])
+                self._notify(
+                    progress_callback,
+                    real_current,
+                    real_total,
+                    (
+                        f"Generazione clip personalizzata {real_current}/{real_total}: {file_path.name}"
+                        if manual_clip
+                        else f"Preparazione clip {real_current}/{real_total}: {file_path.name}"
+                    )
+                )
+                if manual_clip:
+                    reuse_summary["modified"] += 1
+                elif bool(item["previous_was_present"]):
+                    reuse_summary["recalculated"] += 1
+                    reuse_summary["previous_invalid"] += 1
+                else:
+                    reuse_summary["new"] += 1
+
+            prepared.append(
+                {
+                    "path": item["path"],
+                    "input_path": item["input_path"],
+                    "start": item["start"],
+                    "duration": item["duration"],
+                    "file_name": item["file_name"],
+                    "source_mode": source_mode,
+                    "manual_clip": bool(item["manual_clip"]),
+                }
+            )
+
+        return prepared, reuse_summary, preparation_summary
+
+    @staticmethod
+    def _path_compare_key(relative_path: str) -> str:
+        return relative_path.casefold() if os.name == "nt" else relative_path
+
+    def _decode_isolated_input(
+        self,
+        *,
+        source_path: Path,
+        temp_dir: Path,
+        output_index: int,
+        cancel_event: Optional[threading.Event],
+    ) -> Path:
+        self._check_cancel(cancel_event)
+
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_path = temp_dir / f"{output_index:03d}_{source_path.stem}.wav"
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+
+        command = [
+            str(self.ffmpeg.ffmpeg_path),
+            "-hide_banner",
+            "-y",
+            "-i",
+            str(source_path),
+            "-vn",
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            str(output_path),
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=self._creation_flags(),
+            )
+        except OSError as error:
+            raise AudioEngineError(
+                f"Impossibile isolare il file non recuperabile:\n{source_path.name}\n{error}"
+            ) from error
+
+        if result.returncode != 0:
+            if output_path.exists():
+                try:
+                    output_path.unlink()
+                except OSError:
+                    pass
+            message = (result.stderr or result.stdout or "Errore sconosciuto FFmpeg").strip()
+            raise AudioEngineError(
+                "Impossibile preparare il file non recuperabile in modo isolato.\n"
+                f"File: {source_path.name}\n"
+                f"{message[-2000:]}"
+            )
+
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise AudioEngineError(
+                f"Decodifica isolata non valida per:\n{source_path.name}"
+            )
+
+        return output_path
 
     def _run_ffmpeg_with_progress(
         self,
@@ -675,7 +873,7 @@ class AudioEngine:
                     "-t",
                     f"{item['duration']:.3f}",
                     "-i",
-                    str(item["path"])
+                    str(item.get("input_path", item["path"]))
                 ]
             )
 

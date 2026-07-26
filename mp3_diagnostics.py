@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import traceback
 import uuid
@@ -52,16 +53,20 @@ OUTPUT_FOLDER_PROCESSED_ORIGINALS = "Originali dei file elaborati"
 OUTPUT_FOLDER_REPORT = "Report"
 OUTPUT_FOLDER_INTEGRITY_ROOT = "Esito integrità MP3"
 OUTPUT_FOLDER_WINLIVE = "Esito WinLive"
+OUTPUT_FOLDER_INTEGRITY_WINLIVE = "Esito Integrità + WinLive"
 OUTPUT_SESSION_PREFIX = "Diagnostica_MP3_"
 OUTPUT_FOLDER_TEMP = "_TMP_DIAGNOSTICS"
 WINLIVE_FOLDER_CONFORME = "Conformi"
 WINLIVE_FOLDER_NORMALIZZATI = "Normalizzati"
+WINLIVE_FOLDER_NORMALIZZATI_RIPARATI = "Normalizzati e riparati MP3"
+WINLIVE_FOLDER_MP3_CORROTTI = "MP3 corrotti"
+WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA = "Non integro dopo modifica"
 WINLIVE_FOLDER_SENZA_TAG_TESTO = "Senza TAG di Testo"
 WINLIVE_FOLDER_SENZA_TAG_ACCORDI = "Senza TAG Accordi"
 WINLIVE_FOLDER_SENZA_TAG_TESTO_ACCORDI = "Senza TAG di Testo e di Accordi"
 WINLIVE_FOLDER_ACCORDI_NON_RICONOSCIUTI = "Accordi non riconosciuti"
-WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA = "Non integro dopo modifica"
 WINLIVE_FOLDER_ERRORI_STRUTTURA = "Errori struttura WinLive"
+WINLIVE_FOLDER_ERRORI_LETTURA_SCRITTURA = "Errori lettura-scrittura"
 
 PLACEMENT_MODE_COPY = "copy"
 PLACEMENT_MODE_MOVE = "move"
@@ -114,6 +119,24 @@ MIN_SIGNIFICANT_AUDIO_DURATION_MS = 300
 MIN_SILENCE_RUN_MS = 400
 AUDIO_BOUNDS_SAFETY_MARGIN_MS = 250
 
+# Controlled tolerance for low-impact anomalies in the final tail of an MP3.
+TERMINAL_TAIL_TOLERANCE_MS = 1000
+MAX_LOW_IMPACT_TERMINAL_ISSUE_MS = 750
+LOW_IMPACT_TERMINAL_RMS_DBFS = -24.0
+LOW_IMPACT_TERMINAL_PEAK_DBFS = -10.0
+LOW_IMPACT_TERMINAL_OVERLAP_RATIO = 0.6
+LOW_IMPACT_TERMINAL_MAX_ISSUES = 6
+LOW_IMPACT_TERMINAL_PROBLEM_KEYS = {
+    "header_missing",
+    "invalid_data",
+}
+LOW_IMPACT_TERMINAL_EXCLUSION_REASON = (
+    "Anomalia localizzata nella coda finale a basso livello e senza evidenza di impatto uditivo significativo."
+)
+LOW_IMPACT_TERMINAL_HEALTHY_REASON = (
+    "File utilizzabile: rilevate anomalie FFmpeg esclusivamente nella coda finale a basso impatto, conservate come warning non bloccanti."
+)
+
 
 class MP3DiagnosticsError(RuntimeError):
     """General MP3 diagnostics error."""
@@ -135,6 +158,12 @@ class IssuePosition(str, Enum):
     TRAILING_SILENCE = "TRAILING_SILENCE"
     BOUNDARY_OVERLAP = "BOUNDARY_OVERLAP"
     UNKNOWN = "UNKNOWN"
+
+
+class FinalOutputMode(str, Enum):
+    INTEGRITY_ONLY = "INTEGRITY_ONLY"
+    WINLIVE_ONLY = "WINLIVE_ONLY"
+    INTEGRITY_AND_WINLIVE = "INTEGRITY_AND_WINLIVE"
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -260,6 +289,64 @@ class AnalysisResult:
 
 
 @dataclass(slots=True)
+class FinalCertificationResult:
+    target_file_path: str
+    normalized_candidate_path: str
+    final_outcome: str
+    final_status: str
+    final_category: DiagnosticCategory
+    final_folder: str
+    is_certified: bool
+    certification_label: str
+    classification_reason: str
+    blocking_residual: bool
+    repaired: bool
+    repair_command: str
+    repair_rc: int
+    repair_mode_used: str
+    output_repaired_path: str
+    output_unrecoverable_path: str
+    analysis: AnalysisResult
+    duration_seconds: float
+    bounds: AudioBounds
+    segment_metrics: dict[str, int]
+    evaluated: list[EvaluatedIssue]
+    relevant: list[EvaluatedIssue]
+    ignored: list[EvaluatedIssue]
+
+
+@dataclass(slots=True)
+class FinalOutputRoutingResult:
+    output_mode: FinalOutputMode
+    main_output_folder: str
+    final_subfolder: str
+    final_path: str
+    source_file_path: str
+    placed_file_kind: str
+    operation: str
+    effective_operation: str
+    routing_reason: str
+    copy_succeeded: bool
+    already_present: bool
+    source_was_normalized: bool
+    original_preserved: bool
+    preserved_original_path: str
+
+
+@dataclass(slots=True)
+class WinLiveDecodeAssessment:
+    candidate_path: str
+    command_text: str
+    return_code: int
+    decode_log_excerpt: str
+    duration_seconds: float
+    error_timestamps: list[str]
+    decision_rule: str
+    has_positive_corruption: bool
+    is_decodable: bool
+
+
+@dataclass(slots=True)
 class MP3DiagnosticResult:
     file_name: str
     file_path: str
@@ -301,7 +388,16 @@ class MP3DiagnosticResult:
     preserved_original_path: str = ""
     placement_effective_operation: str = ""
     file_already_present: bool = False
+    output_mode: str = ""
+    output_main_folder: str = ""
+    output_final_subfolder: str = ""
+    output_final_path_unified: str = ""
+    output_final_candidate_file: str = ""
+    output_routing_reason: str = ""
+    output_copy_succeeded: bool = False
+    integrity_category_technical: str = ""
     winlive: WinLiveDiagnosticResult = field(default_factory=lambda: WinLiveDiagnosticResult())
+    final_certification: FinalCertificationResult | None = None
 
     @staticmethod
     def _si_no(value: bool) -> str:
@@ -314,15 +410,34 @@ class MP3DiagnosticResult:
 
     def _winlive_summary_fields(self) -> dict[str, Any]:
         status = self.winlive.stato_winlive_finale.value if self.winlive.stato_winlive_finale is not None else ""
+        timestamp_summary = " | ".join(
+            str(item.get("timestamp_formatted", "")).strip()
+            for item in self.winlive.accordi_non_riconosciuti_occurrence
+            if str(item.get("timestamp_formatted", "")).strip()
+        )
+        if timestamp_summary:
+            timestamp_summary = timestamp_summary.replace(" | ", "; ")
         return {
             WINLIVE_COL_VERIFY: self._si_no(self.winlive.verifica_winlive_eseguita),
             WINLIVE_COL_STATUS: status,
+            "Certificazione finale MP3": self.winlive.certificazione_finale_mp3,
+            "Stato integrità originale": self.winlive.stato_integrita_originale,
+            "Stato integrità file normalizzato": self.winlive.stato_integrita_file_normalizzato,
+            "Riparazione MP3 tentata": self._si_no(self.winlive.riparazione_mp3_tentata),
+            "Riparazione MP3 riuscita": self._si_no(self.winlive.riparazione_mp3_riuscita),
+            "Stato dopo riparazione": self.winlive.stato_dopo_riparazione,
+            "Origine dell'anomalia": self.winlive.origine_anomalia,
+            "Errore introdotto dalla normalizzazione": self._si_no(self.winlive.errore_introdotto_dalla_normalizzazione),
+            "Peggioramento dopo normalizzazione": self._si_no(self.winlive.peggioramento_dopo_normalizzazione),
+            "Motivazione sintetica certificazione": self.winlive.motivazione_sintetica_certificazione,
+            "Motivazione tecnica": self.winlive.motivazione_tecnica,
             WINLIVE_COL_SYNCT_PRESENT: self._si_no(self.winlive.synct_presente_prima),
             WINLIVE_COL_CHORD_PRESENT: self._si_no(self.winlive.chord_presente_prima),
             WINLIVE_COL_TEXT_PRESENT: self._si_no(self.winlive.testo_presente),
             WINLIVE_COL_CHORDS_PRESENT: self._si_no(self.winlive.accordi_presenti),
             WINLIVE_COL_UNRECOGNIZED: self.winlive.accordi_non_riconosciuti,
             WINLIVE_COL_UNRECOGNIZED_TOKENS: ", ".join(self.winlive.accordi_non_riconosciuti_token),
+            "Timestamp accordi non riconosciuti": timestamp_summary,
             WINLIVE_COL_NORMALIZATION_REQUIRED: self._si_no(self.winlive.normalizzazione_necessaria),
             WINLIVE_COL_NORMALIZATION_ATTEMPTED: self._si_no(self.winlive.normalizzazione_tentata),
             WINLIVE_COL_NORMALIZATION_VALIDATED: self._si_no(self.winlive.normalizzazione_validata),
@@ -354,8 +469,17 @@ class MP3DiagnosticResult:
         if include_integrity:
             row.update(
                 {
+                    "Modalità di controllo": self.output_mode,
+                    "Cartella principale di esito": self.output_main_folder,
+                    "Sottocartella finale": self.output_final_subfolder,
+                    "Percorso esito finale": self.output_final_path_unified,
+                    "File candidato finale": self.output_final_candidate_file,
+                    "Tipo file collocato": self.placed_file_kind,
+                    "Motivo routing finale": self.output_routing_reason,
+                    "Copia finale riuscita": "SI" if self.output_copy_succeeded else "NO",
                     "Stato finale file": self.repair_outcome,
                     "Categoria finale": self.final_folder,
+                    "Categoria integrità tecnica": self.integrity_category_technical,
                     "Integrita operativa iniziale": self.operational_integrity_before,
                     "Integrita operativa finale": self.operational_integrity_after,
                     "Errori iniziali": self.total_errors_before,
@@ -390,6 +514,14 @@ class MP3DiagnosticResult:
         else:
             row.update(
                 {
+                    "Modalità di controllo": self.output_mode,
+                    "Cartella principale di esito": self.output_main_folder,
+                    "Sottocartella finale": self.output_final_subfolder,
+                    "Percorso esito finale": self.output_final_path_unified,
+                    "File candidato finale": self.output_final_candidate_file,
+                    "Tipo file collocato": self.placed_file_kind,
+                    "Motivo routing finale": self.output_routing_reason,
+                    "Copia finale riuscita": "SI" if self.output_copy_succeeded else "NO",
                     "Motivo classificazione finale": self.classification_reason,
                     "Hash SHA-256": self.file_hash_sha256,
                 }
@@ -512,6 +644,9 @@ class MP3DiagnosticResult:
             "status": self.repair_outcome,
             "final_status": self.final_status,
             "final_folder": self.final_folder,
+            "integrity_category": self.integrity_category_technical,
+            "output_mode": self.output_mode,
+            "main_output_folder": self.output_main_folder,
             "total_errors_before": self.total_errors_before,
             "total_errors_after": self.total_errors_after,
             "repaired": self.repaired,
@@ -553,12 +688,24 @@ class WinLiveDiagnosticResult:
     esito_cartella_winlive: str = ""
     esito_percorso_winlive: str = ""
     esito_operazione_winlive: str = ""
+    certificazione_finale_mp3: str = ""
+    stato_integrita_originale: str = ""
+    stato_integrita_file_normalizzato: str = ""
+    riparazione_mp3_tentata: bool = False
+    riparazione_mp3_riuscita: bool = False
+    stato_dopo_riparazione: str = ""
+    origine_anomalia: str = ""
+    errore_introdotto_dalla_normalizzazione: bool = False
+    peggioramento_dopo_normalizzazione: bool = False
+    motivazione_sintetica_certificazione: str = ""
+    motivazione_tecnica: str = ""
     catene_temporali_rilevate: int = 0
     tag_temporali_rimossi: int = 0
     righe_temporali_vuote_rilevate: int = 0
     righe_temporali_vuote_eliminate: int = 0
     valori_righe_temporali_vuote: list[int] = field(default_factory=list)
     allineamenti_temporali: list[dict[str, Any]] = field(default_factory=list)
+    accordi_non_riconosciuti_occurrence: list[dict[str, Any]] = field(default_factory=list)
     metriche_riscrittura: dict[str, Any] = field(default_factory=dict)
     contatori_diagnostici: dict[str, int] = field(default_factory=dict)
     modificato: bool = False
@@ -584,7 +731,6 @@ class MP3DiagnosticsEngine:
         cancel_event: Any | None = None,
         verify_mp3_integrity: bool = True,
         verify_winlive: bool = False,
-        winlive_autocorrect: bool = True,
     ) -> dict[str, Any]:
         if not verify_mp3_integrity and not verify_winlive:
             raise MP3DiagnosticsError("Almeno un controllo diagnostico deve essere attivo.")
@@ -596,8 +742,15 @@ class MP3DiagnosticsEngine:
         session_timestamp = self._session_timestamp_token()
         base_output = Path(output_folder).expanduser().resolve()
         session_output = self._create_output_session_root(base_output, session_timestamp)
-        integrity_root = session_output / OUTPUT_FOLDER_INTEGRITY_ROOT if verify_mp3_integrity else None
-        winlive_output_dir = session_output / OUTPUT_FOLDER_WINLIVE if verify_winlive else None
+        output_mode = self._determine_output_mode(
+            verify_mp3_integrity=verify_mp3_integrity,
+            verify_winlive=verify_winlive,
+        )
+        integrity_root = session_output / OUTPUT_FOLDER_INTEGRITY_ROOT if output_mode == FinalOutputMode.INTEGRITY_ONLY else None
+        winlive_output_dir = session_output / OUTPUT_FOLDER_WINLIVE if output_mode == FinalOutputMode.WINLIVE_ONLY else None
+        combined_output_dir = (
+            session_output / OUTPUT_FOLDER_INTEGRITY_WINLIVE if output_mode == FinalOutputMode.INTEGRITY_AND_WINLIVE else None
+        )
         placement_mode = self._sanitize_placement_mode(placement_mode)
         placement_mode_label = self._placement_mode_label(placement_mode)
         category_dirs: dict[DiagnosticCategory, Path] = {}
@@ -609,27 +762,24 @@ class MP3DiagnosticsEngine:
             }
         winlive_category_dirs: dict[str, Path] = {}
         if winlive_output_dir is not None:
-            winlive_category_dirs = {
-                WINLIVE_FOLDER_CONFORME: winlive_output_dir / WINLIVE_FOLDER_CONFORME,
-                WINLIVE_FOLDER_NORMALIZZATI: winlive_output_dir / WINLIVE_FOLDER_NORMALIZZATI,
-                WINLIVE_FOLDER_SENZA_TAG_TESTO: winlive_output_dir / WINLIVE_FOLDER_SENZA_TAG_TESTO,
-                WINLIVE_FOLDER_SENZA_TAG_ACCORDI: winlive_output_dir / WINLIVE_FOLDER_SENZA_TAG_ACCORDI,
-                WINLIVE_FOLDER_SENZA_TAG_TESTO_ACCORDI: winlive_output_dir / WINLIVE_FOLDER_SENZA_TAG_TESTO_ACCORDI,
-                WINLIVE_FOLDER_ACCORDI_NON_RICONOSCIUTI: winlive_output_dir / WINLIVE_FOLDER_ACCORDI_NON_RICONOSCIUTI,
-                WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA: winlive_output_dir / WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA,
-                WINLIVE_FOLDER_ERRORI_STRUTTURA: winlive_output_dir / WINLIVE_FOLDER_ERRORI_STRUTTURA,
-            }
+            winlive_category_dirs = self._build_winlive_category_dirs(root=winlive_output_dir, combined_mode=False)
+        elif combined_output_dir is not None:
+            winlive_category_dirs = self._build_winlive_category_dirs(root=combined_output_dir, combined_mode=True)
         processed_originals_dir = session_output / OUTPUT_FOLDER_PROCESSED_ORIGINALS
         report_dir = session_output / OUTPUT_FOLDER_REPORT
         temp_dir = session_output / OUTPUT_FOLDER_TEMP
 
         folders_to_create: list[Path] = [report_dir, temp_dir]
-        if verify_mp3_integrity:
+        if output_mode == FinalOutputMode.INTEGRITY_ONLY:
             folders_to_create.extend(category_dirs.values())
             folders_to_create.append(processed_originals_dir)
-        if verify_winlive and winlive_output_dir is not None:
+        if output_mode == FinalOutputMode.WINLIVE_ONLY and winlive_output_dir is not None:
             folders_to_create.append(winlive_output_dir)
             folders_to_create.extend(winlive_category_dirs.values())
+        if output_mode == FinalOutputMode.INTEGRITY_AND_WINLIVE and combined_output_dir is not None:
+            folders_to_create.append(combined_output_dir)
+            folders_to_create.extend(winlive_category_dirs.values())
+            folders_to_create.append(processed_originals_dir)
 
         for folder in folders_to_create:
             folder.mkdir(parents=True, exist_ok=True)
@@ -647,6 +797,7 @@ class MP3DiagnosticsEngine:
                     *([processed_originals_dir] if verify_mp3_integrity else []),
                     report_dir,
                     *([winlive_output_dir] if winlive_output_dir is not None else []),
+                    *([combined_output_dir] if combined_output_dir is not None else []),
                     temp_dir,
                     *[base_output / name for name in LEGACY_OUTPUT_FOLDERS],
                 ],
@@ -721,6 +872,13 @@ class MP3DiagnosticsEngine:
                     significant_segment_metrics=before_segment_metrics,
                     duration_seconds=duration_sec,
                 )
+                self._apply_low_impact_terminal_tolerance(
+                    evaluated_issues=evaluated_before,
+                    bounds=bounds_before,
+                    analysis=before_analysis,
+                    duration_seconds=duration_sec,
+                    significant_segment_metrics=before_segment_metrics,
+                )
                 relevant_before = [it for it in evaluated_before if not it.ignored_for_classification]
                 ignored_before = [it for it in evaluated_before if it.ignored_for_classification]
             else:
@@ -736,7 +894,6 @@ class MP3DiagnosticsEngine:
                     file_path=file_path,
                     original_data=original_data,
                     repair_mode=repair_mode,
-                    winlive_autocorrect=winlive_autocorrect,
                     temp_dir=temp_dir,
                     phase_times_ms=phase_times_ms,
                     phase_executed=phase_executed,
@@ -746,12 +903,15 @@ class MP3DiagnosticsEngine:
             after_issues = before_issues
             evaluated_after = evaluated_before
             bounds_after = bounds_before
+            unified_certification: FinalCertificationResult | None = None
+            routing_result: FinalOutputRoutingResult | None = None
             repaired = False
             repair_command = ""
             repair_rc = 0
             repair_mode_used = ""
             output_repaired_path = ""
             output_unrecoverable_path = ""
+            raw_repair_log = ""
             placed_file_path = ""
             placed_file_kind = ""
             placement_operation = ""
@@ -759,6 +919,12 @@ class MP3DiagnosticsEngine:
             original_preserved = False
             preserved_original_path = ""
             file_already_present = False
+            output_main_folder = self._output_main_folder_name(output_mode)
+            output_final_subfolder = ""
+            output_routing_reason = ""
+            output_copy_succeeded = False
+            output_final_candidate = ""
+            integrity_category_technical = ""
 
             final_status = FINAL_HEALTHY
             final_category = DiagnosticCategory.OK
@@ -769,187 +935,87 @@ class MP3DiagnosticsEngine:
             else:
                 classification_reason = "Controllo integrità MP3 eseguito: No"
 
-            if verify_mp3_integrity and repair_mode and relevant_before:
-                repaired_result = self._attempt_repair(source=file_path, temp_dir=temp_dir, cancel_event=cancel_event)
-                repair_command = repaired_result.get("command", "")
-                repair_rc = int(repaired_result.get("return_code", 0))
-                repair_mode_used = str(repaired_result.get("mode", ""))
-                temp_output = repaired_result.get("output_path")
-
-                if repaired_result.get("ok") and isinstance(temp_output, str):
-                    repaired_candidate = Path(temp_output)
-                    repaired = True
-                    after_analysis = self._analyze_mp3(
-                        file_path=repaired_candidate,
-                        cancel_event=cancel_event,
-                        segment_ss=None,
-                        segment_t=None,
-                    )
-                    after_issues = self._localize_issues_if_needed(
-                        file_path=repaired_candidate,
-                        duration_seconds=self._safe_duration_seconds(repaired_candidate),
-                        issues=after_analysis.issues,
-                        cancel_event=cancel_event,
-                        progress_callback=progress_callback,
-                        index=index,
-                        total=total,
-                    )
-                    bounds_after = self.detect_significant_audio_bounds(repaired_candidate)
-                    after_segment_metrics = self._analyze_significant_segment(
-                        file_path=repaired_candidate,
-                        bounds=bounds_after,
-                        cancel_event=cancel_event,
-                    )
-                    evaluated_after = self._evaluate_issues(
-                        file_path=repaired_candidate,
-                        issues=after_issues,
-                        bounds=bounds_after,
-                        significant_segment_metrics=after_segment_metrics,
-                        duration_seconds=self._safe_duration_seconds(repaired_candidate),
-                    )
-                    relevant_after = [it for it in evaluated_after if not it.ignored_for_classification]
-
-                    if not relevant_after and not self._has_blocking_errors(after_segment_metrics):
-                        final_status = FINAL_REPAIRED
-                        final_category = DiagnosticCategory.REPAIRED
-                        final_folder = OUTPUT_FOLDER_REPAIRED
-                        final_outcome = STATUS_REPAIRED
-                        classification_reason = "Riparato: problemi rilevanti eliminati nell'audio significativo"
-                    else:
-                        final_status = FINAL_UNRECOVERABLE
-                        final_category = DiagnosticCategory.UNRECOVERABLE
-                        final_folder = OUTPUT_FOLDER_UNRECOVERABLE
-                        final_outcome = STATUS_UNRECOVERABLE
-                        classification_reason = "Non recuperabile: persistono problemi rilevanti nell'audio significativo"
-
-                    placement = self._place_file_for_category(
-                        source_dir=source_dir,
-                        category_dirs=category_dirs,
-                        original_file=file_path,
-                        candidate_file=repaired_candidate,
-                        category=final_category,
-                        include_subfolders=include_subfolders,
-                        prefer_candidate=final_category == DiagnosticCategory.REPAIRED,
-                        allow_move_candidate=True,
-                        placement_mode=placement_mode,
-                        originals_safety_dir=processed_originals_dir,
-                        preserve_original_in_safety=final_category == DiagnosticCategory.REPAIRED,
-                        placed_kind="Output riparato",
-                        fallback_kind="Originale non modificato",
-                    )
-                    placed_file_path = placement["final_path"]
-                    placed_file_kind = placement["placed_kind"]
-                    placement_operation = placement["operation"]
-                    placement_effective_operation = placement["effective_operation"]
-                    original_preserved = bool(placement["original_preserved"])
-                    preserved_original_path = placement["preserved_original_path"]
-                    file_already_present = bool(placement["already_present"])
-
-                    if final_category == DiagnosticCategory.REPAIRED:
-                        output_repaired_path = placed_file_path
-                    if final_category == DiagnosticCategory.UNRECOVERABLE:
-                        output_unrecoverable_path = placed_file_path
-                else:
-                    final_status = FINAL_UNRECOVERABLE
-                    final_category = DiagnosticCategory.UNRECOVERABLE
-                    final_folder = OUTPUT_FOLDER_UNRECOVERABLE
-                    final_outcome = STATUS_UNRECOVERABLE
-                    classification_reason = "Non recuperabile: riparazione non riuscita su problema rilevante"
-
-                    placement = self._place_file_for_category(
-                        source_dir=source_dir,
-                        category_dirs=category_dirs,
-                        original_file=file_path,
-                        candidate_file=None,
-                        category=final_category,
-                        include_subfolders=include_subfolders,
-                        prefer_candidate=False,
-                        allow_move_candidate=False,
-                        placement_mode=placement_mode,
-                        originals_safety_dir=processed_originals_dir,
-                        preserve_original_in_safety=False,
-                        placed_kind="Originale non modificato",
-                        fallback_kind="Originale non modificato",
-                    )
-                    placed_file_path = placement["final_path"]
-                    placed_file_kind = placement["placed_kind"]
-                    placement_operation = placement["operation"]
-                    placement_effective_operation = placement["effective_operation"]
-                    original_preserved = bool(placement["original_preserved"])
-                    preserved_original_path = placement["preserved_original_path"]
-                    file_already_present = bool(placement["already_present"])
-                    output_unrecoverable_path = placed_file_path
-
-            elif verify_mp3_integrity and relevant_before:
-                final_status = FINAL_UNRECOVERABLE
-                final_category = DiagnosticCategory.UNRECOVERABLE
-                final_folder = OUTPUT_FOLDER_UNRECOVERABLE
-                final_outcome = STATUS_UNRECOVERABLE
-                classification_reason = "Non recuperabile: rilevati problemi nell'audio significativo"
-            elif verify_mp3_integrity:
-                final_status = FINAL_HEALTHY
-                final_category = DiagnosticCategory.OK
-                final_folder = OUTPUT_FOLDER_OK
-                final_outcome = STATUS_PERFECT
-                if ignored_before:
-                    classification_reason = (
-                        f"Integro: {len(ignored_before)} anomalie tecniche rilevate solo in aree silenziose"
-                    )
-
-            if verify_mp3_integrity and not placed_file_path:
-                placement = self._place_file_for_category(
-                    source_dir=source_dir,
-                    category_dirs=category_dirs,
+            if verify_mp3_integrity:
+                certification_target = self._select_final_certification_target(
                     original_file=file_path,
-                    candidate_file=None,
-                    category=final_category,
-                    include_subfolders=include_subfolders,
-                    prefer_candidate=False,
-                    allow_move_candidate=False,
-                    placement_mode=placement_mode,
-                    originals_safety_dir=processed_originals_dir,
-                    preserve_original_in_safety=False,
-                    placed_kind="Originale non modificato",
-                    fallback_kind="Originale non modificato",
+                    winlive_result=winlive_result,
                 )
-                placed_file_path = placement["final_path"]
-                placed_file_kind = placement["placed_kind"]
-                placement_operation = placement["operation"]
-                placement_effective_operation = placement["effective_operation"]
-                original_preserved = bool(placement["original_preserved"])
-                preserved_original_path = placement["preserved_original_path"]
-                file_already_present = bool(placement["already_present"])
+                cert_payload = self._certify_mp3_candidate(
+                    file_path=certification_target,
+                    repair_mode=repair_mode,
+                    cancel_event=cancel_event,
+                    temp_dir=temp_dir,
+                )
+                unified_certification = self._build_final_certification_result(
+                    cert_payload=cert_payload,
+                    target_file_path=certification_target,
+                    normalized_candidate_path=winlive_result.file_temporaneo,
+                )
+                if verify_winlive:
+                    self._apply_winlive_certification_overrides(
+                        certification=unified_certification,
+                        winlive_result=winlive_result,
+                    )
+
+                final_status = unified_certification.final_status
+                final_category = unified_certification.final_category
+                final_folder = unified_certification.final_folder
+                final_outcome = unified_certification.final_outcome
+                classification_reason = unified_certification.classification_reason
+                repaired = unified_certification.repaired
+                repair_command = unified_certification.repair_command
+                repair_rc = unified_certification.repair_rc
+                repair_mode_used = unified_certification.repair_mode_used
+                output_repaired_path = unified_certification.output_repaired_path
+                output_unrecoverable_path = unified_certification.output_unrecoverable_path
+                after_analysis = unified_certification.analysis
+                after_issues = [item.issue for item in unified_certification.evaluated]
+                evaluated_after = unified_certification.evaluated
+                bounds_after = unified_certification.bounds
+                raw_repair_log = ""
+                integrity_category_technical = unified_certification.final_folder
+
+                self._apply_unified_certification_to_winlive(
+                    result=winlive_result,
+                    certification=unified_certification,
+                    original_relevant_count=len(relevant_before),
+                )
+
+            copy_start = time.perf_counter()
+            routing_result = self._route_final_output(
+                mode=output_mode,
+                source_dir=source_dir,
+                include_subfolders=include_subfolders,
+                original_file=file_path,
+                integrity_category_dirs=category_dirs,
+                winlive_category_dirs=winlive_category_dirs,
+                final_certification=unified_certification,
+                winlive_result=winlive_result,
+                placement_mode=placement_mode,
+                originals_safety_dir=(processed_originals_dir if verify_mp3_integrity else None),
+            )
+            phase_times_ms["copia_file"] = (time.perf_counter() - copy_start) * 1000.0
+            phase_executed["copia_file"] = routing_result.copy_succeeded
+
+            placed_file_path = routing_result.final_path
+            placed_file_kind = routing_result.placed_file_kind
+            placement_operation = routing_result.operation
+            placement_effective_operation = routing_result.effective_operation
+            file_already_present = routing_result.already_present
+            original_preserved = routing_result.original_preserved
+            preserved_original_path = routing_result.preserved_original_path
+            output_main_folder = routing_result.main_output_folder
+            output_final_subfolder = routing_result.final_subfolder
+            output_routing_reason = routing_result.routing_reason
+            output_copy_succeeded = routing_result.copy_succeeded
+            output_final_candidate = routing_result.source_file_path
+            final_folder = routing_result.final_subfolder
 
             if verify_winlive:
-                copy_start = time.perf_counter()
-                winlive_folder_name = self._winlive_folder_from_outcome(winlive_result.stato_winlive_finale)
-                winlive_root = winlive_category_dirs.get(winlive_folder_name)
-                if winlive_root is not None:
-                    winlive_source = file_path
-                    if (
-                        winlive_result.stato_winlive_finale == WinLiveOutcome.FILE_NORMALIZED
-                        and winlive_result.file_temporaneo
-                    ):
-                        candidate = Path(winlive_result.file_temporaneo)
-                        if candidate.exists():
-                            winlive_source = candidate
-
-                    winlive_placement = self._place_file_in_folder(
-                        source_dir=source_dir,
-                        destination_root=winlive_root,
-                        original_file=file_path,
-                        source_to_place=winlive_source,
-                        include_subfolders=include_subfolders,
-                    )
-                    winlive_result.esito_cartella_winlive = winlive_folder_name
-                    winlive_result.esito_percorso_winlive = winlive_placement["final_path"]
-                    winlive_result.esito_operazione_winlive = winlive_placement["operation"]
-                    winlive_result.modificato = winlive_source != file_path
-                phase_times_ms["copia_file"] = (time.perf_counter() - copy_start) * 1000.0
-                phase_executed["copia_file"] = winlive_root is not None
-            else:
-                phase_times_ms["copia_file"] = 0.0
-                phase_executed["copia_file"] = False
+                winlive_result.esito_cartella_winlive = routing_result.final_subfolder
+                winlive_result.esito_percorso_winlive = routing_result.final_path
+                winlive_result.esito_operazione_winlive = routing_result.operation
+                winlive_result.modificato = routing_result.source_was_normalized
 
             total_ms = (time.perf_counter() - file_start_ts) * 1000.0
             winlive_result.tempi_fasi_ms.update(phase_times_ms)
@@ -982,7 +1048,7 @@ class MP3DiagnosticsEngine:
                 final_category=final_category,
                 final_folder=(final_folder if verify_mp3_integrity else ""),
                 classification_reason=classification_reason,
-                blocking_residual=(self._has_blocking_errors(after_analysis.metrics) if verify_mp3_integrity else False),
+                blocking_residual=(any(not it.ignored_for_classification for it in evaluated_after) if verify_mp3_integrity else False),
                 bounds_before=bounds_before,
                 bounds_after=bounds_after,
                 evaluated_issues_before=evaluated_before,
@@ -997,7 +1063,7 @@ class MP3DiagnosticsEngine:
                 repair_mode_used=repair_mode_used,
                 raw_decode_log_before=before_analysis.decode_log,
                 raw_decode_log_after=after_analysis.decode_log,
-                raw_repair_log=str(repaired_result.get("error", "")) if repair_mode and relevant_before else "",
+                raw_repair_log=raw_repair_log,
                 placed_file_path=placed_file_path,
                 placed_file_kind=placed_file_kind,
                 placement_operation=placement_operation,
@@ -1006,7 +1072,16 @@ class MP3DiagnosticsEngine:
                 preserved_original_path=preserved_original_path,
                 placement_effective_operation=placement_effective_operation or placement_operation,
                 file_already_present=file_already_present,
+                output_mode=output_mode.value,
+                output_main_folder=output_main_folder,
+                output_final_subfolder=output_final_subfolder,
+                output_final_path_unified=placed_file_path,
+                output_final_candidate_file=Path(output_final_candidate).name if output_final_candidate else "",
+                output_routing_reason=output_routing_reason,
+                output_copy_succeeded=output_copy_succeeded,
+                integrity_category_technical=integrity_category_technical,
                 winlive=winlive_result,
+                final_certification=unified_certification,
             )
             rows.append(result)
 
@@ -1025,6 +1100,10 @@ class MP3DiagnosticsEngine:
             self._write_integrity_index(report_dir / "IntegrityIndex.json", rows)
         report_paths["timing"] = self._write_phase_timing_report(report_dir / "TimingFasi.csv", rows)
         self._cleanup_temp_dir(temp_dir)
+        self.remove_empty_output_directories(
+            session_output,
+            protected_roots=[report_dir],
+        )
         self._notify(progress_callback, total, total, "Diagnostica completata.")
 
         return {
@@ -1039,7 +1118,6 @@ class MP3DiagnosticsEngine:
         file_path: Path,
         original_data: bytes,
         repair_mode: bool,
-        winlive_autocorrect: bool,
         temp_dir: Path,
         phase_times_ms: dict[str, float],
         phase_executed: dict[str, bool],
@@ -1108,6 +1186,7 @@ class MP3DiagnosticsEngine:
                 result.accordi_presenti = True
                 result.accordi_non_riconosciuti = count_unrecognized_chords(chord_text)
                 result.accordi_non_riconosciuti_token = self._collect_unrecognized_chord_tokens(chord_text)
+                result.accordi_non_riconosciuti_occurrence = self._collect_unrecognized_chord_occurrences(chord_text)
             else:
                 phase_times_ms["parsing_wl5chord"] = 0.0
                 phase_executed["parsing_wl5chord"] = False
@@ -1129,7 +1208,6 @@ class MP3DiagnosticsEngine:
             post_validation_status = PostNormalizationValidationStatus.NOT_NECESSARY
             should_attempt_normalization = (
                 repair_mode
-                and winlive_autocorrect
                 and structure_valid
                 and text_valid
                 and chord_valid
@@ -1199,6 +1277,21 @@ class MP3DiagnosticsEngine:
             elif result.normalizzazione_tentata:
                 result.motivo_validazione_post_modifica = result.errore_winlive or result.errore_winlive_code or "FALLITA"
 
+            # Final MP3 certification is unified and executed once in run_diagnostics
+            # after optional normalization has produced the definitive target file.
+            if result.file_temporaneo and result.normalizzazione_validata:
+                phase_times_ms["certificazione_integrita"] = 0.0
+                phase_executed["certificazione_integrita"] = False
+                result.stato_integrita_file_normalizzato = "In attesa certificazione unificata"
+            elif result.file_temporaneo:
+                phase_times_ms["certificazione_integrita"] = 0.0
+                phase_executed["certificazione_integrita"] = False
+                result.stato_integrita_file_normalizzato = "Non eseguita"
+            elif result.normalizzazione_tentata:
+                phase_times_ms["certificazione_integrita"] = 0.0
+                phase_executed["certificazione_integrita"] = False
+                result.stato_integrita_file_normalizzato = "Non eseguita"
+
             return result
         except Exception as exc:
             result.errore_winlive_code = type(exc).__name__
@@ -1208,9 +1301,95 @@ class MP3DiagnosticsEngine:
             return result
 
     @staticmethod
-    def _collect_unrecognized_chord_tokens(chord_text: str) -> list[str]:
-        tokens = [token.strip() for token in chord_text.split("|")]
-        return [token for token in tokens if token and "?" in token]
+    def _format_timestamp_ms(timestamp_ms: int | None) -> str:
+        if timestamp_ms is None:
+            return "N/D"
+        total_ms = max(0, int(timestamp_ms))
+        hours = total_ms // 3_600_000
+        rem = total_ms % 3_600_000
+        minutes = rem // 60_000
+        seconds = (rem % 60_000) // 1000
+        millis = rem % 1000
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+    @classmethod
+    def _collect_unrecognized_chord_tokens(cls, chord_text: str) -> list[str]:
+        tokens: list[str] = []
+        for token in chord_text.split("|"):
+            cleaned = token.strip()
+            if cleaned and "?" in cleaned:
+                tokens.append(cleaned)
+        return tokens
+
+    @classmethod
+    def _collect_unrecognized_chord_occurrences(cls, chord_text: str) -> list[dict[str, Any]]:
+        occurrences: list[dict[str, Any]] = []
+        previous_timestamp_ms: int | None = None
+
+        lines = chord_text.splitlines()
+        for line_index, raw_line in enumerate(lines, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            previous_line = ""
+            for back in range(line_index - 2, -1, -1):
+                candidate = lines[back].strip()
+                if candidate:
+                    previous_line = candidate
+                    break
+
+            next_line = ""
+            for forward in range(line_index, len(lines)):
+                candidate = lines[forward].strip()
+                if candidate:
+                    next_line = candidate
+                    break
+
+            parts = [part.strip() for part in line.split("|")]
+            active_timestamp_ms: int | None = previous_timestamp_ms
+            active_source = "derivato" if previous_timestamp_ms is not None else "N/D"
+            occurrence_index_on_line = 0
+
+            for part in parts:
+                if not part:
+                    continue
+
+                if re.fullmatch(r"\d+", part):
+                    active_timestamp_ms = int(part)
+                    previous_timestamp_ms = active_timestamp_ms
+                    active_source = "diretto"
+                    continue
+
+                question_mark_count = part.count("?")
+                if question_mark_count <= 0:
+                    continue
+
+                for _ in range(question_mark_count):
+                    occurrence_index_on_line += 1
+                    timestamp_source = active_source
+                    timestamp_formatted = (
+                        cls._format_timestamp_ms(active_timestamp_ms)
+                        if active_timestamp_ms is not None
+                        else "N/D"
+                    )
+                    occurrences.append(
+                        {
+                            "timestamp_ms": active_timestamp_ms,
+                            "timestamp_formatted": timestamp_formatted,
+                            "token": "?",
+                            "line_index": line_index,
+                            "line_content": line,
+                            "line_context": line,
+                            "line_previous": previous_line,
+                            "line_next": next_line,
+                            "occurrence_index_on_line": occurrence_index_on_line,
+                            "occurrences_on_line": question_mark_count,
+                            "timestamp_source": timestamp_source,
+                        }
+                    )
+
+        return occurrences
 
     @staticmethod
     def _merge_winlive_write_result(
@@ -1433,6 +1612,13 @@ class MP3DiagnosticsEngine:
                 stats["rms_dbfs"] <= SILENCE_RMS_THRESHOLD_DB
                 and stats["peak_dbfs"] <= SILENCE_PEAK_THRESHOLD_DB
             )
+            is_boundary_non_blocking = self._issue_boundary_non_blocking(
+                position=position,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                bounds=bounds,
+                stats=stats,
+            )
 
             ignored = False
             exclusion_reason = ""
@@ -1469,6 +1655,11 @@ class MP3DiagnosticsEngine:
                 exclusion_reason = "Posizione non determinabile"
                 impact_label = "Potenziale impatto"
 
+            if is_boundary_non_blocking:
+                ignored = True
+                exclusion_reason = "Anomalia tecnica confinata nella coda silenziosa o quasi silenziosa, senza impatto udibile"
+                impact_label = "Nessuno rilevabile"
+
             evaluated.append(
                 EvaluatedIssue(
                     issue=issue,
@@ -1485,6 +1676,153 @@ class MP3DiagnosticsEngine:
             )
 
         return evaluated
+
+    def _issue_boundary_non_blocking(
+        self,
+        *,
+        position: IssuePosition,
+        start_ms: int | None,
+        end_ms: int | None,
+        bounds: AudioBounds,
+        stats: dict[str, float],
+    ) -> bool:
+        if position not in (IssuePosition.BOUNDARY_OVERLAP, IssuePosition.TRAILING_SILENCE):
+            return False
+        if start_ms is None:
+            return False
+
+        actual_end = end_ms if end_ms is not None else start_ms
+        segment_duration_ms = max(1, actual_end - start_ms)
+        overlap_start = max(start_ms, bounds.significant_start_ms)
+        overlap_end = min(actual_end, bounds.significant_end_ms)
+        overlap_ms = max(0, overlap_end - overlap_start)
+        overlap_ratio = overlap_ms / float(segment_duration_ms)
+
+        distance_from_file_end = max(0, bounds.file_duration_ms - actual_end)
+        distance_from_significant_end = max(0, start_ms - bounds.significant_end_ms)
+
+        low_energy_tail = (
+            stats["rms_dbfs"] <= (SILENCE_RMS_THRESHOLD_DB - 3.0)
+            and stats["peak_dbfs"] <= (SILENCE_PEAK_THRESHOLD_DB - 3.0)
+        )
+        if not low_energy_tail:
+            return False
+
+        if position == IssuePosition.TRAILING_SILENCE:
+            return distance_from_file_end <= 700 or overlap_ratio <= 0.35
+
+        return (
+            distance_from_file_end <= 500
+            and distance_from_significant_end <= 500
+            and overlap_ratio <= 0.35
+        )
+
+    @staticmethod
+    def _is_globally_usable_for_terminal_tolerance(
+        *,
+        analysis: AnalysisResult,
+        duration_seconds: float,
+        bounds: AudioBounds,
+        significant_segment_metrics: dict[str, int],
+        evaluated_issues: list[EvaluatedIssue],
+    ) -> bool:
+        if analysis.return_code != 0:
+            return False
+        if duration_seconds <= 0 or bounds.file_duration_ms <= 0:
+            return False
+        significant_span = max(0, bounds.significant_end_ms - bounds.significant_start_ms)
+        if significant_span < MIN_SIGNIFICANT_AUDIO_DURATION_MS:
+            return False
+
+        total_blocking = sum(max(0, int(significant_segment_metrics.get(field, 0))) for field in _BLOCKING_ERROR_FIELDS)
+        if total_blocking > LOW_IMPACT_TERMINAL_MAX_ISSUES:
+            return False
+        if len(evaluated_issues) > LOW_IMPACT_TERMINAL_MAX_ISSUES:
+            return False
+        return True
+
+    @staticmethod
+    def _is_terminal_tail_interval(*, start_ms: int, end_ms: int, file_duration_ms: int) -> bool:
+        if file_duration_ms <= 0:
+            return False
+
+        actual_end = max(start_ms, end_ms)
+        tail_start = max(0, file_duration_ms - TERMINAL_TAIL_TOLERANCE_MS)
+        starts_in_tail = start_ms >= tail_start
+        ends_at_or_beyond_duration = actual_end >= file_duration_ms
+        if not (starts_in_tail or ends_at_or_beyond_duration):
+            return False
+
+        segment_len = max(1, actual_end - start_ms)
+        overlap_start = max(start_ms, tail_start)
+        overlap_end = min(actual_end, file_duration_ms)
+        overlap_ms = max(0, overlap_end - overlap_start)
+        overlap_ratio = overlap_ms / float(segment_len)
+        return overlap_ratio >= LOW_IMPACT_TERMINAL_OVERLAP_RATIO
+
+    def _is_low_impact_terminal_issue(
+        self,
+        *,
+        item: EvaluatedIssue,
+        bounds: AudioBounds,
+        analysis: AnalysisResult,
+        duration_seconds: float,
+        significant_segment_metrics: dict[str, int],
+        evaluated_issues: list[EvaluatedIssue],
+    ) -> bool:
+        if item.ignored_for_classification:
+            return False
+        if item.issue.problem_key not in LOW_IMPACT_TERMINAL_PROBLEM_KEYS:
+            return False
+        if item.segment_start_ms is None or item.segment_end_ms is None:
+            return False
+        if item.position == IssuePosition.UNKNOWN:
+            return False
+
+        if not self._is_globally_usable_for_terminal_tolerance(
+            analysis=analysis,
+            duration_seconds=duration_seconds,
+            bounds=bounds,
+            significant_segment_metrics=significant_segment_metrics,
+            evaluated_issues=evaluated_issues,
+        ):
+            return False
+
+        start_ms = item.segment_start_ms
+        end_ms = item.segment_end_ms
+        if not self._is_terminal_tail_interval(start_ms=start_ms, end_ms=end_ms, file_duration_ms=bounds.file_duration_ms):
+            return False
+
+        issue_duration_ms = max(1, end_ms - start_ms)
+        if issue_duration_ms > MAX_LOW_IMPACT_TERMINAL_ISSUE_MS:
+            return False
+        if item.rms_dbfs > LOW_IMPACT_TERMINAL_RMS_DBFS:
+            return False
+        if item.peak_dbfs > LOW_IMPACT_TERMINAL_PEAK_DBFS:
+            return False
+        return True
+
+    def _apply_low_impact_terminal_tolerance(
+        self,
+        *,
+        evaluated_issues: list[EvaluatedIssue],
+        bounds: AudioBounds,
+        analysis: AnalysisResult,
+        duration_seconds: float,
+        significant_segment_metrics: dict[str, int],
+    ) -> None:
+        for item in evaluated_issues:
+            if self._is_low_impact_terminal_issue(
+                item=item,
+                bounds=bounds,
+                analysis=analysis,
+                duration_seconds=duration_seconds,
+                significant_segment_metrics=significant_segment_metrics,
+                evaluated_issues=evaluated_issues,
+            ):
+                item.ignored_for_classification = True
+                item.exclusion_reason = LOW_IMPACT_TERMINAL_EXCLUSION_REASON
+                item.impact_label = "Nessuno rilevabile"
 
     def _issue_segment_ms(self, issue: DiagnosticIssue) -> tuple[int | None, int | None]:
         start_sec = self._parse_issue_time(issue.start)
@@ -1983,6 +2321,39 @@ class MP3DiagnosticsEngine:
         return mapping[category]
 
     @staticmethod
+    def _determine_output_mode(*, verify_mp3_integrity: bool, verify_winlive: bool) -> FinalOutputMode:
+        if verify_mp3_integrity and verify_winlive:
+            return FinalOutputMode.INTEGRITY_AND_WINLIVE
+        if verify_mp3_integrity:
+            return FinalOutputMode.INTEGRITY_ONLY
+        return FinalOutputMode.WINLIVE_ONLY
+
+    @staticmethod
+    def _output_main_folder_name(mode: FinalOutputMode) -> str:
+        if mode == FinalOutputMode.INTEGRITY_ONLY:
+            return OUTPUT_FOLDER_INTEGRITY_ROOT
+        if mode == FinalOutputMode.WINLIVE_ONLY:
+            return OUTPUT_FOLDER_WINLIVE
+        return OUTPUT_FOLDER_INTEGRITY_WINLIVE
+
+    def _build_winlive_category_dirs(self, *, root: Path, combined_mode: bool) -> dict[str, Path]:
+        categories = [
+            WINLIVE_FOLDER_CONFORME,
+            WINLIVE_FOLDER_NORMALIZZATI,
+            WINLIVE_FOLDER_MP3_CORROTTI,
+            WINLIVE_FOLDER_SENZA_TAG_TESTO,
+            WINLIVE_FOLDER_SENZA_TAG_ACCORDI,
+            WINLIVE_FOLDER_SENZA_TAG_TESTO_ACCORDI,
+            WINLIVE_FOLDER_ACCORDI_NON_RICONOSCIUTI,
+            WINLIVE_FOLDER_ERRORI_LETTURA_SCRITTURA,
+        ]
+        if combined_mode:
+            categories.append(WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA)
+        else:
+            categories.extend([WINLIVE_FOLDER_NORMALIZZATI_RIPARATI, WINLIVE_FOLDER_ERRORI_STRUTTURA])
+        return {name: root / name for name in categories}
+
+    @staticmethod
     def _winlive_folder_from_outcome(outcome: WinLiveOutcome | None) -> str:
         if outcome == WinLiveOutcome.FILE_ALREADY_OK:
             return WINLIVE_FOLDER_CONFORME
@@ -1998,11 +2369,669 @@ class MP3DiagnosticsEngine:
             return WINLIVE_FOLDER_SENZA_TAG_TESTO_ACCORDI
         if outcome in (WinLiveOutcome.UNRECOGNIZED_CHORDS, WinLiveOutcome.MISSING_TEXT_AND_UNRECOGNIZED_CHORDS):
             return WINLIVE_FOLDER_ACCORDI_NON_RICONOSCIUTI
-        if outcome == WinLiveOutcome.MODIFICATION_NOT_INTEGRAL:
-            return WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA
         if outcome == WinLiveOutcome.STRUCTURE_ERROR:
             return WINLIVE_FOLDER_ERRORI_STRUTTURA
         return WINLIVE_FOLDER_ERRORI_STRUTTURA
+
+    def _winlive_folder_from_result(self, result: WinLiveDiagnosticResult) -> str:
+        certification = (result.certificazione_finale_mp3 or "").strip().casefold()
+        if certification == "errore infrastrutturale":
+            return WINLIVE_FOLDER_ERRORI_LETTURA_SCRITTURA
+        if certification == "non certificato":
+            return WINLIVE_FOLDER_MP3_CORROTTI
+        if result.stato_winlive_finale == WinLiveOutcome.FILE_NORMALIZED:
+            return WINLIVE_FOLDER_NORMALIZZATI_RIPARATI if result.riparazione_mp3_riuscita else WINLIVE_FOLDER_NORMALIZZATI
+        return self._winlive_folder_from_outcome(result.stato_winlive_finale)
+
+    @staticmethod
+    def _excerpt_decode_log(log_text: str, *, max_lines: int = 24, max_chars: int = 4000) -> str:
+        lines = [line.strip() for line in str(log_text or "").splitlines() if line.strip()]
+        if not lines:
+            return ""
+        excerpt = "\n".join(lines[:max_lines])
+        if len(excerpt) > max_chars:
+            return excerpt[:max_chars]
+        return excerpt
+
+    def _assess_minimal_decode_for_winlive(self, candidate_path: Path) -> WinLiveDecodeAssessment:
+        try:
+            analysis = self._analyze_mp3(
+                file_path=candidate_path,
+                cancel_event=None,
+                segment_ss=None,
+                segment_t=None,
+            )
+        except Exception as exc:
+            return WinLiveDecodeAssessment(
+                candidate_path=str(candidate_path),
+                command_text="",
+                return_code=-1,
+                decode_log_excerpt=f"Analisi FFmpeg non disponibile: {type(exc).__name__}: {exc}",
+                duration_seconds=max(0.0, float(self._safe_duration_seconds(candidate_path))),
+                error_timestamps=[],
+                decision_rule="E_ANALYSIS_UNAVAILABLE",
+                has_positive_corruption=False,
+                is_decodable=False,
+            )
+
+        duration_seconds = max(0.0, float(self._safe_duration_seconds(candidate_path)))
+        bounds = self.detect_significant_audio_bounds(candidate_path)
+        segment_metrics = self._analyze_significant_segment(
+            file_path=candidate_path,
+            bounds=bounds,
+            cancel_event=None,
+        )
+        issues = self._localize_issues_if_needed(
+            file_path=candidate_path,
+            duration_seconds=duration_seconds,
+            issues=analysis.issues,
+            cancel_event=None,
+            progress_callback=None,
+            index=1,
+            total=1,
+        )
+        evaluated = self._evaluate_issues(
+            file_path=candidate_path,
+            issues=issues,
+            bounds=bounds,
+            significant_segment_metrics=segment_metrics,
+            duration_seconds=duration_seconds,
+        )
+        self._apply_low_impact_terminal_tolerance(
+            evaluated_issues=evaluated,
+            bounds=bounds,
+            analysis=analysis,
+            duration_seconds=duration_seconds,
+            significant_segment_metrics=segment_metrics,
+        )
+
+        relevant = [item for item in evaluated if not item.ignored_for_classification]
+        evidence_items = [item for item in relevant if self._issue_has_sufficient_evidence(item)]
+        significant_items = [
+            item
+            for item in evidence_items
+            if item.position in (IssuePosition.SIGNIFICANT_AUDIO, IssuePosition.BOUNDARY_OVERLAP)
+        ]
+        repeated_stream = len(evidence_items) >= 3
+
+        has_positive_corruption = bool(significant_items) or repeated_stream
+        is_decodable = not has_positive_corruption
+
+        log_lower = str(analysis.decode_log or "").casefold()
+        if significant_items:
+            decision_rule = "A_REAL_ERROR_IN_SIGNIFICANT_AUDIO"
+        elif repeated_stream:
+            decision_rule = "B_DIFFUSE_OR_REPEATED_STREAM_ERRORS"
+        elif analysis.return_code != 0 and any(
+            token in log_lower for token in ("trailing", "after end", "junk", "appended", "tag")
+        ):
+            decision_rule = "D_TRAILING_DATA_OR_WINLIVE_TAG_AFTER_AUDIO"
+        elif analysis.return_code != 0:
+            decision_rule = "C_TERMINAL_OR_NON_BLOCKING_WARNING"
+        elif relevant:
+            decision_rule = "E_NON_BLOCKING_FFMPEG_MESSAGES"
+        else:
+            decision_rule = "PASS_NO_POSITIVE_CORRUPTION_EVIDENCE"
+
+        timestamps = sorted(
+            {
+                item.issue.start
+                for item in relevant
+                if item.issue.start and item.issue.start != "Tempo non determinabile"
+            }
+        )
+
+        return WinLiveDecodeAssessment(
+            candidate_path=str(candidate_path),
+            command_text=analysis.command_text,
+            return_code=int(analysis.return_code),
+            decode_log_excerpt=self._excerpt_decode_log(analysis.decode_log),
+            duration_seconds=duration_seconds,
+            error_timestamps=timestamps,
+            decision_rule=decision_rule,
+            has_positive_corruption=has_positive_corruption,
+            is_decodable=is_decodable,
+        )
+
+    def _minimal_candidate_is_decodable(self, candidate_path: Path) -> bool:
+        return self._assess_minimal_decode_for_winlive(candidate_path).is_decodable
+
+    @staticmethod
+    def _append_decode_assessment_notes(
+        winlive_result: WinLiveDiagnosticResult,
+        *,
+        label: str,
+        assessment: WinLiveDecodeAssessment,
+    ) -> None:
+        timestamps = ", ".join(assessment.error_timestamps) if assessment.error_timestamps else "N/D"
+        winlive_result.note_winlive.append(
+            (
+                f"[WINLIVE_ONLY {label}] comando={assessment.command_text or 'N/D'} | "
+                f"rc={assessment.return_code} | durata={assessment.duration_seconds:.3f}s | "
+                f"rule={assessment.decision_rule} | error_ts={timestamps}"
+            )
+        )
+        if assessment.decode_log_excerpt:
+            winlive_result.note_winlive.append(
+                f"[WINLIVE_ONLY {label}] stderr={assessment.decode_log_excerpt}"
+            )
+
+    @staticmethod
+    def _is_temporary_diagnostics_artifact(path: Path) -> bool:
+        lower_name = path.name.casefold()
+        if lower_name.endswith("_stream.mp3"):
+            return True
+        if lower_name.endswith("_reenc.tmp"):
+            return True
+        if lower_name.startswith("wl5_") and lower_name.endswith(".tmp"):
+            return True
+        return any(part.casefold() == OUTPUT_FOLDER_TEMP.casefold() for part in path.parts)
+
+    @staticmethod
+    def _is_infrastructure_failure(winlive_result: WinLiveDiagnosticResult) -> bool:
+        infrastructure_codes = {"READ_FAILED", "WRITE_FAILED", "READBACK_FAILED"}
+        return winlive_result.errore_winlive_code in infrastructure_codes
+
+    def _route_final_output(
+        self,
+        *,
+        mode: FinalOutputMode,
+        source_dir: Path,
+        include_subfolders: bool,
+        original_file: Path,
+        integrity_category_dirs: dict[DiagnosticCategory, Path],
+        winlive_category_dirs: dict[str, Path],
+        final_certification: FinalCertificationResult | None,
+        winlive_result: WinLiveDiagnosticResult,
+        placement_mode: str,
+        originals_safety_dir: Path | None,
+    ) -> FinalOutputRoutingResult:
+        if mode == FinalOutputMode.INTEGRITY_ONLY:
+            if final_certification is None:
+                raise MP3DiagnosticsError("Certificazione finale mancante in modalità solo integrità.")
+
+            placement_candidate_path = ""
+            if final_certification.output_repaired_path:
+                placement_candidate_path = final_certification.output_repaired_path
+            elif final_certification.output_unrecoverable_path:
+                placement_candidate_path = final_certification.output_unrecoverable_path
+            elif final_certification.target_file_path and final_certification.target_file_path != str(original_file):
+                placement_candidate_path = final_certification.target_file_path
+
+            candidate_file_obj: Path | None = None
+            if placement_candidate_path:
+                maybe_path = Path(placement_candidate_path)
+                if maybe_path.exists():
+                    candidate_file_obj = maybe_path
+
+            placement = self._place_file_for_category(
+                source_dir=source_dir,
+                category_dirs=integrity_category_dirs,
+                original_file=original_file,
+                candidate_file=candidate_file_obj,
+                category=final_certification.final_category,
+                include_subfolders=include_subfolders,
+                prefer_candidate=candidate_file_obj is not None,
+                allow_move_candidate=final_certification.final_category == DiagnosticCategory.REPAIRED,
+                placement_mode=placement_mode,
+                originals_safety_dir=originals_safety_dir,
+                preserve_original_in_safety=final_certification.final_category == DiagnosticCategory.REPAIRED,
+                placed_kind=("Output riparato" if final_certification.final_category == DiagnosticCategory.REPAIRED else "Originale non modificato"),
+                fallback_kind="Originale non modificato",
+            )
+            return FinalOutputRoutingResult(
+                output_mode=mode,
+                main_output_folder=OUTPUT_FOLDER_INTEGRITY_ROOT,
+                final_subfolder=self._folder_name_for_category(final_certification.final_category),
+                final_path=str(placement["final_path"]),
+                source_file_path=(str(candidate_file_obj) if candidate_file_obj is not None else str(original_file)),
+                placed_file_kind=str(placement["placed_kind"]),
+                operation=str(placement["operation"]),
+                effective_operation=str(placement["effective_operation"]),
+                routing_reason=final_certification.classification_reason,
+                copy_succeeded=True,
+                already_present=bool(placement["already_present"]),
+                source_was_normalized=candidate_file_obj is not None and candidate_file_obj != original_file,
+                original_preserved=bool(placement["original_preserved"]),
+                preserved_original_path=str(placement["preserved_original_path"]),
+            )
+
+        if mode == FinalOutputMode.WINLIVE_ONLY:
+            final_subfolder = self._winlive_folder_from_result(winlive_result)
+            source_to_place = original_file
+            placed_kind = "Originale"
+            corruption_reason = ""
+
+            candidate_assessment: WinLiveDecodeAssessment | None = None
+            if winlive_result.normalizzazione_validata and winlive_result.file_temporaneo:
+                candidate = Path(winlive_result.file_temporaneo)
+                if candidate.exists():
+                    candidate_assessment = self._assess_minimal_decode_for_winlive(candidate)
+                    self._append_decode_assessment_notes(
+                        winlive_result,
+                        label="candidate",
+                        assessment=candidate_assessment,
+                    )
+                    if candidate_assessment.has_positive_corruption:
+                        final_subfolder = WINLIVE_FOLDER_MP3_CORROTTI
+                        placed_kind = "Originale"
+                        corruption_reason = (
+                            "Corruzione audio reale rilevata sul candidato normalizzato "
+                            f"({candidate_assessment.decision_rule})"
+                        )
+                    elif candidate_assessment.is_decodable:
+                        source_to_place = candidate
+                        placed_kind = "Normalizzato validato"
+                    else:
+                        winlive_result.note_winlive.append(
+                            "Candidato normalizzato con warning non bloccanti: nessuna prova positiva di corruzione audio."
+                        )
+                else:
+                    winlive_result.note_winlive.append(
+                        "Candidato normalizzato non trovato: fallback tecnico sul file originale."
+                    )
+
+            if candidate_assessment is None:
+                original_assessment = self._assess_minimal_decode_for_winlive(original_file)
+                self._append_decode_assessment_notes(
+                    winlive_result,
+                    label="original",
+                    assessment=original_assessment,
+                )
+                if original_assessment.has_positive_corruption:
+                    final_subfolder = WINLIVE_FOLDER_MP3_CORROTTI
+                    placed_kind = "Originale"
+                    corruption_reason = (
+                        "Corruzione audio reale rilevata sul file originale "
+                        f"({original_assessment.decision_rule})"
+                    )
+
+            destination_root = winlive_category_dirs[final_subfolder]
+            placement = self._place_file_in_folder(
+                source_dir=source_dir,
+                destination_root=destination_root,
+                original_file=original_file,
+                source_to_place=source_to_place,
+                include_subfolders=include_subfolders,
+            )
+            reason = winlive_result.motivo_validazione_post_modifica or (winlive_result.stato_winlive_finale.value if winlive_result.stato_winlive_finale else "Routing WinLive")
+            if final_subfolder == WINLIVE_FOLDER_MP3_CORROTTI:
+                reason = corruption_reason or "Corruzione audio reale confermata nel controllo WinLive"
+            return FinalOutputRoutingResult(
+                output_mode=mode,
+                main_output_folder=OUTPUT_FOLDER_WINLIVE,
+                final_subfolder=final_subfolder,
+                final_path=placement["final_path"],
+                source_file_path=str(source_to_place),
+                placed_file_kind=placed_kind,
+                operation=placement["operation"],
+                effective_operation=placement["operation"],
+                routing_reason=reason,
+                copy_succeeded=True,
+                already_present=placement["operation"] == "File già presente nella destinazione",
+                source_was_normalized=source_to_place != original_file,
+                original_preserved=original_file.exists(),
+                preserved_original_path=str(original_file),
+            )
+
+        if final_certification is None:
+            raise MP3DiagnosticsError("Certificazione finale mancante in modalità combinata.")
+
+        if self._is_infrastructure_failure(winlive_result):
+            final_subfolder = WINLIVE_FOLDER_ERRORI_LETTURA_SCRITTURA
+            reason = "Errore infrastrutturale durante lettura/scrittura o validazione"
+        elif winlive_result.stato_winlive_finale == WinLiveOutcome.MODIFICATION_NOT_INTEGRAL:
+            final_subfolder = WINLIVE_FOLDER_NON_INTEGRO_DOPO_MODIFICA
+            reason = "Normalizzazione WinLive non integrale: scartato file modificato"
+        elif not final_certification.is_certified:
+            final_subfolder = WINLIVE_FOLDER_MP3_CORROTTI
+            reason = "MP3 non certificato con anomalia preesistente"
+        else:
+            final_subfolder = self._winlive_folder_from_outcome(winlive_result.stato_winlive_finale)
+            if final_subfolder in (WINLIVE_FOLDER_ERRORI_STRUTTURA, WINLIVE_FOLDER_NORMALIZZATI_RIPARATI):
+                final_subfolder = WINLIVE_FOLDER_MP3_CORROTTI
+            reason = "Certificazione positiva: applicata classificazione WinLive"
+
+        source_to_place = original_file
+        placed_kind = "Originale"
+        if final_certification.is_certified:
+            if final_certification.output_repaired_path:
+                repaired_candidate = Path(final_certification.output_repaired_path)
+                if repaired_candidate.exists():
+                    source_to_place = repaired_candidate
+                    placed_kind = "Riparato"
+            elif winlive_result.normalizzazione_validata and winlive_result.file_temporaneo:
+                normalized_candidate = Path(winlive_result.file_temporaneo)
+                if normalized_candidate.exists():
+                    source_to_place = normalized_candidate
+                    placed_kind = "Normalizzato validato"
+
+        destination_root = winlive_category_dirs[final_subfolder]
+        placement = self._place_file_in_folder(
+            source_dir=source_dir,
+            destination_root=destination_root,
+            original_file=original_file,
+            source_to_place=source_to_place,
+            include_subfolders=include_subfolders,
+        )
+
+        return FinalOutputRoutingResult(
+            output_mode=mode,
+            main_output_folder=OUTPUT_FOLDER_INTEGRITY_WINLIVE,
+            final_subfolder=final_subfolder,
+            final_path=placement["final_path"],
+            source_file_path=str(source_to_place),
+            placed_file_kind=placed_kind,
+            operation=placement["operation"],
+            effective_operation=placement["operation"],
+            routing_reason=reason,
+            copy_succeeded=True,
+            already_present=placement["operation"] == "File già presente nella destinazione",
+            source_was_normalized=source_to_place != original_file,
+            original_preserved=original_file.exists(),
+            preserved_original_path=str(original_file),
+        )
+
+    @staticmethod
+    def _same_issue_signatures(before: list[EvaluatedIssue], after: list[EvaluatedIssue]) -> bool:
+        def signature(item: EvaluatedIssue) -> tuple[str, str, str, str]:
+            return (
+                item.issue.problem_key,
+                item.issue.problem_type,
+                item.issue.start,
+                item.issue.detail,
+            )
+
+        return sorted(signature(item) for item in before) == sorted(signature(item) for item in after)
+
+    @staticmethod
+    def _issue_has_sufficient_evidence(item: EvaluatedIssue) -> bool:
+        if item.segment_start_ms is not None and item.segment_end_ms is not None:
+            return True
+        if item.position in (
+            IssuePosition.SIGNIFICANT_AUDIO,
+            IssuePosition.BOUNDARY_OVERLAP,
+            IssuePosition.LEADING_SILENCE,
+            IssuePosition.TRAILING_SILENCE,
+        ):
+            return item.issue.start != "Tempo non determinabile"
+        return False
+
+    @staticmethod
+    def _certify_integrity_status_label(is_certified: bool) -> str:
+        return "Certificato" if is_certified else "Non certificato"
+
+    def _select_final_certification_target(self, *, original_file: Path, winlive_result: WinLiveDiagnosticResult) -> Path:
+        candidate = (winlive_result.file_temporaneo or "").strip()
+        if winlive_result.normalizzazione_validata and candidate:
+            candidate_path = Path(candidate)
+            if candidate_path.exists():
+                return candidate_path
+        return original_file
+
+    @staticmethod
+    def _build_final_certification_result(
+        *,
+        cert_payload: dict[str, Any],
+        target_file_path: Path,
+        normalized_candidate_path: str,
+    ) -> FinalCertificationResult:
+        final_outcome = str(cert_payload.get("final_outcome", ""))
+        is_certified = final_outcome in (STATUS_PERFECT, STATUS_REPAIRED)
+        return FinalCertificationResult(
+            target_file_path=str(target_file_path),
+            normalized_candidate_path=normalized_candidate_path,
+            final_outcome=final_outcome,
+            final_status=str(cert_payload.get("final_status", "")),
+            final_category=cert_payload.get("final_category", DiagnosticCategory.UNRECOVERABLE),
+            final_folder=str(cert_payload.get("final_folder", "")),
+            is_certified=is_certified,
+            certification_label=("Certificato" if is_certified else "Non certificato"),
+            classification_reason=str(cert_payload.get("classification_reason", "")),
+            blocking_residual=bool(cert_payload.get("blocking_residual", False)),
+            repaired=bool(cert_payload.get("repaired", False)),
+            repair_command=str(cert_payload.get("repair_command", "")),
+            repair_rc=int(cert_payload.get("repair_rc", 0)),
+            repair_mode_used=str(cert_payload.get("repair_mode_used", "")),
+            output_repaired_path=str(cert_payload.get("output_repaired_path", "")),
+            output_unrecoverable_path=str(cert_payload.get("output_unrecoverable_path", "")),
+            analysis=cert_payload.get("analysis"),
+            duration_seconds=float(cert_payload.get("duration_seconds", 0.0)),
+            bounds=cert_payload.get("bounds"),
+            segment_metrics=dict(cert_payload.get("segment_metrics", {})),
+            evaluated=list(cert_payload.get("evaluated", [])),
+            relevant=list(cert_payload.get("relevant", [])),
+            ignored=list(cert_payload.get("ignored", [])),
+        )
+
+    def _apply_unified_certification_to_winlive(
+        self,
+        *,
+        result: WinLiveDiagnosticResult,
+        certification: FinalCertificationResult,
+        original_relevant_count: int,
+    ) -> None:
+        result.certificazione_finale_mp3 = certification.certification_label
+        result.stato_integrita_originale = certification.final_outcome
+        result.stato_integrita_file_normalizzato = certification.final_status
+        result.riparazione_mp3_tentata = bool(certification.repaired or certification.repair_command)
+        result.riparazione_mp3_riuscita = certification.final_status == FINAL_REPAIRED
+        result.stato_dopo_riparazione = certification.final_status
+        result.origine_anomalia = (
+            "Risolta dalla riparazione" if result.riparazione_mp3_riuscita else "Preesistente nel file originale"
+        )
+        became_unrecoverable_after_normalization = (
+            result.normalizzazione_validata
+            and original_relevant_count == 0
+            and certification.final_outcome == STATUS_UNRECOVERABLE
+        )
+        result.peggioramento_dopo_normalizzazione = became_unrecoverable_after_normalization
+        result.errore_introdotto_dalla_normalizzazione = became_unrecoverable_after_normalization
+        result.motivazione_sintetica_certificazione = certification.classification_reason
+        result.motivazione_tecnica = certification.analysis.decode_log
+        if certification.classification_reason:
+            result.note_winlive.append(certification.classification_reason)
+
+    @staticmethod
+    def _apply_winlive_certification_overrides(
+        *,
+        certification: FinalCertificationResult,
+        winlive_result: WinLiveDiagnosticResult,
+    ) -> None:
+        infrastructure_codes = {"READ_FAILED", "WRITE_FAILED", "READBACK_FAILED"}
+        if winlive_result.errore_winlive_code in infrastructure_codes:
+            certification.final_outcome = STATUS_UNRECOVERABLE
+            certification.final_status = FINAL_UNRECOVERABLE
+            certification.final_category = DiagnosticCategory.UNRECOVERABLE
+            certification.final_folder = OUTPUT_FOLDER_UNRECOVERABLE
+            certification.is_certified = False
+            certification.certification_label = "Errore infrastrutturale"
+            certification.classification_reason = "Non recuperabile: errore infrastrutturale durante la normalizzazione WinLive"
+            certification.blocking_residual = True
+            certification.repaired = False
+            return
+
+        if winlive_result.stato_winlive_finale == WinLiveOutcome.MODIFICATION_NOT_INTEGRAL:
+            certification.final_outcome = STATUS_UNRECOVERABLE
+            certification.final_status = FINAL_UNRECOVERABLE
+            certification.final_category = DiagnosticCategory.UNRECOVERABLE
+            certification.final_folder = OUTPUT_FOLDER_UNRECOVERABLE
+            certification.is_certified = False
+            certification.certification_label = "Non certificato"
+            certification.classification_reason = "Non recuperabile: normalizzazione WinLive non integrale"
+            certification.blocking_residual = True
+            certification.repaired = False
+
+    def _certify_mp3_candidate(
+        self,
+        *,
+        file_path: Path,
+        repair_mode: bool,
+        cancel_event: Any | None,
+        temp_dir: Path | None = None,
+    ) -> dict[str, Any]:
+        analysis = self._analyze_mp3(
+            file_path=file_path,
+            cancel_event=cancel_event,
+            segment_ss=None,
+            segment_t=None,
+        )
+        duration_seconds = self._safe_duration_seconds(file_path)
+        issues = self._localize_issues_if_needed(
+            file_path=file_path,
+            duration_seconds=duration_seconds,
+            issues=analysis.issues,
+            cancel_event=cancel_event,
+            progress_callback=None,
+            index=1,
+            total=1,
+        )
+        bounds = self.detect_significant_audio_bounds(file_path)
+        segment_metrics = self._analyze_significant_segment(
+            file_path=file_path,
+            bounds=bounds,
+            cancel_event=cancel_event,
+        )
+        evaluated = self._evaluate_issues(
+            file_path=file_path,
+            issues=issues,
+            bounds=bounds,
+            significant_segment_metrics=segment_metrics,
+            duration_seconds=duration_seconds,
+        )
+        self._apply_low_impact_terminal_tolerance(
+            evaluated_issues=evaluated,
+            bounds=bounds,
+            analysis=analysis,
+            duration_seconds=duration_seconds,
+            significant_segment_metrics=segment_metrics,
+        )
+        relevant = [item for item in evaluated if not item.ignored_for_classification]
+        ignored = [item for item in evaluated if item.ignored_for_classification]
+        confirmed_blocking = [item for item in relevant if self._issue_has_sufficient_evidence(item)]
+
+        repaired = False
+        repair_command = ""
+        repair_rc = 0
+        repair_mode_used = ""
+        output_repaired_path = ""
+        output_unrecoverable_path = ""
+
+        final_status = FINAL_HEALTHY
+        final_category = DiagnosticCategory.OK
+        final_folder = OUTPUT_FOLDER_OK
+        final_outcome = STATUS_PERFECT
+        classification_reason = "Integro: nessun errore rilevante nell'audio significativo"
+        blocking_residual = bool(confirmed_blocking)
+
+        if relevant and not confirmed_blocking:
+            final_status = "Classificazione non determinabile"
+            final_category = DiagnosticCategory.UNRECOVERABLE
+            final_folder = OUTPUT_FOLDER_UNRECOVERABLE
+            final_outcome = "Classificazione non determinabile"
+            classification_reason = (
+                "Warning FFmpeg rilevati ma non supportati da sufficiente evidenza tecnica per classificare il file come Non recuperabile."
+            )
+        elif relevant:
+            final_status = FINAL_UNRECOVERABLE
+            final_category = DiagnosticCategory.UNRECOVERABLE
+            final_folder = OUTPUT_FOLDER_UNRECOVERABLE
+            final_outcome = STATUS_UNRECOVERABLE
+            classification_reason = "Non recuperabile: rilevati problemi nell'audio significativo"
+        elif ignored and all(item.exclusion_reason == LOW_IMPACT_TERMINAL_EXCLUSION_REASON for item in ignored):
+            classification_reason = LOW_IMPACT_TERMINAL_HEALTHY_REASON
+
+        if repair_mode and confirmed_blocking:
+            working_temp_dir = temp_dir or (Path(tempfile.gettempdir()) / OUTPUT_FOLDER_TEMP)
+            working_temp_dir.mkdir(parents=True, exist_ok=True)
+            repair_result = self._attempt_repair(source=file_path, temp_dir=working_temp_dir, cancel_event=cancel_event)
+            repair_command = repair_result.get("command", "")
+            repair_rc = int(repair_result.get("return_code", 0))
+            repair_mode_used = str(repair_result.get("mode", ""))
+            temp_output = repair_result.get("output_path")
+            if repair_result.get("ok") and isinstance(temp_output, str):
+                repaired = True
+                repaired_file = Path(temp_output)
+                repaired_analysis = self._analyze_mp3(
+                    file_path=repaired_file,
+                    cancel_event=cancel_event,
+                    segment_ss=None,
+                    segment_t=None,
+                )
+                repaired_duration = self._safe_duration_seconds(repaired_file)
+                repaired_issues = self._localize_issues_if_needed(
+                    file_path=repaired_file,
+                    duration_seconds=repaired_duration,
+                    issues=repaired_analysis.issues,
+                    cancel_event=cancel_event,
+                    progress_callback=None,
+                    index=1,
+                    total=1,
+                )
+                repaired_bounds = self.detect_significant_audio_bounds(repaired_file)
+                repaired_metrics = self._analyze_significant_segment(
+                    file_path=repaired_file,
+                    bounds=repaired_bounds,
+                    cancel_event=cancel_event,
+                )
+                repaired_evaluated = self._evaluate_issues(
+                    file_path=repaired_file,
+                    issues=repaired_issues,
+                    bounds=repaired_bounds,
+                    significant_segment_metrics=repaired_metrics,
+                    duration_seconds=repaired_duration,
+                )
+                self._apply_low_impact_terminal_tolerance(
+                    evaluated_issues=repaired_evaluated,
+                    bounds=repaired_bounds,
+                    analysis=repaired_analysis,
+                    duration_seconds=repaired_duration,
+                    significant_segment_metrics=repaired_metrics,
+                )
+                repaired_relevant = [item for item in repaired_evaluated if not item.ignored_for_classification]
+                repaired_confirmed_blocking = [item for item in repaired_relevant if self._issue_has_sufficient_evidence(item)]
+                has_same_signatures = self._same_issue_signatures(relevant, repaired_relevant)
+                if not repaired_confirmed_blocking and not self._has_blocking_errors(repaired_metrics) and not has_same_signatures:
+                    repaired = True
+                    final_status = FINAL_REPAIRED
+                    final_category = DiagnosticCategory.REPAIRED
+                    final_folder = OUTPUT_FOLDER_REPAIRED
+                    final_outcome = STATUS_REPAIRED
+                    classification_reason = "Riparato: problemi rilevanti eliminati nell'audio significativo"
+                    blocking_residual = False
+                    output_repaired_path = str(repaired_file)
+                else:
+                    classification_reason = "Non recuperabile: riparazione non risolutiva o firme residue identiche"
+                    output_unrecoverable_path = str(repaired_file)
+            else:
+                output_unrecoverable_path = str(file_path)
+
+        certification_ok = final_outcome in (STATUS_PERFECT, STATUS_REPAIRED)
+        return {
+            "analysis": analysis,
+            "duration_seconds": duration_seconds,
+            "issues": issues,
+            "bounds": bounds,
+            "segment_metrics": segment_metrics,
+            "evaluated": evaluated,
+            "relevant": relevant,
+            "ignored": ignored,
+            "repaired": repaired,
+            "repair_command": repair_command,
+            "repair_rc": repair_rc,
+            "repair_mode_used": repair_mode_used,
+            "output_repaired_path": output_repaired_path,
+            "output_unrecoverable_path": output_unrecoverable_path,
+            "final_status": final_status,
+            "final_category": final_category,
+            "final_folder": final_folder,
+            "final_outcome": final_outcome,
+            "classification_reason": classification_reason,
+            "blocking_residual": blocking_residual,
+            "certificazione_finale_mp3": self._certify_integrity_status_label(certification_ok),
+            "motivazione_sintetica_certificazione": classification_reason,
+            "motivazione_tecnica": analysis.decode_log,
+        }
 
     @staticmethod
     def _zero_metrics() -> dict[str, int]:
@@ -2525,6 +3554,7 @@ class MP3DiagnosticsEngine:
             "idempotenza_seconda_normalizzazione",
             "confronto_prefisso_suffisso_metadati",
             "classificazione",
+            "certificazione_integrita",
             "copia_file",
             "ffmpeg",
             "ffprobe",
@@ -2661,6 +3691,51 @@ class MP3DiagnosticsEngine:
         for row in rows:
             if not row.winlive.verifica_winlive_eseguita:
                 continue
+
+            for occurrence in row.winlive.accordi_non_riconosciuti_occurrence:
+                timestamp_ms = occurrence.get("timestamp_ms", None)
+                timestamp_formatted = str(occurrence.get("timestamp_formatted", "") or "")
+                token = str(occurrence.get("token", "") or "")
+                line_index = str(occurrence.get("line_index", "") or "")
+                line_content = str(occurrence.get("line_content", "") or "")
+                timestamp_source = str(occurrence.get("timestamp_source", "") or "")
+                line_previous = str(occurrence.get("line_previous", "") or "")
+                line_next = str(occurrence.get("line_next", "") or "")
+                occurrence_index = str(occurrence.get("occurrence_index_on_line", "") or "")
+                out.append(
+                    {
+                        "Numero": number,
+                        "File": row.file_name,
+                        "Percorso originale": row.file_path,
+                        "Tipo controllo": "WinLive",
+                        "Fase": "analisi_winlive",
+                        "Categoria": "ACCORDO_NON_RICONOSCIUTO",
+                        "Codice": "UNRECOGNIZED_CHORD_OCCURRENCE",
+                        "Descrizione": f"Riga WinLive {line_index}, occorrenza {occurrence_index}: accordo non riconosciuto.",
+                        "Timestamp iniziale ms": "" if timestamp_ms is None else str(timestamp_ms),
+                        "Timestamp finale ms": "",
+                        "Tempo iniziale formattato": timestamp_formatted,
+                        "Tempo finale formattato": "",
+                        "Offset byte iniziale": "",
+                        "Offset byte finale": "",
+                        "Riga logica": line_index,
+                        "Riga precedente": line_previous,
+                        "Riga successiva": line_next,
+                        "Indice occorrenza sulla riga": occurrence_index,
+                        "Valore originale": line_content,
+                        "Valore collegato": timestamp_source,
+                        "Origine timestamp": timestamp_source,
+                        "Valore risultante": token,
+                        "Frammento originale": line_content,
+                        "Frammento risultante": token,
+                        "Azione": "Segnalazione accordo non riconosciuto",
+                        "Validazione": "OK",
+                        "Impatto uditivo": "Da verificare",
+                        "Decisione finale": row.winlive.stato_winlive_finale.value if row.winlive.stato_winlive_finale else "",
+                        "Note": f"occorrenza={occurrence_index}/{occurrence.get('occurrences_on_line', '')}",
+                    }
+                )
+                number += 1
 
             if row.winlive.righe_temporali_vuote_eliminate > 0:
                 out.append(
@@ -2820,6 +3895,13 @@ class MP3DiagnosticsEngine:
                     "File": row.file_name,
                     "Stato MP3": row.repair_outcome,
                     "Stato WinLive": status,
+                    "Certificazione finale MP3": row.winlive.certificazione_finale_mp3,
+                    "Stato integrità file normalizzato": row.winlive.stato_integrita_file_normalizzato,
+                    "Riparazione MP3 tentata": "SI" if row.winlive.riparazione_mp3_tentata else "NO",
+                    "Riparazione MP3 riuscita": "SI" if row.winlive.riparazione_mp3_riuscita else "NO",
+                    "Origine dell'anomalia": row.winlive.origine_anomalia,
+                    "Motivazione sintetica certificazione": row.winlive.motivazione_sintetica_certificazione,
+                    "Motivazione tecnica": row.winlive.motivazione_tecnica,
                     "Presenza WL5SYNCT": "SI" if row.winlive.synct_presente_prima else "NO",
                     "Presenza WL5CHORD": "SI" if row.winlive.chord_presente_prima else "NO",
                     "Testo presente": "SI" if row.winlive.testo_presente else "NO",
@@ -3043,6 +4125,12 @@ class MP3DiagnosticsEngine:
             lines.append(f"Silenzio finale: {row.bounds_before.trailing_silence_ms} ms")
             lines.append(f"Motivo classificazione finale: {row.classification_reason}")
             lines.append(f"Esito finale: {row.repair_outcome}")
+            lines.append(f"Modalità di controllo: {row.output_mode}")
+            lines.append(f"Cartella principale di esito: {row.output_main_folder}")
+            lines.append(f"Sottocartella finale: {row.output_final_subfolder}")
+            lines.append(f"Percorso esito finale: {row.output_final_path_unified}")
+            lines.append(f"File candidato finale: {row.output_final_candidate_file}")
+            lines.append(f"Motivo routing finale: {row.output_routing_reason}")
             lines.append(f"Cartella finale: {row.final_folder}")
             if row.winlive.verifica_winlive_eseguita:
                 lines.append("WinLive: ATTIVO")
@@ -3065,6 +4153,32 @@ class MP3DiagnosticsEngine:
                     lines.append(
                         "Token accordi non riconosciuti: " + ", ".join(row.winlive.accordi_non_riconosciuti_token)
                     )
+                if row.winlive.accordi_non_riconosciuti_occurrence:
+                    lines.append("Dettaglio accordi non riconosciuti:")
+                    for occurrence in row.winlive.accordi_non_riconosciuti_occurrence:
+                        timestamp_ms = occurrence.get("timestamp_ms", None)
+                        timestamp_text = str(occurrence.get("timestamp_formatted", "") or "")
+                        timestamp_source = str(occurrence.get("timestamp_source", "") or "")
+                        token = str(occurrence.get("token", "") or "")
+                        line_index = str(occurrence.get("line_index", "") or "")
+                        context = str(occurrence.get("line_content", "") or "")
+                        context_prev = str(occurrence.get("line_previous", "") or "")
+                        context_next = str(occurrence.get("line_next", "") or "")
+                        occurrence_index = str(occurrence.get("occurrence_index_on_line", "") or "")
+                        occurrences_on_line = str(occurrence.get("occurrences_on_line", "") or "")
+                        lines.append(
+                            " - "
+                            f"riga {line_index}; "
+                            f"indice_occorrenza={occurrence_index}; "
+                            f"timestamp_ms={'' if timestamp_ms is None else timestamp_ms}; "
+                            f"timestamp={timestamp_text}; "
+                            f"token={token}; "
+                            f"contesto={context}; "
+                            f"precedente={context_prev}; "
+                            f"successiva={context_next}; "
+                            f"occorrenze={occurrences_on_line}; "
+                            f"origine_timestamp={timestamp_source}"
+                        )
                 lines.append(f"Cartella esito WinLive: {row.winlive.esito_cartella_winlive}")
                 lines.append(f"Percorso esito WinLive: {row.winlive.esito_percorso_winlive}")
                 lines.append(f"Operazione esito WinLive: {row.winlive.esito_operazione_winlive}")
@@ -3110,6 +4224,11 @@ class MP3DiagnosticsEngine:
         verify_mp3_integrity: bool,
         verify_winlive: bool,
     ) -> dict[str, Any]:
+        output_mode = self._determine_output_mode(
+            verify_mp3_integrity=verify_mp3_integrity,
+            verify_winlive=verify_winlive,
+        )
+        main_output_folder = self._output_main_folder_name(output_mode)
         total = len(rows)
         perfect = sum(1 for row in rows if row.repair_outcome == STATUS_PERFECT) if verify_mp3_integrity else 0
         repaired = sum(1 for row in rows if row.repair_outcome == STATUS_REPAIRED) if verify_mp3_integrity else 0
@@ -3136,6 +4255,8 @@ class MP3DiagnosticsEngine:
             "placement_mode_label": self._placement_mode_label(placement_mode),
             "verify_mp3_integrity": bool(verify_mp3_integrity),
             "verify_winlive": bool(verify_winlive),
+            "output_mode": output_mode.value,
+            "main_output_folder": main_output_folder,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -3149,6 +4270,57 @@ class MP3DiagnosticsEngine:
             except OSError:
                 pass
 
+    def remove_empty_output_directories(self, root_path: Path, *, protected_roots: list[Path] | None = None) -> None:
+        if not root_path.exists():
+            return
+
+        protected = {root_path.resolve()}
+        for item in protected_roots or []:
+            try:
+                protected.add(item.resolve())
+            except OSError:
+                continue
+
+        directories = sorted(
+            [path for path in root_path.rglob("*") if path.is_dir()],
+            key=lambda item: len(item.parts),
+            reverse=True,
+        )
+
+        for directory in directories:
+            try:
+                resolved = directory.resolve()
+            except OSError:
+                continue
+            if resolved in protected:
+                continue
+            try:
+                if any(directory.iterdir()):
+                    continue
+                directory.rmdir()
+            except OSError:
+                continue
+
     @staticmethod
     def _command_to_text(command: list[str]) -> str:
         return " ".join(f'"{part}"' if " " in part else part for part in command)
+
+
+def diagnose_mp3_integrity(
+    file_path: str | Path,
+    *,
+    allow_repair: bool = True,
+    generate_details: bool = True,
+    context: str = "standalone",
+) -> dict[str, Any]:
+    engine = MP3DiagnosticsEngine()
+    source = Path(file_path).expanduser().resolve()
+    return engine.run_diagnostics(
+        input_folder=str(source.parent),
+        include_subfolders=False,
+        output_folder=str(source.parent),
+        repair_mode=allow_repair,
+        selected_input_files=[source],
+        verify_mp3_integrity=generate_details,
+        verify_winlive=False,
+    )

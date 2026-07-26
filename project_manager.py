@@ -144,7 +144,10 @@ def validate_project(data: dict[str, Any]) -> None:
 
 def resolve_project_files(
     data: dict[str, Any],
-    selected_folder: str | Path | None = None
+    selected_folder: str | Path | None = None,
+    *,
+    include_subfolders: bool = False,
+    auto_append_new: bool = AUTO_APPEND_NEW_TRACKS,
 ) -> ProjectLoadResult:
     validate_project(data)
 
@@ -157,7 +160,7 @@ def resolve_project_files(
         raise ProjectResolutionError(f"Cartella sorgente non valida:\n{source_folder}")
 
     source_folder = source_folder.resolve()
-    scanned = _scan_mp3_files(source_folder)
+    scanned = _scan_mp3_files(source_folder, include_subfolders=include_subfolders)
 
     by_relative = {
         item.relative_path.lower(): item
@@ -182,21 +185,6 @@ def resolve_project_files(
 
         display_name = str(saved.get("relative_path") or saved.get("file_name") or "<sconosciuto>")
         matched: _ResolvedFile | None = None
-
-        raw_relative = saved.get("relative_path")
-        if raw_relative is not None:
-            raw_relative_str = str(raw_relative).strip().replace("\\", "/")
-        else:
-            raw_relative_str = ""
-
-        has_nested_relative = "/" in raw_relative_str
-        if has_nested_relative:
-            warnings.append(
-                "Percorso non valido nel progetto (sottocartelle non supportate): "
-                f"{display_name}"
-            )
-            missing_files.append(display_name)
-            continue
 
         normalized_relative = _normalize_relative_path(saved.get("relative_path"))
         if normalized_relative is not None:
@@ -276,7 +264,7 @@ def resolve_project_files(
         )
 
     new_files: list[str] = []
-    if AUTO_APPEND_NEW_TRACKS:
+    if auto_append_new:
         for candidate in sorted(scanned, key=lambda item: item.relative_path.lower()):
             if candidate.relative_path.lower() in consumed_relative:
                 continue
@@ -305,10 +293,14 @@ def resolve_project_files(
     )
 
 
-def _scan_mp3_files(folder: Path) -> list[_ResolvedFile]:
+def _scan_mp3_files(folder: Path, *, include_subfolders: bool = False) -> list[_ResolvedFile]:
     resolved: list[_ResolvedFile] = []
 
-    for file_path in scan_mp3_files(folder):
+    for file_path in scan_mp3_files(
+        folder,
+        include_subfolders=include_subfolders,
+        exclude_diagnostics_sessions=True,
+    ):
         try:
             relative = file_path.relative_to(folder).as_posix()
             stat = file_path.stat()
@@ -484,9 +476,6 @@ def _normalize_relative_path(value: Any) -> str | None:
         normalized_parts.append(part)
 
     if not normalized_parts:
-        return None
-
-    if len(normalized_parts) > 1:
         return None
 
     return Path(*normalized_parts).as_posix()

@@ -30,11 +30,15 @@ class NonRecursiveScanTests(unittest.TestCase):
         # Non-MP3 in root
         _write_file(self.folder / "note.txt")
 
-        # 2 subfolders with 4 MP3 total (must be ignored)
+        # 2 subfolders with 4 MP3 total
         _write_file(self.folder / "Archivio" / "A1.mp3")
         _write_file(self.folder / "Archivio" / "A2.mp3")
         _write_file(self.folder / "Vecchi" / "V1.mp3")
         _write_file(self.folder / "Vecchi" / "V2.MP3")
+
+        # Diagnostics output session subtree (must be excluded when recursive scan is enabled)
+        _write_file(self.folder / "Diagnostica_MP3_2026-07-26_10-00-00" / "Esito WinLive" / "Conformi" / "Diag1.mp3")
+        _write_file(self.folder / "Diagnostica_MP3_2026-07-26_10-00-00" / "Esito WinLive" / "Conformi" / "Diag2.MP3")
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -59,6 +63,21 @@ class NonRecursiveScanTests(unittest.TestCase):
         files = scan_mp3_files(self.folder)
         self.assertEqual(len(files), 3)
 
+    def test_4b_recursive_scan_includes_subfolders(self) -> None:
+        files = scan_mp3_files(self.folder, include_subfolders=True)
+        self.assertEqual(len(files), 9)
+
+    def test_4c_recursive_scan_excludes_diagnostics_sessions(self) -> None:
+        files = scan_mp3_files(
+            self.folder,
+            include_subfolders=True,
+            exclude_diagnostics_sessions=True,
+        )
+        names = [item.name for item in files]
+        self.assertEqual(len(files), 7)
+        self.assertNotIn("Diag1.mp3", names)
+        self.assertNotIn("Diag2.MP3", names)
+
     def test_5_uppercase_extension_is_included(self) -> None:
         files = scan_mp3_files(self.folder)
         names = [item.name for item in files]
@@ -75,8 +94,15 @@ class NonRecursiveScanTests(unittest.TestCase):
             scan_mp3_files(self.root / "inesistente")
 
     def test_gui_scanner_uses_same_non_recursive_rule(self) -> None:
-        files = MixCreatorApp.scan_mp3_files(self.folder)
+        files = MixCreatorApp.scan_mp3_files(self.folder, include_subfolders=False)
         self.assertEqual(files, ["Brano1.mp3", "Brano2.mp3", "Brano3.MP3"])
+
+    def test_gui_scanner_recursive_includes_subfolders_but_excludes_diagnostics(self) -> None:
+        files = MixCreatorApp.scan_mp3_files(self.folder, include_subfolders=True)
+        self.assertEqual(len(files), 7)
+        self.assertIn("Archivio/A1.mp3", files)
+        self.assertIn("Vecchi/V2.MP3", files)
+        self.assertTrue(all("Diagnostica_MP3_" not in item for item in files))
 
 
 if __name__ == "__main__":

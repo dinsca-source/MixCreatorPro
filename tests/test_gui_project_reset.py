@@ -127,10 +127,10 @@ class GuiProjectResetTests(unittest.TestCase):
         first_item = self.app.track_list.get(0)
         self.assertIn("00:00:57", first_item)
 
-    def test_extract_button_is_always_enabled_without_temporal_data(self) -> None:
+    def test_extract_button_is_disabled_without_temporal_data(self) -> None:
         self.app.last_generated_mix_data = None
         self.app._update_controls_state()
-        self.assertEqual(str(self.app.extract_song_button.cget("state")), "normal")
+        self.assertEqual(str(self.app.extract_song_button.cget("state")), "disabled")
 
     def test_diagnostics_subfolders_default_is_disabled(self) -> None:
         self.assertFalse(bool(self.app.diagnostics_include_subfolders_var.get()))
@@ -141,18 +141,15 @@ class GuiProjectResetTests(unittest.TestCase):
     def test_diagnostics_winlive_defaults_are_disabled(self) -> None:
         self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
         self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
-        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
 
     def test_diagnostics_defaults_restored_after_manual_change_and_reset(self) -> None:
         self.app.diagnostics_verify_mp3_integrity_var.set(False)
         self.app.diagnostics_verify_winlive_var.set(True)
-        self.app.diagnostics_winlive_autocorrect_var.set(True)
 
         self.app._reset_to_initial_state()
 
         self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
         self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
-        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
 
     def test_diagnostics_window_reuses_single_instance(self) -> None:
         self.app.open_diagnostics_window()
@@ -172,44 +169,26 @@ class GuiProjectResetTests(unittest.TestCase):
     def test_diagnostics_winlive_checkboxes_exist_and_positioned_under_subfolders(self) -> None:
         self.app.open_diagnostics_window()
         self.assertTrue(hasattr(self.app, "diagnostics_integrity_checkbox"))
+        self.assertTrue(hasattr(self.app, "diagnostics_winlive_group_label"))
         self.assertTrue(hasattr(self.app, "diagnostics_winlive_checkbox"))
-        self.assertTrue(hasattr(self.app, "diagnostics_winlive_autocorrect_checkbox"))
 
         subfolders_row = int(self.app.diagnostics_subfolders_checkbox.grid_info().get("row", 0))
         integrity_row = int(self.app.diagnostics_integrity_checkbox.grid_info().get("row", 0))
+        group_row = int(self.app.diagnostics_winlive_group_label.grid_info().get("row", 0))
         winlive_row = int(self.app.diagnostics_winlive_checkbox.grid_info().get("row", 0))
-        autocorrect_row = int(self.app.diagnostics_winlive_autocorrect_checkbox.grid_info().get("row", 0))
         output_row = int(self.app.diagnostics_output_entry.grid_info().get("row", 0))
 
         self.assertEqual(integrity_row, subfolders_row + 1)
-        self.assertEqual(winlive_row, subfolders_row + 3)
-        self.assertEqual(autocorrect_row, winlive_row + 1)
-        self.assertGreater(output_row, autocorrect_row)
+        self.assertEqual(group_row, integrity_row + 1)
+        self.assertEqual(winlive_row, group_row + 1)
+        self.assertGreater(output_row, winlive_row)
 
-    def test_diagnostics_winlive_autocorrect_starts_disabled(self) -> None:
+    def test_diagnostics_winlive_toggle_keeps_only_one_option(self) -> None:
         self.app.open_diagnostics_window()
-        self.assertEqual(str(self.app.diagnostics_winlive_checkbox.cget("text")), "Verifica TAG WinLive")
-        self.assertEqual(
-            str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("text")),
-            "Correggi automaticamente\ngli errori normalizzabili",
-        )
-        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
-
-    def test_diagnostics_winlive_toggle_enables_and_disables_autocorrect(self) -> None:
-        self.app.open_diagnostics_window()
-
         self.app.diagnostics_verify_winlive_var.set(True)
         self.app._on_diagnostics_winlive_toggle()
-        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "normal")
-
-        self.app.diagnostics_winlive_autocorrect_var.set(True)
-        self.app._on_diagnostics_winlive_autocorrect_toggle()
-        self.assertTrue(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
-
-        self.app.diagnostics_verify_winlive_var.set(False)
-        self.app._on_diagnostics_winlive_toggle()
-        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
-        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
+        self.assertTrue(bool(self.app.diagnostics_verify_winlive_var.get()))
+        self.assertTrue(self.app._diagnostics_actions_enabled())
 
     def test_diagnostics_both_on_is_allowed(self) -> None:
         self.app.open_diagnostics_window()
@@ -268,9 +247,13 @@ class GuiProjectResetTests(unittest.TestCase):
             tooltip_texts,
         )
         self.assertIn(
-            "Applica esclusivamente\n"
-            "le normalizzazioni sicure\n"
-            "previste dal motore WinLive.",
+            "Controlla la presenza e la correttezza\n"
+            "dei TAG WinLive (testo e accordi)\n"
+            "e include i risultati nei report.",
+            tooltip_texts,
+        )
+        self.assertIn(
+            "Analizza i file selezionati, applica le correzioni disponibili quando necessarie e genera un'unica cartella di esito in base ai controlli attivati.",
             tooltip_texts,
         )
 
@@ -281,24 +264,25 @@ class GuiProjectResetTests(unittest.TestCase):
         try:
             self.app.diagnostics_verify_winlive_var.set(True)
             self.app.diagnostics_verify_mp3_integrity_var.set(False)
-            self.app.diagnostics_winlive_autocorrect_var.set(True)
             self.app.save_settings()
         finally:
             self.app.settings_manager.save = original_save
 
         self.assertFalse(bool(saved_payload.get("diagnostics_verify_mp3_integrity")))
         self.assertTrue(bool(saved_payload.get("diagnostics_verify_winlive")))
-        self.assertTrue(bool(saved_payload.get("diagnostics_winlive_autocorrect")))
+        self.assertNotIn("diagnostics_winlive_autocorrect", saved_payload)
 
         self.app.settings["diagnostics_verify_mp3_integrity"] = False
         self.app.settings["diagnostics_verify_winlive"] = True
-        self.app.settings["diagnostics_winlive_autocorrect"] = True
         self.app._load_settings_into_ui()
         self.app.open_diagnostics_window()
         self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
         self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
-        self.assertFalse(bool(self.app.diagnostics_winlive_autocorrect_var.get()))
-        self.assertEqual(str(self.app.diagnostics_winlive_autocorrect_checkbox.cget("state")), "disabled")
+
+    def test_diagnostics_winlive_autocorrect_ui_and_state_are_absent(self) -> None:
+        self.app.open_diagnostics_window()
+        self.assertFalse(hasattr(self.app, "diagnostics_winlive_autocorrect_var"))
+        self.assertFalse(hasattr(self.app, "diagnostics_winlive_autocorrect_checkbox"))
 
     def test_diagnostics_invalid_saved_both_off_recovers_with_integrity_on(self) -> None:
         self.app.settings["diagnostics_verify_mp3_integrity"] = False
@@ -317,13 +301,12 @@ class GuiProjectResetTests(unittest.TestCase):
 
             self.app._set_diagnostics_entry_values(input_folder=str(input_dir), output_folder=str(output_dir))
             self.app.diagnostics_verify_winlive_var.set(False)
-            self.app.diagnostics_winlive_autocorrect_var.set(True)
 
             captured: dict[str, object] = {}
             original_start = self.app.diagnostics_worker.start
             try:
                 self.app.diagnostics_worker.start = lambda **kwargs: captured.update(kwargs)
-                self.app.start_diagnostics_analysis()
+                self.app.start_diagnostics_repair()
             finally:
                 self.app.diagnostics_worker.start = original_start
 
@@ -331,8 +314,7 @@ class GuiProjectResetTests(unittest.TestCase):
             self.assertFalse(bool(captured["verify_winlive"]))
             self.assertIn("verify_mp3_integrity", captured)
             self.assertTrue(bool(captured["verify_mp3_integrity"]))
-            self.assertIn("winlive_autocorrect", captured)
-            self.assertFalse(bool(captured["winlive_autocorrect"]))
+            self.assertNotIn("winlive_autocorrect", captured)
 
     def test_diagnostics_winlive_flags_are_propagated_when_enabled(self) -> None:
         self.app.open_diagnostics_window()
@@ -345,7 +327,6 @@ class GuiProjectResetTests(unittest.TestCase):
             self.app._set_diagnostics_entry_values(input_folder=str(input_dir), output_folder=str(output_dir))
             self.app.diagnostics_verify_winlive_var.set(True)
             self.app.diagnostics_verify_mp3_integrity_var.set(False)
-            self.app.diagnostics_winlive_autocorrect_var.set(True)
 
             captured: dict[str, object] = {}
             original_start = self.app.diagnostics_worker.start
@@ -357,14 +338,13 @@ class GuiProjectResetTests(unittest.TestCase):
 
             self.assertFalse(bool(captured["verify_mp3_integrity"]))
             self.assertTrue(bool(captured["verify_winlive"]))
-            self.assertTrue(bool(captured["winlive_autocorrect"]))
+            self.assertNotIn("winlive_autocorrect", captured)
 
     def test_diagnostics_actions_disabled_when_both_verifications_disabled(self) -> None:
         self.app.open_diagnostics_window()
         self.app.diagnostics_verify_mp3_integrity_var.set(False)
         self.app.diagnostics_verify_winlive_var.set(False)
         self.app._update_controls_state()
-        self.assertEqual(str(self.app.diagnostics_analyze_button.cget("state")), "disabled")
         self.assertEqual(str(self.app.diagnostics_repair_button.cget("state")), "disabled")
 
     def test_diagnostics_winlive_completion_updates_log_and_final_stats(self) -> None:
@@ -440,7 +420,6 @@ class GuiProjectResetTests(unittest.TestCase):
         self.app.diagnostics_worker._running = True
         try:
             self.app._update_controls_state()
-            self.assertEqual(str(self.app.diagnostics_analyze_button.cget("state")), "disabled")
             self.assertEqual(str(self.app.diagnostics_repair_button.cget("state")), "disabled")
             self.assertEqual(str(self.app.diagnostics_reverify_button.cget("state")), "disabled")
             self.assertEqual(str(self.app.diagnostics_stop_button.cget("state")), "normal")
@@ -450,7 +429,7 @@ class GuiProjectResetTests(unittest.TestCase):
 
     def test_diagnostics_eta_default_before_start(self) -> None:
         self.app.open_diagnostics_window()
-        self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato: --")
+        self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato restante: --")
 
     def test_diagnostics_eta_preparing_state(self) -> None:
         self.app.open_diagnostics_window()
@@ -458,7 +437,8 @@ class GuiProjectResetTests(unittest.TestCase):
         self.app.diagnostics_worker_total = 4
         self.app.diagnostics_last_progress = 0
         self.app._update_diagnostics_eta()
-        self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato: calcolo in corso...")
+        self.assertRegex(self.app.diagnostics_eta_label.cget("text"), r"^Tempo stimato restante: ")
+        self.assertIn("secondi", self.app.diagnostics_eta_label.cget("text"))
 
     def test_diagnostics_eta_formats_seconds_and_mmss(self) -> None:
         self.app.open_diagnostics_window()
@@ -467,14 +447,14 @@ class GuiProjectResetTests(unittest.TestCase):
         self.app.diagnostics_last_progress = 3
         self.app.diagnostics_worker_start_time = time.monotonic() - 2.0
         self.app._update_diagnostics_eta()
-        self.assertIn("Tempo stimato:", self.app.diagnostics_eta_label.cget("text"))
+        self.assertIn("Tempo stimato restante:", self.app.diagnostics_eta_label.cget("text"))
         self.assertIn("secondi", self.app.diagnostics_eta_label.cget("text"))
 
         self.app.diagnostics_worker_total = 2
         self.app.diagnostics_last_progress = 1
         self.app.diagnostics_worker_start_time = time.monotonic() - 120.0
         self.app._update_diagnostics_eta()
-        self.assertRegex(self.app.diagnostics_eta_label.cget("text"), r"^Tempo stimato: \d{2}:\d{2}$")
+        self.assertRegex(self.app.diagnostics_eta_label.cget("text"), r"^Tempo stimato restante: \d{2}:\d{2}$")
 
     def test_diagnostics_eta_final_states_on_complete_cancel_error(self) -> None:
         self.app.open_diagnostics_window()
@@ -497,16 +477,31 @@ class GuiProjectResetTests(unittest.TestCase):
                     "report_paths": {},
                 }
             )
-            self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato: completato")
+            self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato restante: completato")
 
             self.app._handle_diagnostics_worker_cancelled("stop")
-            self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato: annullato")
+            self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato restante: annullato")
 
             self.app._handle_diagnostics_worker_error("boom")
-            self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato: non disponibile")
+            self.assertEqual(self.app.diagnostics_eta_label.cget("text"), "Tempo stimato restante: non disponibile")
         finally:
             gui_module.messagebox.showinfo = original_showinfo
             gui_module.messagebox.showerror = original_showerror
+
+    def test_mix_eta_tracks_preparation_and_export_phases(self) -> None:
+        self.app.start_time = time.monotonic()
+        self.app.last_progress_percent = 0
+
+        self.app._handle_worker_progress(1, 4, "Preparazione clip 1/4: song.mp3")
+        preparation_eta = str(self.app.remaining_label.cget("text"))
+        self.assertNotEqual(preparation_eta, "--:--:--")
+
+        self.app._handle_worker_progress(0, 100, "Normalizzazione e composizione mix...")
+        self.app._handle_worker_progress(10, 100, "Creazione mix: 10%")
+        export_eta = str(self.app.remaining_label.cget("text"))
+
+        self.assertNotEqual(export_eta, "--:--:--")
+        self.assertTrue(export_eta == "calcolo in corso..." or export_eta.endswith("secondi") or ":" in export_eta)
 
     def test_selective_reverify_missing_columns_shows_error(self) -> None:
         self.app.open_diagnostics_window()
@@ -694,11 +689,11 @@ class GuiProjectResetTests(unittest.TestCase):
 
             self.assertEqual(self.app.diagnostics_run_mode, "normal")
             self.assertIsNone(self.app.diagnostics_reverify_selection)
-            self.assertEqual(str(self.app.diagnostics_analyze_button.cget("state")), "normal")
+            self.assertEqual(str(self.app.diagnostics_repair_button.cget("state")), "normal")
 
     def test_load_mp3_list_keeps_selection_model_in_sync(self) -> None:
         self.app.input_folder = "C:/Music"
-        self.app.scan_mp3_files = lambda _folder: ["a.mp3", "b.mp3"]
+        self.app.scan_mp3_files = lambda _folder, **_kwargs: ["a.mp3", "b.mp3"]
 
         self.app.load_mp3_list()
 

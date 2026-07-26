@@ -33,9 +33,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "normalize_audio": True,
     "continue_short_tracks": False,
     "exclude_unrecoverable_from_mix": False,
+    "mix_include_subfolders": True,
     "diagnostics_verify_mp3_integrity": True,
     "diagnostics_verify_winlive": False,
-    "diagnostics_winlive_autocorrect": False,
     "diagnostics_placement_mode": "copy",
     "diagnostics_last_reverify_csv": "",
     "appearance_mode": "System"
@@ -266,12 +266,12 @@ class SettingsManager:
             validated["exclude_unrecoverable_from_mix"]
         )
 
-        validated["diagnostics_verify_winlive"] = bool(
-            validated.get("diagnostics_verify_winlive", False)
+        validated["mix_include_subfolders"] = bool(
+            validated.get("mix_include_subfolders", True)
         )
 
-        validated["diagnostics_winlive_autocorrect"] = bool(
-            validated.get("diagnostics_winlive_autocorrect", False)
+        validated["diagnostics_verify_winlive"] = bool(
+            validated.get("diagnostics_verify_winlive", False)
         )
 
         valid_placement_modes = {

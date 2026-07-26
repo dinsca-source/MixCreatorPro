@@ -224,7 +224,7 @@ class ProjectManagerTests(unittest.TestCase):
         self.assertEqual(len(result.tracks), 0)
         self.assertEqual(len(result.missing_files), 1)
 
-    def test_subfolder_relative_path_is_marked_missing(self) -> None:
+    def test_subfolder_relative_path_is_supported_when_recursive_enabled(self) -> None:
         _write_dummy_mp3(self.source / "top.mp3")
         _write_dummy_mp3(self.source / "sub" / "nested.mp3")
 
@@ -235,10 +235,16 @@ class ProjectManagerTests(unittest.TestCase):
             self._base_settings()
         )
 
-        result = resolve_project_files(load_project(project_path))
+        result = resolve_project_files(
+            load_project(project_path),
+            include_subfolders=True,
+            auto_append_new=False,
+        )
 
-        self.assertIn("sub/nested.mp3", result.missing_files)
-        self.assertTrue(any("sottocartelle" in warning.lower() for warning in result.warnings))
+        self.assertEqual(result.missing_files, [])
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(len(result.tracks), 1)
+        self.assertEqual(result.tracks[0]["relative_path"], "sub/nested.mp3")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ class MP3DiagnosticsWorkerTests(unittest.TestCase):
         kwargs = _FakeDiagnosticsEngine.last_kwargs
         self.assertTrue(kwargs["verify_mp3_integrity"])
         self.assertFalse(kwargs["verify_winlive"])
-        self.assertTrue(kwargs["winlive_autocorrect"])
+        self.assertNotIn("winlive_autocorrect", kwargs)
         self.assertIn("diagnostic_results", self.completed_payload)
 
     def test_verify_winlive_true_is_forwarded_and_callbacks_propagated(self) -> None:
@@ -97,13 +97,12 @@ class MP3DiagnosticsWorkerTests(unittest.TestCase):
                 selected_input_files=[Path("a.mp3")],
                 verify_mp3_integrity=False,
                 verify_winlive=True,
-                winlive_autocorrect=False,
             )
 
         kwargs = _FakeDiagnosticsEngine.last_kwargs
         self.assertFalse(kwargs["verify_mp3_integrity"])
         self.assertTrue(kwargs["verify_winlive"])
-        self.assertFalse(kwargs["winlive_autocorrect"])
+        self.assertNotIn("winlive_autocorrect", kwargs)
         self.assertIs(kwargs["progress_callback"].__self__, w)
         self.assertEqual(kwargs["progress_callback"].__func__.__name__, "_emit_progress")
         self.assertIs(kwargs["cancel_event"], w._cancel_event)

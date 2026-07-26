@@ -81,6 +81,7 @@ class MixWorker:
         ordered_file_names: Optional[list[str]] = None,
         custom_clips: Optional[dict[str, "ClipInfo"]] = None,
         previous_resolved_clips: Optional[dict[str, dict[str, Any]]] = None,
+        isolated_input_names: Optional[list[str]] = None,
     ) -> None:
         if self._running:
             raise RuntimeError("È già in corso una creazione del mix.")
@@ -105,6 +106,7 @@ class MixWorker:
                 "ordered_file_names": ordered_file_names,
                 "custom_clips": custom_clips,
                 "previous_resolved_clips": previous_resolved_clips,
+                "isolated_input_names": isolated_input_names,
             },
             daemon=True
         )
@@ -309,7 +311,6 @@ class MP3DiagnosticsWorker:
         selected_input_files: Optional[list[Path]] = None,
         verify_mp3_integrity: bool = True,
         verify_winlive: bool = False,
-        winlive_autocorrect: bool = True,
     ) -> None:
         if self._running:
             raise RuntimeError("È già in corso una diagnostica MP3.")
@@ -331,7 +332,6 @@ class MP3DiagnosticsWorker:
                 "selected_input_files": selected_input_files,
                 "verify_mp3_integrity": verify_mp3_integrity,
                 "verify_winlive": verify_winlive,
-                "winlive_autocorrect": winlive_autocorrect,
             },
             daemon=True,
         )

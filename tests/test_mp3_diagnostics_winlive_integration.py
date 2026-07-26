@@ -12,8 +12,16 @@ from mp3_diagnostics import (
     AudioBounds,
     DiagnosticIssue,
     MP3DiagnosticsEngine,
+    OUTPUT_FOLDER_INTEGRITY_WINLIVE,
     OUTPUT_FOLDER_INTEGRITY_ROOT,
+    OUTPUT_FOLDER_PROCESSED_ORIGINALS,
+    OUTPUT_FOLDER_TEMP,
+    OUTPUT_FOLDER_WINLIVE,
+    PRECISION_UNKNOWN,
     STATUS_PERFECT,
+    EvaluatedIssue,
+    IssuePosition,
+    WinLiveDecodeAssessment,
 )
 from winlive_classification import WinLiveOutcome
 from winlive_safe_write import WinLiveWriteErrorCode, WinLiveWriteValidationResult
@@ -143,6 +151,30 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
     def _first_result(self, result: dict[str, object]):
         return result["diagnostic_results"][0]
 
+    @staticmethod
+    def _assessment(
+        *,
+        path: str,
+        rule: str,
+        positive: bool,
+        is_decodable: bool = True,
+        rc: int = 0,
+        stderr: str = "",
+        duration: float = 30.0,
+        timestamps: list[str] | None = None,
+    ) -> WinLiveDecodeAssessment:
+        return WinLiveDecodeAssessment(
+            candidate_path=path,
+            command_text=f"ffmpeg -v error -i {path} -f null -",
+            return_code=rc,
+            decode_log_excerpt=stderr,
+            duration_seconds=duration,
+            error_timestamps=list(timestamps or []),
+            decision_rule=rule,
+            has_positive_corruption=positive,
+            is_decodable=is_decodable,
+        )
+
     def test_verify_winlive_false_skips_engine_and_keeps_mp3_result(self) -> None:
         self._write_input("song.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
         engine = _WinLiveScenarioEngine()
@@ -262,6 +294,295 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         self.assertEqual(row.winlive.errore_winlive_code, WinLiveWriteErrorCode.METADATA_MISMATCH.value)
         self.assertEqual(row.winlive.esito_cartella_winlive, "Non integro dopo modifica")
 
+    def test_corrupt_normalizable_wins_only_mp3_corrupted_folder(self) -> None:
+        self._write_input("corrupt_normalizable.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        def fake_assess(path: Path) -> WinLiveDecodeAssessment:
+            return self._assessment(
+                path=str(path),
+                rule="A_REAL_ERROR_IN_SIGNIFICANT_AUDIO",
+                positive=True,
+                is_decodable=False,
+                rc=1,
+                stderr="error while decoding",
+                timestamps=["00:00:02.000"],
+            )
+
+        with mock.patch.object(engine, "_assess_minimal_decode_for_winlive", side_effect=fake_assess):
+            row = self._first_result(self._run(engine, verify_winlive=True, repair_mode=True, verify_mp3_integrity=False))
+
+        self.assertEqual(row.winlive.esito_cartella_winlive, "MP3 corrotti")
+        self.assertEqual(Path(row.winlive.esito_percorso_winlive).name, "corrupt_normalizable.mp3")
+
+    def test_corrupt_unrecognized_wins_only_mp3_corrupted_folder(self) -> None:
+        self._write_input("corrupt_unrecognized.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C?|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        def fake_assess(path: Path) -> WinLiveDecodeAssessment:
+            return self._assessment(
+                path=str(path),
+                rule="B_DIFFUSE_OR_REPEATED_STREAM_ERRORS",
+                positive=True,
+                is_decodable=False,
+                rc=1,
+                stderr="multiple decode errors",
+                timestamps=["00:00:03.000", "00:00:04.000"],
+            )
+
+        with mock.patch.object(engine, "_assess_minimal_decode_for_winlive", side_effect=fake_assess):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False))
+
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.UNRECOGNIZED_CHORDS)
+        self.assertEqual(row.winlive.esito_cartella_winlive, "MP3 corrotti")
+
+    def test_winlive_only_valid_tags_and_trailing_or_terminal_warnings_do_not_route_corrupted(self) -> None:
+        self._write_input("valid_synct.mp3", _mp3_blob(b"|100|CIAO|200|", None))
+        self._write_input("valid_chord.mp3", _mp3_blob(None, b"|100|C|200|"))
+        self._write_input("valid_both.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        self._write_input("valid_trailing.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|", trailing=b"<WL5TAIL>"))
+        self._write_input("valid_tail_warning.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        def fake_assess(path: Path) -> WinLiveDecodeAssessment:
+            name = path.name
+            if name == "valid_trailing.mp3":
+                return self._assessment(
+                    path=str(path),
+                    rule="D_TRAILING_DATA_OR_WINLIVE_TAG_AFTER_AUDIO",
+                    positive=False,
+                    is_decodable=True,
+                    rc=1,
+                    stderr="trailing data after audio stream",
+                )
+            if name == "valid_tail_warning.mp3":
+                return self._assessment(
+                    path=str(path),
+                    rule="C_TERMINAL_OR_NON_BLOCKING_WARNING",
+                    positive=False,
+                    is_decodable=True,
+                    rc=1,
+                    stderr="non monotonic dts warning",
+                )
+            return self._assessment(
+                path=str(path),
+                rule="PASS_NO_POSITIVE_CORRUPTION_EVIDENCE",
+                positive=False,
+                is_decodable=True,
+                rc=0,
+            )
+
+        with mock.patch.object(engine, "_assess_minimal_decode_for_winlive", side_effect=fake_assess):
+            result = self._run(engine, verify_winlive=True, verify_mp3_integrity=False)
+
+        by_name = {row.file_name: row for row in result["diagnostic_results"]}
+        self.assertEqual(by_name["valid_synct.mp3"].winlive.esito_cartella_winlive, "Senza TAG Accordi")
+        self.assertEqual(by_name["valid_chord.mp3"].winlive.esito_cartella_winlive, "Senza TAG di Testo")
+        self.assertEqual(by_name["valid_both.mp3"].winlive.esito_cartella_winlive, "Conformi")
+        self.assertNotEqual(by_name["valid_trailing.mp3"].winlive.esito_cartella_winlive, "MP3 corrotti")
+        self.assertNotEqual(by_name["valid_tail_warning.mp3"].winlive.esito_cartella_winlive, "MP3 corrotti")
+
+    def test_winlive_only_real_significant_corruption_is_routed_to_mp3_corrotti(self) -> None:
+        self._write_input("real_corrupt.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        with mock.patch.object(
+            engine,
+            "_assess_minimal_decode_for_winlive",
+            return_value=self._assessment(
+                path="real_corrupt.mp3",
+                rule="A_REAL_ERROR_IN_SIGNIFICANT_AUDIO",
+                positive=True,
+                is_decodable=False,
+                rc=1,
+                stderr="error while decoding frame",
+                timestamps=["00:00:01.120"],
+            ),
+        ):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False))
+
+        self.assertEqual(row.winlive.esito_cartella_winlive, "MP3 corrotti")
+        self.assertIn("A_REAL_ERROR_IN_SIGNIFICANT_AUDIO", row.winlive.esito_operazione_winlive + " " + row.output_routing_reason)
+
+    def test_winlive_only_without_tags_keeps_winlive_category(self) -> None:
+        self._write_input("no_tags.mp3", _mp3_blob(None, None))
+        engine = _WinLiveScenarioEngine()
+
+        with mock.patch.object(
+            engine,
+            "_assess_minimal_decode_for_winlive",
+            return_value=self._assessment(
+                path="no_tags.mp3",
+                rule="PASS_NO_POSITIVE_CORRUPTION_EVIDENCE",
+                positive=False,
+                is_decodable=True,
+                rc=0,
+            ),
+        ):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False))
+
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Senza TAG di Testo e di Accordi")
+
+    def test_normalized_temp_candidate_keeps_original_filename_and_no_temp_names_escape(self) -> None:
+        self._write_input("temp_name.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        def fake_write_normalized_winlive_copy(**kwargs):
+            temp_dir = Path(str(kwargs["temp_dir"]))
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_path = temp_dir / "temp_name_stream.mp3"
+            temp_path.write_bytes(_mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+            return WinLiveWriteValidationResult(
+                write_succeeded=True,
+                readback_succeeded=True,
+                winlive_structure_valid=True,
+                text_matches_expected=True,
+                chords_match_expected=True,
+                normalization_idempotent=True,
+                original_audio_hash="hash-a",
+                copy_audio_hash="hash-a",
+                audio_identical=True,
+                metadata_preserved=True,
+                prefix_preserved=True,
+                postfix_preserved=True,
+                error_code=None,
+                error="",
+                notes=["forced temp candidate"],
+                temporary_path=str(temp_path),
+                suggested_outcome=WinLiveOutcome.FILE_NORMALIZED,
+                encoding_detected="utf-8",
+                encoding_used="utf-8",
+                encoding_converted=False,
+                encoding_lossless=True,
+                rewrite_metrics={},
+                phase_times_ms={},
+                diagnostic_counters={},
+            )
+
+        with mock.patch("mp3_diagnostics.write_normalized_winlive_copy", side_effect=fake_write_normalized_winlive_copy):
+            row = self._first_result(self._run(engine, verify_winlive=True, repair_mode=True, verify_mp3_integrity=False))
+
+        session_output = Path(row.winlive.esito_percorso_winlive).parents[2]
+        winlive_root = session_output / OUTPUT_FOLDER_WINLIVE
+        self.assertEqual(Path(row.winlive.esito_percorso_winlive).name, "temp_name.mp3")
+        self.assertEqual(len(list(winlive_root.rglob("temp_name.mp3"))), 1)
+        self.assertEqual(len(list(winlive_root.rglob("*_stream.mp3"))), 0)
+        self.assertEqual(len(list(self.input_dir.rglob("*_stream.mp3"))), 0)
+
+    def test_winlive_only_outputs_one_file_per_input(self) -> None:
+        self._write_input("one_a.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        self._write_input("one_b.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=True, repair_mode=True, verify_mp3_integrity=False)
+
+        winlive_root = Path(result["summary"]["output_folder"]) / OUTPUT_FOLDER_WINLIVE
+        self.assertEqual(len(list(winlive_root.rglob("one_a.mp3"))), 1)
+        self.assertEqual(len(list(winlive_root.rglob("one_b.mp3"))), 1)
+
+    def test_infrastructure_failure_routes_to_read_write_errors(self) -> None:
+        self._write_input("infra_fail.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+        failed_write = WinLiveWriteValidationResult(
+            write_succeeded=False,
+            readback_succeeded=False,
+            winlive_structure_valid=True,
+            text_matches_expected=False,
+            chords_match_expected=False,
+            normalization_idempotent=False,
+            original_audio_hash=None,
+            copy_audio_hash=None,
+            audio_identical=False,
+            metadata_preserved=False,
+            prefix_preserved=False,
+            postfix_preserved=False,
+            error_code=WinLiveWriteErrorCode.WRITE_FAILED,
+            error="forced infrastructure failure",
+            notes=["forced infrastructure failure"],
+            temporary_path=None,
+            suggested_outcome=WinLiveOutcome.MODIFICATION_NOT_INTEGRAL,
+            encoding_detected="utf-8",
+            encoding_used="utf-8",
+            encoding_converted=False,
+            encoding_lossless=True,
+            rewrite_metrics={},
+            phase_times_ms={},
+            diagnostic_counters={},
+        )
+
+        with mock.patch("mp3_diagnostics.write_normalized_winlive_copy", return_value=failed_write):
+            row = self._first_result(self._run(engine, verify_winlive=True, repair_mode=True))
+
+        self.assertEqual(row.winlive.certificazione_finale_mp3, "Errore infrastrutturale")
+        self.assertEqual(row.winlive.esito_cartella_winlive, "Errori lettura-scrittura")
+
+    def test_unknown_timestamp_issue_is_not_definitively_nonrecoverable(self) -> None:
+        self._write_input("unknown_issue.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+        unknown_issue = DiagnosticIssue(
+            problem_key="undecodable_frames",
+            problem_type="Frame MP3 non decodificabile",
+            start="Tempo non determinabile",
+            end="",
+            precision=PRECISION_UNKNOWN,
+            detail="Header missing / Invalid data found when processing input",
+        )
+        analysis = AnalysisResult(
+            command=["ffmpeg", "-i", "unknown_issue.mp3"],
+            command_text="ffmpeg -i unknown_issue.mp3",
+            return_code=0,
+            decode_log="Header missing\nInvalid data found when processing input",
+            issues=[unknown_issue],
+            metrics={
+                "header_missing": 1,
+                "corrupted_frames": 0,
+                "crc_errors": 0,
+                "sync_errors": 0,
+                "undecodable_frames": 0,
+                "invalid_data": 1,
+                "xing_issues": 0,
+                "vbr_issues": 0,
+                "id3_issues": 0,
+            },
+            integrity_index=0,
+            total_errors=2,
+        )
+        evaluated = [
+            EvaluatedIssue(
+                issue=unknown_issue,
+                position=IssuePosition.UNKNOWN,
+                ignored_for_classification=False,
+                exclusion_reason="",
+                zone_label="Zona non determinabile",
+                rms_dbfs=-80.0,
+                peak_dbfs=-70.0,
+                impact_label="Nessun impatto verificabile",
+                segment_start_ms=None,
+                segment_end_ms=None,
+            )
+        ]
+
+        with mock.patch.object(engine, "_analyze_mp3", return_value=analysis):
+            with mock.patch.object(engine, "_evaluate_issues", return_value=evaluated):
+                with mock.patch.object(engine, "_analyze_significant_segment", return_value={
+                    "header_missing": 0,
+                    "corrupted_frames": 0,
+                    "crc_errors": 0,
+                    "sync_errors": 0,
+                    "undecodable_frames": 0,
+                    "invalid_data": 0,
+                    "xing_issues": 0,
+                    "vbr_issues": 0,
+                    "id3_issues": 0,
+                }):
+                    cert = engine._certify_mp3_candidate(
+                        file_path=self.input_dir / "unknown_issue.mp3",
+                        repair_mode=True,
+                        cancel_event=None,
+                    )
+
+        self.assertEqual(cert["final_outcome"], "Classificazione non determinabile")
+        self.assertIn("Warning FFmpeg rilevati", cert["classification_reason"])
+        self.assertEqual(cert["certificazione_finale_mp3"], "Non certificato")
+
     def test_winlive_exception_does_not_interrupt_mp3_diagnostics(self) -> None:
         self._write_input("boom.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
         engine = _WinLiveScenarioEngine()
@@ -284,23 +605,109 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         self.assertEqual(row.repair_outcome, STATUS_PERFECT)
         self.assertFalse(row.winlive.verifica_winlive_eseguita)
 
+    def test_unified_certification_called_once_on_original_when_not_normalized(self) -> None:
+        self._write_input("single_cert_original.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        with mock.patch.object(engine, "_certify_mp3_candidate", wraps=engine._certify_mp3_candidate) as cert_spy:
+            result = self._run(engine, verify_winlive=True, repair_mode=False)
+
+        self.assertEqual(cert_spy.call_count, 1)
+        called_path = cert_spy.call_args.kwargs["file_path"]
+        called_temp_dir = cert_spy.call_args.kwargs.get("temp_dir")
+        self.assertEqual(Path(called_path).name, "single_cert_original.mp3")
+        self.assertIsNotNone(called_temp_dir)
+        self.assertIn(OUTPUT_FOLDER_TEMP, str(called_temp_dir))
+        self.assertEqual(Path(called_temp_dir).parent, Path(result["summary"]["output_folder"]))
+
+    def test_unified_certification_called_once_on_normalized_when_validated(self) -> None:
+        self._write_input("single_cert_normalized.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        with mock.patch.object(engine, "_certify_mp3_candidate", wraps=engine._certify_mp3_candidate) as cert_spy:
+            result = self._run(engine, verify_winlive=True, repair_mode=True)
+
+        self.assertEqual(cert_spy.call_count, 1)
+        called_path = Path(cert_spy.call_args.kwargs["file_path"])
+        called_temp_dir = cert_spy.call_args.kwargs.get("temp_dir")
+        self.assertNotEqual(called_path.name, "single_cert_normalized.mp3")
+        self.assertEqual(called_path.suffix.lower(), ".tmp")
+        self.assertIsNotNone(called_temp_dir)
+        self.assertIn(OUTPUT_FOLDER_TEMP, str(called_temp_dir))
+        self.assertEqual(Path(called_temp_dir).parent, Path(result["summary"]["output_folder"]))
+
     def test_verify_mp3_integrity_false_runs_winlive_only(self) -> None:
         self._write_input("wl_only.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
         engine = _WinLiveScenarioEngine()
-        with mock.patch.object(engine, "_analyze_mp3", side_effect=AssertionError("_analyze_mp3 should not run")):
-            with mock.patch.object(engine, "_safe_duration_seconds", side_effect=AssertionError("_safe_duration_seconds should not run")):
-                with mock.patch.object(
-                    engine,
-                    "_place_file_for_category",
-                    side_effect=AssertionError("_place_file_for_category should not run"),
-                ):
-                    result = self._run(engine, verify_winlive=True, verify_mp3_integrity=False)
+        with mock.patch.object(engine, "_certify_mp3_candidate", side_effect=AssertionError("_certify_mp3_candidate should not run")):
+            result = self._run(engine, verify_winlive=True, verify_mp3_integrity=False)
         row = self._first_result(result)
         self.assertTrue(row.winlive.verifica_winlive_eseguita)
         self.assertEqual(row.repair_outcome, "")
 
         session_output = Path(result["summary"]["output_folder"])
         self.assertFalse((session_output / OUTPUT_FOLDER_INTEGRITY_ROOT).exists())
+
+    def test_output_mode_integrity_only_creates_single_main_folder(self) -> None:
+        self._write_input("integrity_only.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=False, verify_mp3_integrity=True)
+
+        session_output = Path(result["summary"]["output_folder"])
+        self.assertTrue((session_output / OUTPUT_FOLDER_INTEGRITY_ROOT).exists())
+        self.assertFalse((session_output / OUTPUT_FOLDER_WINLIVE).exists())
+        self.assertFalse((session_output / OUTPUT_FOLDER_INTEGRITY_WINLIVE).exists())
+
+        all_hits = list((session_output / OUTPUT_FOLDER_INTEGRITY_ROOT).rglob("integrity_only.mp3"))
+        self.assertEqual(len(all_hits), 1)
+
+    def test_output_mode_winlive_only_creates_single_main_folder(self) -> None:
+        self._write_input("winlive_only_mode.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=True, verify_mp3_integrity=False)
+
+        session_output = Path(result["summary"]["output_folder"])
+        self.assertFalse((session_output / OUTPUT_FOLDER_INTEGRITY_ROOT).exists())
+        self.assertTrue((session_output / OUTPUT_FOLDER_WINLIVE).exists())
+        self.assertFalse((session_output / OUTPUT_FOLDER_INTEGRITY_WINLIVE).exists())
+
+        all_hits = list((session_output / OUTPUT_FOLDER_WINLIVE).rglob("winlive_only_mode.mp3"))
+        self.assertEqual(len(all_hits), 1)
+
+    def test_empty_winlive_output_directories_are_removed_after_run(self) -> None:
+        self._write_input("cleanup_dirs.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=True, verify_mp3_integrity=False)
+
+        session_output = Path(result["summary"]["output_folder"])
+        winlive_root = session_output / OUTPUT_FOLDER_WINLIVE
+        self.assertTrue((winlive_root / "Conformi").exists())
+        self.assertFalse((winlive_root / "Normalizzati").exists())
+        self.assertFalse((winlive_root / "MP3 corrotti").exists())
+        self.assertFalse((winlive_root / "Errori struttura").exists())
+
+    def test_empty_originals_folder_is_removed_when_unused(self) -> None:
+        self._write_input("integrity_ok.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=False, verify_mp3_integrity=True)
+
+        session_output = Path(result["summary"]["output_folder"])
+        self.assertFalse((session_output / OUTPUT_FOLDER_PROCESSED_ORIGINALS).exists())
+
+    def test_output_mode_combined_creates_single_main_folder_and_single_copy(self) -> None:
+        self._write_input("combo_a.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        self._write_input("combo_b.mp3", _mp3_blob(None, b"|100|C|200|"))
+        result = self._run(_WinLiveScenarioEngine(), verify_winlive=True, verify_mp3_integrity=True, repair_mode=True)
+
+        session_output = Path(result["summary"]["output_folder"])
+        self.assertFalse((session_output / OUTPUT_FOLDER_INTEGRITY_ROOT).exists())
+        self.assertFalse((session_output / OUTPUT_FOLDER_WINLIVE).exists())
+        combined_root = session_output / OUTPUT_FOLDER_INTEGRITY_WINLIVE
+        self.assertTrue(combined_root.exists())
+
+        for row in result["diagnostic_results"]:
+            self.assertEqual(row.placed_file_path, row.winlive.esito_percorso_winlive)
+
+        hits_a = list(combined_root.rglob("combo_a.mp3"))
+        hits_b = list(combined_root.rglob("combo_b.mp3"))
+        self.assertEqual(len(hits_a), 1)
+        self.assertEqual(len(hits_b), 1)
 
     def test_both_flags_false_are_rejected(self) -> None:
         self._write_input("invalid.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))

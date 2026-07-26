@@ -7,9 +7,14 @@ __pycache__/
 build/
 dist/
 
+temp_*
 temp_*/
+tmp_*
 e2e_*/
 real_regression_compare/
+output/
+test_samples/
+phase4d2_perf_after.json
 
 .vscode/
 
