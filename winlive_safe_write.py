@@ -16,6 +16,7 @@ from winlive_classification import (
     classify_winlive,
 )
 from winlive_normalizer import normalize_synct_content
+from winlive_normalizer import build_logical_line_diffs
 from winlive_tags import (
     TAG_CHORD_CLOSE,
     TAG_CHORD_OPEN,
@@ -43,6 +44,7 @@ class WinLiveWriteErrorCode(str, Enum):
     TEXT_MISMATCH = "TEXT_MISMATCH"
     CHORD_MISMATCH = "CHORD_MISMATCH"
     NON_IDEMPOTENT_NORMALIZATION = "NON_IDEMPOTENT_NORMALIZATION"
+    CANONICALIZATION_NOT_STABLE = "CANONICALIZATION_NOT_STABLE"
     AUDIO_MISMATCH = "AUDIO_MISMATCH"
     METADATA_MISMATCH = "METADATA_MISMATCH"
 
@@ -86,6 +88,13 @@ class WinLiveWriteValidationResult:
     encoding_converted: bool
     encoding_lossless: bool
     rewrite_metrics: dict[str, object]
+    canonicalization_iterations: int
+    canonicalization_stabilized: bool
+    canonicalization_cycle_detected: bool
+    canonicalization_cycle_at_iteration: int
+    canonicalization_state_hashes: list[str]
+    canonicalization_change_log: list[dict[str, object]]
+    first_residual_diff: dict[str, object]
     phase_times_ms: dict[str, float]
     diagnostic_counters: dict[str, int]
 
@@ -279,6 +288,26 @@ def write_normalized_winlive_copy(
 
     normalized = normalize_synct_content(synct_decoded.text)
     counters["normalize"] += 1
+    canonicalization_change_log = _canonicalization_change_log(normalized)
+    first_residual_diff: dict[str, object] = {}
+    if not normalized.canonicalization_stabilized or not normalized.temporal_normalization_succeeded:
+        return _result_error(
+            code=WinLiveWriteErrorCode.CANONICALIZATION_NOT_STABLE,
+            message="Canonicalizzazione WinLive non stabile entro il limite interno.",
+            notes=notes + normalized.notes,
+            temporary_path=None,
+            encoding_report=synct_decoded.report,
+            phase_times_ms=phase_times_ms,
+            diagnostic_counters=counters,
+            canonicalization_iterations=normalized.canonicalization_iterations,
+            canonicalization_stabilized=normalized.canonicalization_stabilized,
+            canonicalization_cycle_detected=normalized.canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=normalized.canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=list(normalized.canonicalization_state_hashes),
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
+        )
+
     if not normalized.text_semantically_valid:
         return _result_error(
             code=WinLiveWriteErrorCode.NORMALIZATION_INVALID,
@@ -288,11 +317,21 @@ def write_normalized_winlive_copy(
             encoding_report=synct_decoded.report,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
+            canonicalization_iterations=normalized.canonicalization_iterations,
+            canonicalization_stabilized=normalized.canonicalization_stabilized,
+            canonicalization_cycle_detected=normalized.canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=normalized.canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=list(normalized.canonicalization_state_hashes),
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
         )
 
     second_pass = normalize_synct_content(normalized.normalized_text)
     counters["idempotence_normalize"] += 1
     if second_pass.normalized_text != normalized.normalized_text or not second_pass.text_semantically_valid:
+        residual_diffs = build_logical_line_diffs(normalized.normalized_text, second_pass.normalized_text, max_items=1)
+        if residual_diffs:
+            first_residual_diff = residual_diffs[0]
         return _result_error(
             code=WinLiveWriteErrorCode.NON_IDEMPOTENT_NORMALIZATION,
             message="Normalizzazione non idempotente.",
@@ -301,6 +340,13 @@ def write_normalized_winlive_copy(
             encoding_report=synct_decoded.report,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
+            canonicalization_iterations=normalized.canonicalization_iterations,
+            canonicalization_stabilized=normalized.canonicalization_stabilized,
+            canonicalization_cycle_detected=normalized.canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=normalized.canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=list(normalized.canonicalization_state_hashes),
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
         )
 
     if synct_decoded.report.used_encoding is None:
@@ -385,6 +431,13 @@ def write_normalized_winlive_copy(
         temporary_path=temp_path,
         text_was_modified=normalized.changed,
         rewrite_metrics=rewrite_metrics,
+        canonicalization_iterations=normalized.canonicalization_iterations,
+        canonicalization_stabilized=normalized.canonicalization_stabilized,
+        canonicalization_cycle_detected=normalized.canonicalization_cycle_detected,
+        canonicalization_cycle_at_iteration=normalized.canonicalization_cycle_at_iteration,
+        canonicalization_state_hashes=list(normalized.canonicalization_state_hashes),
+        canonicalization_change_log=canonicalization_change_log,
+        first_residual_diff=first_residual_diff,
         phase_times_ms=phase_times_ms,
         counters=counters,
     )
@@ -455,6 +508,13 @@ def _validate_written_copy(
     temporary_path: str,
     text_was_modified: bool,
     rewrite_metrics: dict[str, object],
+    canonicalization_iterations: int,
+    canonicalization_stabilized: bool,
+    canonicalization_cycle_detected: bool,
+    canonicalization_cycle_at_iteration: int,
+    canonicalization_state_hashes: list[str],
+    canonicalization_change_log: list[dict[str, object]],
+    first_residual_diff: dict[str, object],
     phase_times_ms: dict[str, float],
     counters: dict[str, int],
 ) -> WinLiveWriteValidationResult:
@@ -486,6 +546,13 @@ def _validate_written_copy(
             readback_succeeded=True,
             winlive_structure_valid=False,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -520,6 +587,13 @@ def _validate_written_copy(
             readback_succeeded=True,
             winlive_structure_valid=False,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -539,6 +613,13 @@ def _validate_written_copy(
             readback_succeeded=True,
             winlive_structure_valid=True,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -555,6 +636,13 @@ def _validate_written_copy(
             readback_succeeded=True,
             winlive_structure_valid=True,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -571,6 +659,13 @@ def _validate_written_copy(
             readback_succeeded=True,
             winlive_structure_valid=True,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -588,6 +683,13 @@ def _validate_written_copy(
             winlive_structure_valid=True,
             text_matches_expected=False,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -607,6 +709,13 @@ def _validate_written_copy(
             text_matches_expected=True,
             chords_match_expected=False,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -630,6 +739,13 @@ def _validate_written_copy(
             chords_match_expected=True,
             normalization_idempotent=False,
             rewrite_metrics=rewrite_metrics,
+            canonicalization_iterations=canonicalization_iterations,
+            canonicalization_stabilized=canonicalization_stabilized,
+            canonicalization_cycle_detected=canonicalization_cycle_detected,
+            canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+            canonicalization_state_hashes=canonicalization_state_hashes,
+            canonicalization_change_log=canonicalization_change_log,
+            first_residual_diff=first_residual_diff,
             phase_times_ms=phase_times_ms,
             diagnostic_counters=counters,
         )
@@ -704,6 +820,13 @@ def _validate_written_copy(
         encoding_converted=original_encoding.converted,
         encoding_lossless=original_encoding.lossless,
         rewrite_metrics=rewrite_metrics,
+        canonicalization_iterations=canonicalization_iterations,
+        canonicalization_stabilized=canonicalization_stabilized,
+        canonicalization_cycle_detected=canonicalization_cycle_detected,
+        canonicalization_cycle_at_iteration=canonicalization_cycle_at_iteration,
+        canonicalization_state_hashes=canonicalization_state_hashes,
+        canonicalization_change_log=canonicalization_change_log,
+        first_residual_diff=first_residual_diff,
         phase_times_ms=phase_times_ms,
         diagnostic_counters=counters,
     )
@@ -801,6 +924,13 @@ def _result_error(
     chords_match_expected: bool = False,
     normalization_idempotent: bool = False,
     rewrite_metrics: dict[str, object] | None = None,
+    canonicalization_iterations: int = 0,
+    canonicalization_stabilized: bool = False,
+    canonicalization_cycle_detected: bool = False,
+    canonicalization_cycle_at_iteration: int = 0,
+    canonicalization_state_hashes: list[str] | None = None,
+    canonicalization_change_log: list[dict[str, object]] | None = None,
+    first_residual_diff: dict[str, object] | None = None,
     phase_times_ms: dict[str, float] | None = None,
     diagnostic_counters: dict[str, int] | None = None,
 ) -> WinLiveWriteValidationResult:
@@ -837,9 +967,38 @@ def _result_error(
         encoding_converted=converted,
         encoding_lossless=lossless,
         rewrite_metrics=dict(rewrite_metrics or {}),
+        canonicalization_iterations=int(canonicalization_iterations),
+        canonicalization_stabilized=bool(canonicalization_stabilized),
+        canonicalization_cycle_detected=bool(canonicalization_cycle_detected),
+        canonicalization_cycle_at_iteration=int(canonicalization_cycle_at_iteration),
+        canonicalization_state_hashes=list(canonicalization_state_hashes or []),
+        canonicalization_change_log=list(canonicalization_change_log or []),
+        first_residual_diff=dict(first_residual_diff or {}),
         phase_times_ms=dict(phase_times_ms or {}),
         diagnostic_counters=dict(diagnostic_counters or {}),
     )
+
+
+def _canonicalization_change_log(normalized: object) -> list[dict[str, object]]:
+    summaries = list(getattr(normalized, "canonicalization_pass_summaries", []) or [])
+    out: list[dict[str, object]] = []
+    for entry in summaries:
+        counters = entry.get("counters")
+        out.append(
+            {
+                "iteration": int(entry.get("iteration", 0)),
+                "changed": bool(entry.get("changed", False)),
+                "phase": str(entry.get("phase", "")),
+                "modification_count": int(entry.get("modification_count", 0)),
+                "input_hash": str(entry.get("input_hash", "")),
+                "output_hash": str(entry.get("output_hash", "")),
+                "adjacent_time_tags_removed": int(getattr(counters, "adjacent_time_tags_removed", 0)),
+                "empty_timed_lines_removed": int(getattr(counters, "empty_timed_lines_removed", 0)),
+                "previous_row_end_adjustments": int(getattr(counters, "previous_row_end_adjustments", 0)),
+                "current_row_start_adjustments": int(getattr(counters, "current_row_start_adjustments", 0)),
+            }
+        )
+    return out
 
 
 def _build_rewrite_metrics(

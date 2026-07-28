@@ -420,6 +420,9 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertEqual(problems[0]["Motivo / dettaglio essenziale"], "tail-hm")
         self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertEqual(problems[0]["Within non-blocking tail"], "SI")
+        self.assertEqual(problems[0]["Blocking"], "NO")
+        self.assertEqual(problems[0]["Classification"], "Avvertimento di coda")
         self.assertIn("coda finale", problems[0]["Motivo esclusione"].lower())
 
     def test_terminal_low_impact_invalid_data_is_ignored_for_classification(self) -> None:
@@ -458,6 +461,7 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertEqual(problems[0]["Motivo / dettaglio essenziale"], "tail-id")
         self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertEqual(problems[0]["Within non-blocking tail"], "SI")
 
     def test_two_terminal_low_impact_warnings_are_both_ignored(self) -> None:
         bounds = AudioBounds(
@@ -498,7 +502,7 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertIn("tail-i", details)
         self.assertTrue(all(p["Problema ignorato ai fini dello stato"] == "SI" for p in problems))
 
-    def test_terminal_issue_high_level_is_not_tolerated(self) -> None:
+    def test_terminal_issue_high_level_is_still_non_blocking_in_last_second(self) -> None:
         bounds = AudioBounds(
             file_duration_ms=180_000,
             significant_start_ms=0,
@@ -530,8 +534,9 @@ class MP3DiagnosticsTests(unittest.TestCase):
 
         row = self._summary_rows(result)[0]
         problems = self._problem_rows(result)
-        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
-        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertEqual(problems[0]["Within non-blocking tail"], "SI")
 
     def test_issue_in_song_body_is_not_tolerated(self) -> None:
         bounds = AudioBounds(
@@ -568,7 +573,7 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
         self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
 
-    def test_terminal_issue_too_long_is_not_tolerated(self) -> None:
+    def test_terminal_issue_in_last_second_is_non_blocking_even_if_long(self) -> None:
         bounds = AudioBounds(
             file_duration_ms=180_000,
             significant_start_ms=0,
@@ -600,8 +605,9 @@ class MP3DiagnosticsTests(unittest.TestCase):
 
         row = self._summary_rows(result)[0]
         problems = self._problem_rows(result)
-        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
-        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertEqual(problems[0]["Within non-blocking tail"], "SI")
 
     def test_terminal_low_impact_plus_central_issue_keeps_central_blocking(self) -> None:
         bounds = AudioBounds(
@@ -644,7 +650,74 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertEqual(tail_rows[0]["Problema ignorato ai fini dello stato"], "SI")
         self.assertEqual(mid_rows[0]["Problema ignorato ai fini dello stato"], "NO")
 
-    def test_terminal_tolerance_not_applied_when_decoding_is_globally_unusable(self) -> None:
+    def test_rev_tail_1_previously_negative_tail_only_becomes_positive_with_warning(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        issue = self._localized_issue("header_missing", "00:02:59.200", "00:02:59.800", "tail-rev-only")
+        engine = _ScenarioEngine(
+            before_issues=[issue],
+            after_issues=[issue],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=bounds,
+            issue_stats={"tail-rev-only": (-12.0, -2.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+
+    def test_rev_tail_2_tail_plus_previous_anomaly_stays_negative(self) -> None:
+        bounds = AudioBounds(
+            file_duration_ms=180_000,
+            significant_start_ms=0,
+            significant_end_ms=180_000,
+            leading_silence_ms=0,
+            trailing_silence_ms=0,
+            detection_confidence=1.0,
+            threshold_rms_db=SILENCE_RMS_THRESHOLD_DB,
+            threshold_peak_db=SILENCE_PEAK_THRESHOLD_DB,
+        )
+        tail_issue = self._localized_issue("header_missing", "00:02:59.200", "00:02:59.800", "tail-rev")
+        mid_issue = self._localized_issue("sync_errors", "00:01:20.000", "00:01:20.500", "mid-rev")
+        engine = _ScenarioEngine(
+            before_issues=[tail_issue, mid_issue],
+            after_issues=[tail_issue, mid_issue],
+            repair_ok=False,
+            significant_blocking_before=True,
+            significant_blocking_after=True,
+            bounds=bounds,
+            issue_stats={"tail-rev": (-20.0, -8.0), "mid-rev": (-16.0, -7.0)},
+        )
+        with mock.patch.object(engine, "_safe_duration_seconds", return_value=180.0):
+            result = engine.run_diagnostics(
+                input_folder=str(self.input_dir),
+                include_subfolders=False,
+                output_folder=str(self.output_dir),
+                repair_mode=False,
+                placement_mode=PLACEMENT_MODE_COPY,
+            )
+
+        row = self._summary_rows(result)[0]
+        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
+
+    def test_tail_policy_applies_even_if_global_decode_context_is_weak(self) -> None:
         bounds = AudioBounds(
             file_duration_ms=180_000,
             significant_start_ms=0,
@@ -676,8 +749,9 @@ class MP3DiagnosticsTests(unittest.TestCase):
 
         row = self._summary_rows(result)[0]
         problems = self._problem_rows(result)
-        self.assertEqual(row["Stato finale file"], STATUS_UNRECOVERABLE)
-        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "NO")
+        self.assertEqual(row["Stato finale file"], STATUS_PERFECT)
+        self.assertEqual(problems[0]["Problema ignorato ai fini dello stato"], "SI")
+        self.assertEqual(problems[0]["Within non-blocking tail"], "SI")
 
     def test_boundary_overlap_not_ignored_automatically(self) -> None:
         issue = DiagnosticIssue(
@@ -907,9 +981,10 @@ class MP3DiagnosticsTests(unittest.TestCase):
 
         self.assertTrue(session_root.name.startswith(OUTPUT_SESSION_PREFIX))
         self.assertTrue((integrity_root / OUTPUT_FOLDER_OK).is_dir())
-        self.assertTrue((integrity_root / OUTPUT_FOLDER_REPAIRED).is_dir())
-        self.assertTrue((integrity_root / OUTPUT_FOLDER_UNRECOVERABLE).is_dir())
-        self.assertTrue((session_root / OUTPUT_FOLDER_PROCESSED_ORIGINALS).is_dir())
+        self.assertFalse((integrity_root / OUTPUT_FOLDER_REPAIRED).exists())
+        self.assertFalse((integrity_root / OUTPUT_FOLDER_UNRECOVERABLE).exists())
+        processed_originals_dir = session_root / OUTPUT_FOLDER_PROCESSED_ORIGINALS
+        self.assertFalse(processed_originals_dir.exists())
         self.assertTrue((session_root / OUTPUT_FOLDER_REPORT).is_dir())
         self.assertEqual(row["Categoria finale"], OUTPUT_FOLDER_OK)
 
@@ -939,6 +1014,49 @@ class MP3DiagnosticsTests(unittest.TestCase):
         self.assertEqual(Path(result["report_paths"]["xlsx"]).name, "report_diagnostica_2026-01-02_03-04-05.xlsx")
         self.assertEqual(Path(result["report_paths"]["html"]).name, "report_diagnostica.html")
         self.assertTrue(Path(row["Percorso finale"]).is_relative_to(session_root))
+
+    def test_session_summary_file_contains_configuration_header(self) -> None:
+        engine = _ScenarioEngine(
+            before_issues=[],
+            after_issues=[],
+            repair_ok=False,
+            significant_blocking_before=False,
+            significant_blocking_after=False,
+            bounds=self.default_bounds,
+            issue_stats={},
+        )
+        result = engine.run_diagnostics(
+            input_folder=str(self.input_dir),
+            include_subfolders=False,
+            output_folder=str(self.output_dir),
+            repair_mode=False,
+            placement_mode=PLACEMENT_MODE_COPY,
+            verify_mp3_integrity=True,
+            verify_winlive=False,
+            session_snapshot={
+                "processing_type": "Diagnostica MP3",
+                "include_subfolders": False,
+                "verify_mp3_integrity": True,
+                "verify_winlive": False,
+                "placement_mode": "copy",
+                "placement_mode_label": "Copia",
+                "input_folder": str(self.input_dir),
+                "output_folder": str(self.output_dir),
+            },
+        )
+        summary_path = self._session_root(result) / "Riepilogo sessione.txt"
+        self.assertTrue(summary_path.is_file())
+        content = summary_path.read_text(encoding="utf-8")
+        self.assertIn("CONFIGURAZIONE DELLA SESSIONE", content)
+        self.assertIn("Tipo di elaborazione:", content)
+        self.assertIn("Diagnostica MP3", content)
+        self.assertIn("Ricerca nelle sottocartelle: NO", content)
+        self.assertIn("Verifica integrità MP3: SI", content)
+        self.assertIn("Verifica TAG WinLive: NO", content)
+        self.assertIn("Percorso file da diagnosticare:", content)
+        self.assertIn("Percorso file diagnosticati:", content)
+        self.assertIn("Percorso completo esito della sessione:", content)
+        self.assertIn("RIEPILOGO RISULTATI", content)
 
     def test_final_counts_three_categories_are_consistent(self) -> None:
         issue = self._issue("undecodable_frames", "00:00:15.000", "center")
@@ -1132,8 +1250,7 @@ class MP3DiagnosticsTests(unittest.TestCase):
         session_root = self._session_root(result)
         safety_dir = session_root / OUTPUT_FOLDER_PROCESSED_ORIGINALS
 
-        self.assertTrue(safety_dir.is_dir())
-        self.assertEqual(list(safety_dir.rglob("*.mp3")), [])
+        self.assertFalse(safety_dir.exists())
 
     def test_safety_backup_handles_duplicate_names_without_overwrite(self) -> None:
         first = self.input_dir / "disc_a" / "song.mp3"

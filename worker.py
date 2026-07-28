@@ -21,6 +21,8 @@ from audio_engine import (
     AudioEngineError
 )
 from clip_info import ClipInfo
+from mp3_recovery import RecoveryMode
+from mp3_recovery_batch import MP3RecoveryBatchResult, recover_mp3_batch_from_folders
 from mp3_diagnostics import (
     MP3DiagnosticsCancelled,
     MP3DiagnosticsEngine,
@@ -34,6 +36,8 @@ ErrorCallback = Callable[[str], None]
 CancelledCallback = Callable[[str], None]
 ExtractCompletedCallback = Callable[[dict[str, Any]], None]
 DiagnosticsCompletedCallback = Callable[[dict[str, Any]], None]
+RecoveryCompletedCallback = Callable[[MP3RecoveryBatchResult], None]
+RecoveryLogCallback = Callable[[str], None]
 
 
 class DiagnosticsRunResult(TypedDict, total=False):
@@ -62,6 +66,8 @@ class MixWorker:
 
     @property
     def is_running(self) -> bool:
+        if self._running and self._thread is not None and not self._thread.is_alive():
+            self._running = False
         return self._running
 
     def start(
@@ -278,6 +284,111 @@ class SongExtractionWorker:
             self.on_cancelled(message)
 
 
+class MP3RecoveryWorker:
+    def __init__(
+        self,
+        on_progress: Optional[ProgressCallback] = None,
+        on_completed: Optional[RecoveryCompletedCallback] = None,
+        on_error: Optional[ErrorCallback] = None,
+        on_cancelled: Optional[CancelledCallback] = None,
+        on_log: Optional[RecoveryLogCallback] = None,
+    ) -> None:
+        self.on_progress = on_progress
+        self.on_completed = on_completed
+        self.on_error = on_error
+        self.on_cancelled = on_cancelled
+        self.on_log = on_log
+
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._cancel_event = threading.Event()
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(
+        self,
+        *,
+        problematic_dir: str,
+        originals_dir: str,
+        destination_dir: str,
+        recovery_mode: RecoveryMode | str = RecoveryMode.NORMAL,
+        session_snapshot: dict[str, Any] | None = None,
+    ) -> None:
+        if self._running:
+            raise RuntimeError("È già in corso un recupero MP3.")
+
+        self._cancel_event.clear()
+        self._running = True
+
+        self._thread = threading.Thread(
+            target=self._run,
+            kwargs={
+                "problematic_dir": problematic_dir,
+                "originals_dir": originals_dir,
+                "destination_dir": destination_dir,
+                "recovery_mode": recovery_mode,
+                "session_snapshot": session_snapshot,
+            },
+            daemon=True,
+        )
+        self._thread.start()
+
+    def cancel(self) -> None:
+        if not self._running:
+            return
+        self._cancel_event.set()
+
+    def _run(self, **kwargs: Any) -> None:
+        try:
+            self._emit_log("[TECH] Worker recovery avviato")
+            self._emit_progress(0, 1, "Inizio recupero MP3...")
+            result = recover_mp3_batch_from_folders(
+                cancel_event=self._cancel_event,
+                log_callback=self._emit_log,
+                progress_callback=self._emit_progress,
+                **kwargs,
+            )
+        except RuntimeError as error:
+            self._emit_log("[TECH] Worker recovery errore runtime")
+            self._emit_error(str(error))
+        except Exception as error:
+            self._emit_log("[TECH] Worker recovery eccezione imprevista")
+            self._emit_error(f"Errore imprevisto durante il recupero MP3:\n{error}")
+        else:
+            if result.interrupted:
+                self._emit_log("[TECH] Worker recovery interrotto")
+                self._emit_completed(result)
+            else:
+                self._emit_log("[TECH] Worker recovery completato")
+                self._emit_completed(result)
+        finally:
+            self._emit_log("[TECH] Worker recovery terminato")
+            self._running = False
+            self._cancel_event.clear()
+
+    def _emit_progress(self, current: int, total: int, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(current, total, message)
+
+    def _emit_completed(self, result: MP3RecoveryBatchResult) -> None:
+        if self.on_completed is not None:
+            self.on_completed(result)
+
+    def _emit_error(self, message: str) -> None:
+        if self.on_error is not None:
+            self.on_error(message)
+
+    def _emit_cancelled(self, message: str) -> None:
+        if self.on_cancelled is not None:
+            self.on_cancelled(message)
+
+    def _emit_log(self, message: str) -> None:
+        if self.on_log is not None:
+            self.on_log(message)
+
+
 class MP3DiagnosticsWorker:
     def __init__(
         self,
@@ -311,6 +422,7 @@ class MP3DiagnosticsWorker:
         selected_input_files: Optional[list[Path]] = None,
         verify_mp3_integrity: bool = True,
         verify_winlive: bool = False,
+        session_snapshot: dict[str, Any] | None = None,
     ) -> None:
         if self._running:
             raise RuntimeError("È già in corso una diagnostica MP3.")
@@ -332,6 +444,7 @@ class MP3DiagnosticsWorker:
                 "selected_input_files": selected_input_files,
                 "verify_mp3_integrity": verify_mp3_integrity,
                 "verify_winlive": verify_winlive,
+                "session_snapshot": session_snapshot,
             },
             daemon=True,
         )

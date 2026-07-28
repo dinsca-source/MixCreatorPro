@@ -283,6 +283,13 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
             encoding_converted=False,
             encoding_lossless=True,
             rewrite_metrics={},
+            canonicalization_iterations=1,
+            canonicalization_stabilized=True,
+            canonicalization_cycle_detected=False,
+            canonicalization_cycle_at_iteration=0,
+            canonicalization_state_hashes=[],
+            canonicalization_change_log=[],
+            first_residual_diff={},
             phase_times_ms={},
             diagnostic_counters={},
         )
@@ -382,6 +389,91 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
         self.assertNotEqual(by_name["valid_trailing.mp3"].winlive.esito_cartella_winlive, "MP3 corrotti")
         self.assertNotEqual(by_name["valid_tail_warning.mp3"].winlive.esito_cartella_winlive, "MP3 corrotti")
 
+    def test_wl_tail_1_normalization_tail_warning_is_confirmed(self) -> None:
+        self._write_input("wl_tail_norm.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        def fake_assess(path: Path) -> WinLiveDecodeAssessment:
+            return self._assessment(
+                path=str(path),
+                rule="C_TERMINAL_OR_NON_BLOCKING_WARNING",
+                positive=False,
+                is_decodable=True,
+                rc=1,
+                stderr="tail warning",
+                timestamps=["00:00:29.800"],
+            )
+
+        with mock.patch.object(engine, "_assess_minimal_decode_for_winlive", side_effect=fake_assess):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False, repair_mode=True))
+
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.FILE_NORMALIZED)
+        self.assertNotEqual(row.winlive.esito_cartella_winlive, "Non integro dopo modifica")
+        self.assertNotEqual(row.winlive.esito_cartella_winlive, "MP3 corrotti")
+
+    def test_wl_tail_2_boundary_crossing_remains_blocking(self) -> None:
+        self._write_input("wl_tail_cross.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        def fake_assess(path: Path) -> WinLiveDecodeAssessment:
+            return self._assessment(
+                path=str(path),
+                rule="A_REAL_ERROR_IN_SIGNIFICANT_AUDIO",
+                positive=True,
+                is_decodable=False,
+                rc=1,
+                stderr="boundary-crossing error",
+                timestamps=["00:00:28.999"],
+            )
+
+        with mock.patch.object(engine, "_assess_minimal_decode_for_winlive", side_effect=fake_assess):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False, repair_mode=True))
+
+        self.assertEqual(row.winlive.esito_cartella_winlive, "MP3 corrotti")
+
+    def test_wl_tail_3_pre_modify_tail_warning_allows_processing(self) -> None:
+        self._write_input("wl_tail_pre.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        with mock.patch.object(
+            engine,
+            "_assess_minimal_decode_for_winlive",
+            return_value=self._assessment(
+                path="wl_tail_pre.mp3",
+                rule="C_TERMINAL_OR_NON_BLOCKING_WARNING",
+                positive=False,
+                is_decodable=True,
+                rc=1,
+                stderr="tail warning",
+                timestamps=["00:00:29.900"],
+            ),
+        ):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False, repair_mode=False))
+
+        self.assertNotEqual(row.winlive.esito_cartella_winlive, "MP3 corrotti")
+
+    def test_wl_tail_4_post_modify_tail_warning_keeps_output_confirmed(self) -> None:
+        self._write_input("wl_tail_post.mp3", _mp3_blob(b"|100||200|CIAO|300|", b"|100|C|200|"))
+        engine = _WinLiveScenarioEngine()
+
+        with mock.patch.object(
+            engine,
+            "_assess_minimal_decode_for_winlive",
+            return_value=self._assessment(
+                path="wl_tail_post.mp3",
+                rule="C_TERMINAL_OR_NON_BLOCKING_WARNING",
+                positive=False,
+                is_decodable=True,
+                rc=1,
+                stderr="tail warning",
+                timestamps=["00:00:29.700"],
+            ),
+        ):
+            row = self._first_result(self._run(engine, verify_winlive=True, verify_mp3_integrity=False, repair_mode=True))
+
+        self.assertEqual(row.winlive.stato_winlive_finale, WinLiveOutcome.FILE_NORMALIZED)
+        self.assertNotEqual(row.winlive.esito_cartella_winlive, "Non integro dopo modifica")
+
     def test_winlive_only_real_significant_corruption_is_routed_to_mp3_corrotti(self) -> None:
         self._write_input("real_corrupt.mp3", _mp3_blob(b"|100|CIAO|200|", b"|100|C|200|"))
         engine = _WinLiveScenarioEngine()
@@ -455,6 +547,13 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
                 encoding_converted=False,
                 encoding_lossless=True,
                 rewrite_metrics={},
+                canonicalization_iterations=1,
+                canonicalization_stabilized=True,
+                canonicalization_cycle_detected=False,
+                canonicalization_cycle_at_iteration=0,
+                canonicalization_state_hashes=[],
+                canonicalization_change_log=[],
+                first_residual_diff={},
                 phase_times_ms={},
                 diagnostic_counters={},
             )
@@ -504,6 +603,13 @@ class MP3DiagnosticsWinLiveIntegrationTests(unittest.TestCase):
             encoding_converted=False,
             encoding_lossless=True,
             rewrite_metrics={},
+            canonicalization_iterations=1,
+            canonicalization_stabilized=True,
+            canonicalization_cycle_detected=False,
+            canonicalization_cycle_at_iteration=0,
+            canonicalization_state_hashes=[],
+            canonicalization_change_log=[],
+            first_residual_diff={},
             phase_times_ms={},
             diagnostic_counters={},
         )

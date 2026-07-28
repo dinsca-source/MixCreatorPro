@@ -12,6 +12,7 @@ Diagnostica e riparazione MP3 con classificazione a tre stati:
 from __future__ import annotations
 
 import array
+import copy
 import csv
 import hashlib
 import json
@@ -32,10 +33,21 @@ from typing import Any, Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from ffmpeg_manager import FFmpegManager
+from mp3_integrity_policy import (
+    TAIL_CLASSIFICATION_WARNING,
+    TAIL_FINAL_OUTCOME_IMPACT_NONE,
+    TAIL_NON_BLOCKING_BOUNDARY_TOLERANCE_MS,
+    TAIL_NON_BLOCKING_EXCLUSION_REASON,
+    TAIL_NON_BLOCKING_HEALTHY_REASON,
+    TAIL_NON_BLOCKING_WINDOW_MS,
+    build_tail_policy_decision,
+    is_issue_exclusively_in_non_blocking_tail,
+)
 from winlive_classification import PostNormalizationValidationStatus, WinLiveClassificationInput, WinLiveOutcome, classify_winlive
 from winlive_normalizer import contains_semantic_text, count_unrecognized_chords, normalize_synct_content
 from winlive_safe_write import WinLiveWriteValidationResult, decode_text_lossless, write_normalized_winlive_copy
 from winlive_tags import WinLiveStructureState, parse_winlive_blocks_strict
+from session_summary import build_session_configuration_header, clean_path_value, format_si_no
 
 
 STATUS_PERFECT = "Integro"
@@ -118,25 +130,6 @@ SILENCE_PEAK_THRESHOLD_DB = -45.0
 MIN_SIGNIFICANT_AUDIO_DURATION_MS = 300
 MIN_SILENCE_RUN_MS = 400
 AUDIO_BOUNDS_SAFETY_MARGIN_MS = 250
-
-# Controlled tolerance for low-impact anomalies in the final tail of an MP3.
-TERMINAL_TAIL_TOLERANCE_MS = 1000
-MAX_LOW_IMPACT_TERMINAL_ISSUE_MS = 750
-LOW_IMPACT_TERMINAL_RMS_DBFS = -24.0
-LOW_IMPACT_TERMINAL_PEAK_DBFS = -10.0
-LOW_IMPACT_TERMINAL_OVERLAP_RATIO = 0.6
-LOW_IMPACT_TERMINAL_MAX_ISSUES = 6
-LOW_IMPACT_TERMINAL_PROBLEM_KEYS = {
-    "header_missing",
-    "invalid_data",
-}
-LOW_IMPACT_TERMINAL_EXCLUSION_REASON = (
-    "Anomalia localizzata nella coda finale a basso livello e senza evidenza di impatto uditivo significativo."
-)
-LOW_IMPACT_TERMINAL_HEALTHY_REASON = (
-    "File utilizzabile: rilevate anomalie FFmpeg esclusivamente nella coda finale a basso impatto, conservate come warning non bloccanti."
-)
-
 
 class MP3DiagnosticsError(RuntimeError):
     """General MP3 diagnostics error."""
@@ -274,6 +267,10 @@ class EvaluatedIssue:
     impact_label: str
     segment_start_ms: int | None
     segment_end_ms: int | None
+    blocking_for_final_outcome: bool = True
+    within_non_blocking_tail: bool = False
+    classification: str = "Bloccante"
+    final_outcome_impact: str = "Bloccante"
 
 
 @dataclass(slots=True)
@@ -370,6 +367,9 @@ class MP3DiagnosticResult:
     evaluated_issues_before: list[EvaluatedIssue] = field(default_factory=list)
     evaluated_issues_after: list[EvaluatedIssue] = field(default_factory=list)
     ignored_anomalies_count: int = 0
+    blocking_issues_count: int = 0
+    non_blocking_tail_issues_count: int = 0
+    integrity_certified: bool = False
     output_repaired_path: str = ""
     output_unrecoverable_path: str = ""
     analysis_command: str = ""
@@ -408,6 +408,28 @@ class MP3DiagnosticResult:
         cleaned = [item.strip() for item in notes if item and item.strip()]
         return " | ".join(cleaned)
 
+    @staticmethod
+    def _derive_winlive_validation_status(winlive: WinLiveDiagnosticResult) -> str:
+        if not winlive.verifica_winlive_eseguita:
+            return "Non eseguita"
+        if winlive.normalizzazione_necessaria and not winlive.normalizzazione_tentata:
+            return "Normalizzazione richiesta ma non tentata"
+        if winlive.normalizzazione_tentata and winlive.normalizzazione_validata:
+            return "Normalizzazione idempotente validata"
+        if winlive.normalizzazione_tentata and not winlive.normalizzazione_validata:
+            return "Validazione normalizzazione WinLive fallita"
+        return "Conforme senza normalizzazione"
+
+    @staticmethod
+    def _derive_combined_outcome(winlive: WinLiveDiagnosticResult) -> str:
+        if winlive.stato_winlive_finale == WinLiveOutcome.MODIFICATION_NOT_INTEGRAL:
+            return "Normalizzazione WinLive fallita"
+        if winlive.stato_winlive_finale == WinLiveOutcome.FILE_NORMALIZED:
+            return "Normalizzazione WinLive riuscita"
+        if winlive.stato_winlive_finale == WinLiveOutcome.FILE_ALREADY_OK:
+            return "WinLive conforme"
+        return "Esito WinLive da classificazione"
+
     def _winlive_summary_fields(self) -> dict[str, Any]:
         status = self.winlive.stato_winlive_finale.value if self.winlive.stato_winlive_finale is not None else ""
         timestamp_summary = " | ".join(
@@ -421,7 +443,10 @@ class MP3DiagnosticResult:
             WINLIVE_COL_VERIFY: self._si_no(self.winlive.verifica_winlive_eseguita),
             WINLIVE_COL_STATUS: status,
             "Certificazione finale MP3": self.winlive.certificazione_finale_mp3,
+            "Stato integrità audio originale": self.winlive.stato_integrita_audio_originale,
             "Stato integrità originale": self.winlive.stato_integrita_originale,
+            "Stato validazione WinLive": self.winlive.stato_validazione_winlive,
+            "Esito combinato": self.winlive.esito_combinato_winlive,
             "Stato integrità file normalizzato": self.winlive.stato_integrita_file_normalizzato,
             "Riparazione MP3 tentata": self._si_no(self.winlive.riparazione_mp3_tentata),
             "Riparazione MP3 riuscita": self._si_no(self.winlive.riparazione_mp3_riuscita),
@@ -452,6 +477,13 @@ class MP3DiagnosticResult:
             WINLIVE_COL_TAGS_REMOVED: self.winlive.tag_temporali_rimossi,
             WINLIVE_COL_EMPTY_TIMED_LINES_DETECTED: self.winlive.righe_temporali_vuote_rilevate,
             WINLIVE_COL_EMPTY_TIMED_LINES_REMOVED: self.winlive.righe_temporali_vuote_eliminate,
+            "Canonicalizzazione iterazioni": self.winlive.canonicalization_iterations,
+            "Canonicalizzazione stabilizzata": self._si_no(self.winlive.canonicalization_stabilized),
+            "Canonicalizzazione ciclo rilevato": self._si_no(self.winlive.canonicalization_cycle_detected),
+            "Canonicalizzazione ciclo iterazione": self.winlive.canonicalization_cycle_at_iteration,
+            "Canonicalizzazione hash stati": " | ".join(self.winlive.canonicalization_state_hashes),
+            "Canonicalizzazione log modifiche": json.dumps(self.winlive.canonicalization_change_log, ensure_ascii=False),
+            "Prima differenza residua": json.dumps(self.winlive.first_residual_diff, ensure_ascii=False),
         }
 
     def to_summary_row(
@@ -485,6 +517,9 @@ class MP3DiagnosticResult:
                     "Errori iniziali": self.total_errors_before,
                     "Errori finali": self.total_errors_after,
                     "Anomalie tecniche ignorate": self.ignored_anomalies_count,
+                    "Anomalie bloccanti": self.blocking_issues_count,
+                    "Anomalie ultimo secondo non bloccanti": self.non_blocking_tail_issues_count,
+                    "Integrità certificata": "SI" if self.integrity_certified else "NO",
                     "Inizio audio significativo": _format_hhmmss_mmm_from_seconds(self.bounds_before.significant_start_ms / 1000.0),
                     "Fine audio significativo": _format_hhmmss_mmm_from_seconds(self.bounds_before.significant_end_ms / 1000.0),
                     "Silenzio iniziale (ms)": self.bounds_before.leading_silence_ms,
@@ -558,6 +593,10 @@ class MP3DiagnosticResult:
                     "Esito intervento": self.repair_outcome,
                     "Posizione rispetto all'audio significativo": IssuePosition.SIGNIFICANT_AUDIO.value,
                     "Problema ignorato ai fini dello stato": "NO",
+                    "Within non-blocking tail": "NO",
+                    "Blocking": "NO",
+                    "Classification": "none",
+                    "Final outcome impact": "none",
                     "Motivo esclusione": "",
                     "Motivo / dettaglio essenziale": self.classification_reason,
                     "RMS segmento (dBFS)": "",
@@ -611,6 +650,10 @@ class MP3DiagnosticResult:
                     "Esito intervento": ev.issue.intervention,
                     "Posizione rispetto all'audio significativo": ev.position.value,
                     "Problema ignorato ai fini dello stato": is_ignored,
+                    "Within non-blocking tail": "SI" if ev.within_non_blocking_tail else "NO",
+                    "Blocking": "SI" if ev.blocking_for_final_outcome else "NO",
+                    "Classification": ev.classification,
+                    "Final outcome impact": ev.final_outcome_impact,
                     "Motivo esclusione": ev.exclusion_reason,
                     "Motivo / dettaglio essenziale": ev.issue.detail,
                     "RMS segmento (dBFS)": f"{ev.rms_dbfs:.2f}",
@@ -653,6 +696,14 @@ class MP3DiagnosticResult:
             "classification_reason": self.classification_reason,
             "hash_sha256": self.file_hash_sha256,
             "ignored_anomalies": self.ignored_anomalies_count,
+            "blocking_issues_count": self.blocking_issues_count,
+            "non_blocking_tail_issues_count": self.non_blocking_tail_issues_count,
+            "integrity_certified": self.integrity_certified,
+            "tail_policy": {
+                "window_ms": TAIL_NON_BLOCKING_WINDOW_MS,
+                "boundary_tolerance_ms": TAIL_NON_BLOCKING_BOUNDARY_TOLERANCE_MS,
+                "rule": "exclusive_last_second_non_blocking",
+            },
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -689,7 +740,10 @@ class WinLiveDiagnosticResult:
     esito_percorso_winlive: str = ""
     esito_operazione_winlive: str = ""
     certificazione_finale_mp3: str = ""
+    stato_integrita_audio_originale: str = ""
     stato_integrita_originale: str = ""
+    stato_validazione_winlive: str = ""
+    esito_combinato_winlive: str = ""
     stato_integrita_file_normalizzato: str = ""
     riparazione_mp3_tentata: bool = False
     riparazione_mp3_riuscita: bool = False
@@ -708,6 +762,13 @@ class WinLiveDiagnosticResult:
     accordi_non_riconosciuti_occurrence: list[dict[str, Any]] = field(default_factory=list)
     metriche_riscrittura: dict[str, Any] = field(default_factory=dict)
     contatori_diagnostici: dict[str, int] = field(default_factory=dict)
+    canonicalization_iterations: int = 0
+    canonicalization_stabilized: bool = False
+    canonicalization_cycle_detected: bool = False
+    canonicalization_cycle_at_iteration: int = 0
+    canonicalization_state_hashes: list[str] = field(default_factory=list)
+    canonicalization_change_log: list[dict[str, Any]] = field(default_factory=list)
+    first_residual_diff: dict[str, Any] = field(default_factory=dict)
     modificato: bool = False
     tempi_fasi_ms: dict[str, float] = field(default_factory=dict)
     fasi_eseguite: dict[str, bool] = field(default_factory=dict)
@@ -731,6 +792,7 @@ class MP3DiagnosticsEngine:
         cancel_event: Any | None = None,
         verify_mp3_integrity: bool = True,
         verify_winlive: bool = False,
+        session_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not verify_mp3_integrity and not verify_winlive:
             raise MP3DiagnosticsError("Almeno un controllo diagnostico deve essere attivo.")
@@ -946,11 +1008,12 @@ class MP3DiagnosticsEngine:
                     cancel_event=cancel_event,
                     temp_dir=temp_dir,
                 )
-                unified_certification = self._build_final_certification_result(
+                audio_certification = self._build_final_certification_result(
                     cert_payload=cert_payload,
                     target_file_path=certification_target,
                     normalized_candidate_path=winlive_result.file_temporaneo,
                 )
+                unified_certification = copy.deepcopy(audio_certification)
                 if verify_winlive:
                     self._apply_winlive_certification_overrides(
                         certification=unified_certification,
@@ -977,7 +1040,7 @@ class MP3DiagnosticsEngine:
 
                 self._apply_unified_certification_to_winlive(
                     result=winlive_result,
-                    certification=unified_certification,
+                    certification=audio_certification,
                     original_relevant_count=len(relevant_before),
                 )
 
@@ -1054,6 +1117,9 @@ class MP3DiagnosticsEngine:
                 evaluated_issues_before=evaluated_before,
                 evaluated_issues_after=evaluated_after,
                 ignored_anomalies_count=(len([it for it in evaluated_before if it.ignored_for_classification]) if verify_mp3_integrity else 0),
+                blocking_issues_count=(len([it for it in evaluated_after if it.blocking_for_final_outcome]) if verify_mp3_integrity else 0),
+                non_blocking_tail_issues_count=(len([it for it in evaluated_before if it.within_non_blocking_tail]) if verify_mp3_integrity else 0),
+                integrity_certified=(final_outcome in (STATUS_PERFECT, STATUS_REPAIRED) if verify_mp3_integrity else False),
                 output_repaired_path=output_repaired_path,
                 output_unrecoverable_path=output_unrecoverable_path,
                 analysis_command=(before_analysis.command_text if verify_mp3_integrity else ""),
@@ -1094,6 +1160,17 @@ class MP3DiagnosticsEngine:
             placement_mode,
             verify_mp3_integrity=verify_mp3_integrity,
             verify_winlive=verify_winlive,
+        )
+        self._write_session_summary_text(
+            session_output=session_output,
+            summary=summary,
+            include_subfolders=include_subfolders,
+            verify_mp3_integrity=verify_mp3_integrity,
+            verify_winlive=verify_winlive,
+            placement_mode=placement_mode,
+            session_snapshot=session_snapshot,
+            input_folder=str(source_dir),
+            output_folder=str(base_output),
         )
         self._write_log(report_dir / "Log.txt", rows)
         if verify_mp3_integrity:
@@ -1292,6 +1369,9 @@ class MP3DiagnosticsEngine:
                 phase_executed["certificazione_integrita"] = False
                 result.stato_integrita_file_normalizzato = "Non eseguita"
 
+            result.stato_validazione_winlive = MP3DiagnosticResult._derive_winlive_validation_status(result)
+            result.esito_combinato_winlive = MP3DiagnosticResult._derive_combined_outcome(result)
+
             return result
         except Exception as exc:
             result.errore_winlive_code = type(exc).__name__
@@ -1401,6 +1481,13 @@ class MP3DiagnosticsEngine:
         result.metadati_preservati = write_result.metadata_preserved
         result.metriche_riscrittura = dict(write_result.rewrite_metrics)
         result.contatori_diagnostici = dict(write_result.diagnostic_counters)
+        result.canonicalization_iterations = int(write_result.canonicalization_iterations)
+        result.canonicalization_stabilized = bool(write_result.canonicalization_stabilized)
+        result.canonicalization_cycle_detected = bool(write_result.canonicalization_cycle_detected)
+        result.canonicalization_cycle_at_iteration = int(write_result.canonicalization_cycle_at_iteration)
+        result.canonicalization_state_hashes = list(write_result.canonicalization_state_hashes)
+        result.canonicalization_change_log = list(write_result.canonicalization_change_log)
+        result.first_residual_diff = dict(write_result.first_residual_diff)
         result.normalizzazione_validata = write_result.error_code is None and write_result.write_succeeded and write_result.readback_succeeded
         result.note_winlive.extend(write_result.notes)
         if write_result.error_code is not None:
@@ -1413,6 +1500,8 @@ class MP3DiagnosticsEngine:
             result.terminatore_preservato = False
             result.valore_iniziale_preservato = False
             result.motivo_validazione_post_modifica = result.errore_winlive
+        result.stato_validazione_winlive = MP3DiagnosticResult._derive_winlive_validation_status(result)
+        result.esito_combinato_winlive = MP3DiagnosticResult._derive_combined_outcome(result)
 
     def detect_significant_audio_bounds(self, file_path: Path) -> AudioBounds:
         duration_ms = max(0, int(round(self._safe_duration_seconds(file_path) * 1000.0)))
@@ -1619,6 +1708,13 @@ class MP3DiagnosticsEngine:
                 bounds=bounds,
                 stats=stats,
             )
+            within_non_blocking_tail = is_issue_exclusively_in_non_blocking_tail(
+                start_ms=start_ms,
+                end_ms=end_ms,
+                file_duration_ms=bounds.file_duration_ms,
+                tail_window_ms=TAIL_NON_BLOCKING_WINDOW_MS,
+                boundary_tolerance_ms=TAIL_NON_BLOCKING_BOUNDARY_TOLERANCE_MS,
+            )
 
             ignored = False
             exclusion_reason = ""
@@ -1660,6 +1756,23 @@ class MP3DiagnosticsEngine:
                 exclusion_reason = "Anomalia tecnica confinata nella coda silenziosa o quasi silenziosa, senza impatto udibile"
                 impact_label = "Nessuno rilevabile"
 
+            if within_non_blocking_tail:
+                ignored = True
+                exclusion_reason = TAIL_NON_BLOCKING_EXCLUSION_REASON
+                impact_label = "Warning non bloccante"
+
+            tail_decision = build_tail_policy_decision(within_non_blocking_tail=within_non_blocking_tail)
+            blocking_for_final_outcome = not ignored
+            if not blocking_for_final_outcome and within_non_blocking_tail:
+                classification = tail_decision.classification
+                final_outcome_impact = tail_decision.final_outcome_impact
+            elif blocking_for_final_outcome:
+                classification = "Bloccante"
+                final_outcome_impact = "Bloccante"
+            else:
+                classification = "Ignorato"
+                final_outcome_impact = "Nessuno"
+
             evaluated.append(
                 EvaluatedIssue(
                     issue=issue,
@@ -1672,6 +1785,10 @@ class MP3DiagnosticsEngine:
                     impact_label=impact_label,
                     segment_start_ms=start_ms,
                     segment_end_ms=end_ms,
+                    blocking_for_final_outcome=blocking_for_final_outcome,
+                    within_non_blocking_tail=within_non_blocking_tail,
+                    classification=classification,
+                    final_outcome_impact=final_outcome_impact,
                 )
             )
 
@@ -1717,91 +1834,6 @@ class MP3DiagnosticsEngine:
             and overlap_ratio <= 0.35
         )
 
-    @staticmethod
-    def _is_globally_usable_for_terminal_tolerance(
-        *,
-        analysis: AnalysisResult,
-        duration_seconds: float,
-        bounds: AudioBounds,
-        significant_segment_metrics: dict[str, int],
-        evaluated_issues: list[EvaluatedIssue],
-    ) -> bool:
-        if analysis.return_code != 0:
-            return False
-        if duration_seconds <= 0 or bounds.file_duration_ms <= 0:
-            return False
-        significant_span = max(0, bounds.significant_end_ms - bounds.significant_start_ms)
-        if significant_span < MIN_SIGNIFICANT_AUDIO_DURATION_MS:
-            return False
-
-        total_blocking = sum(max(0, int(significant_segment_metrics.get(field, 0))) for field in _BLOCKING_ERROR_FIELDS)
-        if total_blocking > LOW_IMPACT_TERMINAL_MAX_ISSUES:
-            return False
-        if len(evaluated_issues) > LOW_IMPACT_TERMINAL_MAX_ISSUES:
-            return False
-        return True
-
-    @staticmethod
-    def _is_terminal_tail_interval(*, start_ms: int, end_ms: int, file_duration_ms: int) -> bool:
-        if file_duration_ms <= 0:
-            return False
-
-        actual_end = max(start_ms, end_ms)
-        tail_start = max(0, file_duration_ms - TERMINAL_TAIL_TOLERANCE_MS)
-        starts_in_tail = start_ms >= tail_start
-        ends_at_or_beyond_duration = actual_end >= file_duration_ms
-        if not (starts_in_tail or ends_at_or_beyond_duration):
-            return False
-
-        segment_len = max(1, actual_end - start_ms)
-        overlap_start = max(start_ms, tail_start)
-        overlap_end = min(actual_end, file_duration_ms)
-        overlap_ms = max(0, overlap_end - overlap_start)
-        overlap_ratio = overlap_ms / float(segment_len)
-        return overlap_ratio >= LOW_IMPACT_TERMINAL_OVERLAP_RATIO
-
-    def _is_low_impact_terminal_issue(
-        self,
-        *,
-        item: EvaluatedIssue,
-        bounds: AudioBounds,
-        analysis: AnalysisResult,
-        duration_seconds: float,
-        significant_segment_metrics: dict[str, int],
-        evaluated_issues: list[EvaluatedIssue],
-    ) -> bool:
-        if item.ignored_for_classification:
-            return False
-        if item.issue.problem_key not in LOW_IMPACT_TERMINAL_PROBLEM_KEYS:
-            return False
-        if item.segment_start_ms is None or item.segment_end_ms is None:
-            return False
-        if item.position == IssuePosition.UNKNOWN:
-            return False
-
-        if not self._is_globally_usable_for_terminal_tolerance(
-            analysis=analysis,
-            duration_seconds=duration_seconds,
-            bounds=bounds,
-            significant_segment_metrics=significant_segment_metrics,
-            evaluated_issues=evaluated_issues,
-        ):
-            return False
-
-        start_ms = item.segment_start_ms
-        end_ms = item.segment_end_ms
-        if not self._is_terminal_tail_interval(start_ms=start_ms, end_ms=end_ms, file_duration_ms=bounds.file_duration_ms):
-            return False
-
-        issue_duration_ms = max(1, end_ms - start_ms)
-        if issue_duration_ms > MAX_LOW_IMPACT_TERMINAL_ISSUE_MS:
-            return False
-        if item.rms_dbfs > LOW_IMPACT_TERMINAL_RMS_DBFS:
-            return False
-        if item.peak_dbfs > LOW_IMPACT_TERMINAL_PEAK_DBFS:
-            return False
-        return True
-
     def _apply_low_impact_terminal_tolerance(
         self,
         *,
@@ -1811,18 +1843,20 @@ class MP3DiagnosticsEngine:
         duration_seconds: float,
         significant_segment_metrics: dict[str, int],
     ) -> None:
+        _ = (bounds, analysis, duration_seconds, significant_segment_metrics)
         for item in evaluated_issues:
-            if self._is_low_impact_terminal_issue(
-                item=item,
-                bounds=bounds,
-                analysis=analysis,
-                duration_seconds=duration_seconds,
-                significant_segment_metrics=significant_segment_metrics,
-                evaluated_issues=evaluated_issues,
+            if is_issue_exclusively_in_non_blocking_tail(
+                start_ms=item.segment_start_ms,
+                end_ms=item.segment_end_ms,
+                file_duration_ms=bounds.file_duration_ms,
             ):
                 item.ignored_for_classification = True
-                item.exclusion_reason = LOW_IMPACT_TERMINAL_EXCLUSION_REASON
-                item.impact_label = "Nessuno rilevabile"
+                item.blocking_for_final_outcome = False
+                item.within_non_blocking_tail = True
+                item.classification = TAIL_CLASSIFICATION_WARNING
+                item.final_outcome_impact = TAIL_FINAL_OUTCOME_IMPACT_NONE
+                item.exclusion_reason = TAIL_NON_BLOCKING_EXCLUSION_REASON
+                item.impact_label = "Warning non bloccante"
 
     def _issue_segment_ms(self, issue: DiagnosticIssue) -> tuple[int | None, int | None]:
         start_sec = self._parse_issue_time(issue.start)
@@ -2812,6 +2846,17 @@ class MP3DiagnosticsEngine:
         original_relevant_count: int,
     ) -> None:
         result.certificazione_finale_mp3 = certification.certification_label
+        if result.errore_winlive_code in {"READ_FAILED", "WRITE_FAILED", "READBACK_FAILED"}:
+            result.certificazione_finale_mp3 = "Errore infrastrutturale"
+        if certification.is_certified and certification.final_outcome == STATUS_PERFECT:
+            if getattr(certification, "ignored", []):
+                result.stato_integrita_audio_originale = "Integro con avvertimenti di coda"
+            else:
+                result.stato_integrita_audio_originale = "Integro"
+        elif certification.is_certified:
+            result.stato_integrita_audio_originale = "Riparato"
+        else:
+            result.stato_integrita_audio_originale = "Non recuperabile"
         result.stato_integrita_originale = certification.final_outcome
         result.stato_integrita_file_normalizzato = certification.final_status
         result.riparazione_mp3_tentata = bool(certification.repaired or certification.repair_command)
@@ -2938,8 +2983,8 @@ class MP3DiagnosticsEngine:
             final_folder = OUTPUT_FOLDER_UNRECOVERABLE
             final_outcome = STATUS_UNRECOVERABLE
             classification_reason = "Non recuperabile: rilevati problemi nell'audio significativo"
-        elif ignored and all(item.exclusion_reason == LOW_IMPACT_TERMINAL_EXCLUSION_REASON for item in ignored):
-            classification_reason = LOW_IMPACT_TERMINAL_HEALTHY_REASON
+        elif ignored and all(item.within_non_blocking_tail for item in ignored):
+            classification_reason = TAIL_NON_BLOCKING_HEALTHY_REASON
 
         if repair_mode and confirmed_blocking:
             working_temp_dir = temp_dir or (Path(tempfile.gettempdir()) / OUTPUT_FOLDER_TEMP)
@@ -3612,6 +3657,10 @@ class MP3DiagnosticsEngine:
                     "Zona": item.get("Zona", ""),
                     "Posizione rispetto all'audio significativo": item.get("Posizione rispetto all'audio significativo", ""),
                     "Problema ignorato ai fini dello stato": item.get("Problema ignorato ai fini dello stato", ""),
+                    "Within non-blocking tail": item.get("Within non-blocking tail", ""),
+                    "Blocking": item.get("Blocking", ""),
+                    "Classification": item.get("Classification", ""),
+                    "Final outcome impact": item.get("Final outcome impact", ""),
                     "Motivo esclusione": item.get("Motivo esclusione", ""),
                     "RMS segmento (dBFS)": item.get("RMS segmento (dBFS)", ""),
                     "Picco segmento (dBFS)": item.get("Picco segmento (dBFS)", ""),
@@ -3664,6 +3713,10 @@ class MP3DiagnosticsEngine:
                     "Esito intervento": bucket["Esito intervento"],
                     "Posizione rispetto all'audio significativo": bucket["Posizione rispetto all'audio significativo"],
                     "Problema ignorato ai fini dello stato": bucket["Problema ignorato ai fini dello stato"],
+                    "Within non-blocking tail": bucket["Within non-blocking tail"],
+                    "Blocking": bucket["Blocking"],
+                    "Classification": bucket["Classification"],
+                    "Final outcome impact": bucket["Final outcome impact"],
                     "Motivo esclusione": bucket["Motivo esclusione"],
                     "Motivo / dettaglio essenziale": " / ".join(bucket["_dettagli"]),
                     "RMS segmento (dBFS)": bucket["RMS segmento (dBFS)"],
@@ -3896,7 +3949,10 @@ class MP3DiagnosticsEngine:
                     "Stato MP3": row.repair_outcome,
                     "Stato WinLive": status,
                     "Certificazione finale MP3": row.winlive.certificazione_finale_mp3,
+                    "Stato integrità audio originale": row.winlive.stato_integrita_audio_originale,
                     "Stato integrità file normalizzato": row.winlive.stato_integrita_file_normalizzato,
+                    "Stato validazione WinLive": row.winlive.stato_validazione_winlive,
+                    "Esito combinato": row.winlive.esito_combinato_winlive,
                     "Riparazione MP3 tentata": "SI" if row.winlive.riparazione_mp3_tentata else "NO",
                     "Riparazione MP3 riuscita": "SI" if row.winlive.riparazione_mp3_riuscita else "NO",
                     "Origine dell'anomalia": row.winlive.origine_anomalia,
@@ -3917,6 +3973,13 @@ class MP3DiagnosticsEngine:
                     "Tag temporali rimossi": str(row.winlive.tag_temporali_rimossi),
                     "Righe solo temporali rilevate": str(row.winlive.righe_temporali_vuote_rilevate),
                     "Righe solo temporali eliminate": str(row.winlive.righe_temporali_vuote_eliminate),
+                    "Canonicalizzazione iterazioni": str(row.winlive.canonicalization_iterations),
+                    "Canonicalizzazione stabilizzata": "SI" if row.winlive.canonicalization_stabilized else "NO",
+                    "Canonicalizzazione ciclo rilevato": "SI" if row.winlive.canonicalization_cycle_detected else "NO",
+                    "Canonicalizzazione ciclo iterazione": str(row.winlive.canonicalization_cycle_at_iteration),
+                    "Canonicalizzazione hash stati": " | ".join(row.winlive.canonicalization_state_hashes),
+                    "Canonicalizzazione log modifiche": json.dumps(row.winlive.canonicalization_change_log, ensure_ascii=False),
+                    "Prima differenza residua": json.dumps(row.winlive.first_residual_diff, ensure_ascii=False),
                     "Cartella esito WinLive": row.winlive.esito_cartella_winlive,
                     "Percorso esito WinLive": row.winlive.esito_percorso_winlive,
                     "Operazione esito WinLive": row.winlive.esito_operazione_winlive,
@@ -4239,6 +4302,9 @@ class MP3DiagnosticsEngine:
             sum(1 for row in rows if row.final_category == DiagnosticCategory.UNRECOVERABLE) if verify_mp3_integrity else 0
         )
         ignored_anomalies = sum(row.ignored_anomalies_count for row in rows) if verify_mp3_integrity else 0
+        blocking_issues = sum(row.blocking_issues_count for row in rows) if verify_mp3_integrity else 0
+        non_blocking_tail_issues = sum(row.non_blocking_tail_issues_count for row in rows) if verify_mp3_integrity else 0
+        integrity_certified_files = sum(1 for row in rows if row.integrity_certified) if verify_mp3_integrity else 0
 
         return {
             "analyzed_files": total,
@@ -4249,6 +4315,14 @@ class MP3DiagnosticsEngine:
             "category_repaired_files": category_repaired,
             "category_unrecoverable_files": category_unrecoverable,
             "ignored_silent_anomalies": ignored_anomalies,
+            "blocking_issues_count": blocking_issues,
+            "non_blocking_tail_issues_count": non_blocking_tail_issues,
+            "integrity_certified_files": integrity_certified_files,
+            "tail_policy": {
+                "window_ms": TAIL_NON_BLOCKING_WINDOW_MS,
+                "boundary_tolerance_ms": TAIL_NON_BLOCKING_BOUNDARY_TOLERANCE_MS,
+                "rule": "exclusive_last_second_non_blocking",
+            },
             "output_folder": str(output_folder),
             "repair_mode": bool(repair_mode),
             "placement_mode": self._sanitize_placement_mode(placement_mode),
@@ -4258,6 +4332,95 @@ class MP3DiagnosticsEngine:
             "output_mode": output_mode.value,
             "main_output_folder": main_output_folder,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _write_session_summary_text(
+        self,
+        *,
+        session_output: Path,
+        summary: dict[str, Any],
+        include_subfolders: bool,
+        verify_mp3_integrity: bool,
+        verify_winlive: bool,
+        placement_mode: str,
+        session_snapshot: dict[str, Any] | None,
+        input_folder: str,
+        output_folder: str,
+    ) -> None:
+        output_mode = str(summary.get("output_mode", ""))
+        effective_diagnostics_dir = self._effective_diagnostics_output_dir(session_output, output_mode)
+        snapshot = self._freeze_diagnostics_session_snapshot(
+            snapshot=session_snapshot,
+            include_subfolders=include_subfolders,
+            verify_mp3_integrity=verify_mp3_integrity,
+            verify_winlive=verify_winlive,
+            placement_mode=placement_mode,
+            default_input=input_folder,
+            default_output=output_folder,
+        )
+        options = [
+            ("Ricerca nelle sottocartelle", format_si_no(bool(snapshot.get("include_subfolders", False)))),
+            ("Verifica integrità MP3", format_si_no(bool(snapshot.get("verify_mp3_integrity", False)))),
+            ("Verifica TAG WinLive", format_si_no(bool(snapshot.get("verify_winlive", False)))),
+            ("Modalità collocazione file", str(snapshot.get("placement_mode_label", "Non disponibile"))),
+        ]
+        paths = [
+            ("Percorso file da diagnosticare", str(snapshot.get("input_folder", ""))),
+            ("Percorso file diagnosticati", str(effective_diagnostics_dir)),
+            ("Percorso completo esito della sessione", str(session_output)),
+        ]
+        lines = build_session_configuration_header(
+            processing_type="Diagnostica MP3",
+            options=options,
+            paths=paths,
+        )
+        lines.extend(
+            [
+                f"File analizzati: {int(summary.get('analyzed_files', 0) or 0)}",
+                f"File già rilevati OK: {int(summary.get('category_ok_files', 0) or 0)}",
+                f"File riparati: {int(summary.get('category_repaired_files', 0) or 0)}",
+                f"File non recuperabili: {int(summary.get('category_unrecoverable_files', 0) or 0)}",
+                f"Anomalie tecniche ignorate in zone silenziose: {int(summary.get('ignored_silent_anomalies', 0) or 0)}",
+                f"Anomalie bloccanti: {int(summary.get('blocking_issues_count', 0) or 0)}",
+                f"Anomalie ultimo secondo non bloccanti: {int(summary.get('non_blocking_tail_issues_count', 0) or 0)}",
+                f"Integrità certificata (file): {int(summary.get('integrity_certified_files', 0) or 0)}",
+                f"Percorso completo esito della sessione: {session_output}",
+            ]
+        )
+        summary_path = session_output / "Riepilogo sessione.txt"
+        summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _effective_diagnostics_output_dir(self, session_output: Path, output_mode: str) -> Path:
+        if output_mode == FinalOutputMode.WINLIVE_ONLY.value:
+            return session_output / OUTPUT_FOLDER_WINLIVE
+        if output_mode == FinalOutputMode.INTEGRITY_AND_WINLIVE.value:
+            return session_output / OUTPUT_FOLDER_INTEGRITY_WINLIVE
+        return session_output / OUTPUT_FOLDER_INTEGRITY_ROOT
+
+    def _freeze_diagnostics_session_snapshot(
+        self,
+        *,
+        snapshot: dict[str, Any] | None,
+        include_subfolders: bool,
+        verify_mp3_integrity: bool,
+        verify_winlive: bool,
+        placement_mode: str,
+        default_input: str,
+        default_output: str,
+    ) -> dict[str, Any]:
+        source = dict(snapshot or {})
+        normalized_placement = str(source.get("placement_mode", placement_mode)).strip().lower()
+        if normalized_placement not in (PLACEMENT_MODE_COPY, PLACEMENT_MODE_MOVE):
+            normalized_placement = PLACEMENT_MODE_COPY
+        placement_label = "Copia" if normalized_placement == PLACEMENT_MODE_COPY else "Sposta"
+        return {
+            "include_subfolders": bool(source.get("include_subfolders", include_subfolders)),
+            "verify_mp3_integrity": bool(source.get("verify_mp3_integrity", verify_mp3_integrity)),
+            "verify_winlive": bool(source.get("verify_winlive", verify_winlive)),
+            "placement_mode": normalized_placement,
+            "placement_mode_label": str(source.get("placement_mode_label", placement_label)) or placement_label,
+            "input_folder": clean_path_value(source.get("input_folder") or default_input),
+            "output_folder": clean_path_value(source.get("output_folder") or default_output),
         }
 
     def _cleanup_temp_dir(self, temp_dir: Path) -> None:

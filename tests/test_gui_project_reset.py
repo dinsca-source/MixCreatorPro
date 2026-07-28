@@ -13,7 +13,6 @@ import gui as gui_module
 from gui import MixCreatorApp
 from clip_info import ClipInfo
 from mp3_diagnostics import STATUS_PERFECT, STATUS_REPAIRED, STATUS_UNRECOVERABLE
-from selective_reverify import PreviousReportRow, MissingOriginalRow, SelectiveReverifySelection
 
 
 class GuiProjectResetTests(unittest.TestCase):
@@ -161,10 +160,9 @@ class GuiProjectResetTests(unittest.TestCase):
 
         self.assertIs(first, second)
 
-    def test_diagnostics_reverify_button_exists(self) -> None:
+    def test_diagnostics_reverify_button_removed(self) -> None:
         self.app.open_diagnostics_window()
-        self.assertTrue(hasattr(self.app, "diagnostics_reverify_button"))
-        self.assertEqual(str(self.app.diagnostics_reverify_button.cget("text")), "Riverifica file problematici")
+        self.assertFalse(hasattr(self.app, "diagnostics_reverify_button"))
 
     def test_diagnostics_winlive_checkboxes_exist_and_positioned_under_subfolders(self) -> None:
         self.app.open_diagnostics_window()
@@ -421,11 +419,71 @@ class GuiProjectResetTests(unittest.TestCase):
         try:
             self.app._update_controls_state()
             self.assertEqual(str(self.app.diagnostics_repair_button.cget("state")), "disabled")
-            self.assertEqual(str(self.app.diagnostics_reverify_button.cget("state")), "disabled")
             self.assertEqual(str(self.app.diagnostics_stop_button.cget("state")), "normal")
         finally:
             self.app.diagnostics_worker._running = False
             self.app._update_controls_state()
+
+    def test_diagnostics_close_and_reopen_restores_full_form(self) -> None:
+        self.app.open_diagnostics_window()
+        first_window = self.app.diagnostics_window
+        self.assertIsNotNone(first_window)
+        self.app._close_diagnostics_window()
+        self.assertIsNone(self.app.diagnostics_window)
+
+        self.app.open_diagnostics_window()
+        second_window = self.app.diagnostics_window
+        self.assertIsNotNone(second_window)
+        self.assertIsNot(first_window, second_window)
+        self.assertIsNotNone(self.app.diagnostics_output_entry)
+        self.assertIsNotNone(self.app.diagnostics_progress)
+        self.assertIsNotNone(self.app.diagnostics_log_box)
+        self.assertIsNotNone(self.app.diagnostics_stop_button)
+
+    def test_diagnostics_reopen_after_recovery_keeps_full_form(self) -> None:
+        self.app.open_diagnostics_window()
+        self.app._close_diagnostics_window()
+        self.app.open_mp3_recovery_window()
+        self.app._close_recovery_window()
+        self.app.open_diagnostics_window()
+
+        self.assertIsNotNone(self.app.diagnostics_window)
+        self.assertIsNotNone(self.app.diagnostics_output_entry)
+        self.assertIsNotNone(self.app.diagnostics_status_label)
+        self.assertIsNotNone(self.app.diagnostics_log_box)
+        self.assertEqual(str(self.app.diagnostics_repair_button.winfo_manager()), "grid")
+        self.assertEqual(str(self.app.diagnostics_stop_button.winfo_manager()), "grid")
+
+    def test_diagnostics_close_clears_window_reference_and_timer(self) -> None:
+        self.app.open_diagnostics_window()
+        self.app.diagnostics_timer_job = "diag-timer"
+        cancelled: list[str] = []
+        original_after_cancel = self.app.after_cancel
+
+        def _after_cancel(job_id):
+            cancelled.append(str(job_id))
+
+        self.app.after_cancel = _after_cancel
+        try:
+            self.app._close_diagnostics_window()
+        finally:
+            self.app.after_cancel = original_after_cancel
+
+        self.assertIn("diag-timer", cancelled)
+        self.assertIsNone(self.app.diagnostics_timer_job)
+        self.assertIsNone(self.app.diagnostics_window)
+
+    def test_alternating_diagnostics_recovery_open_close_keeps_forms_stable(self) -> None:
+        for _ in range(5):
+            self.app.open_diagnostics_window()
+            self.assertIsNotNone(self.app.diagnostics_repair_button)
+            self.assertIsNotNone(self.app.diagnostics_stop_button)
+            self.app._close_diagnostics_window()
+
+            self.app.open_mp3_recovery_window()
+            self.assertIsNotNone(self.app._recovery_start_button)
+            self.assertIsNotNone(self.app._recovery_close_button)
+            self.app._close_recovery_window()
 
     def test_diagnostics_eta_default_before_start(self) -> None:
         self.app.open_diagnostics_window()
@@ -503,193 +561,6 @@ class GuiProjectResetTests(unittest.TestCase):
         self.assertNotEqual(export_eta, "--:--:--")
         self.assertTrue(export_eta == "calcolo in corso..." or export_eta.endswith("secondi") or ":" in export_eta)
 
-    def test_selective_reverify_missing_columns_shows_error(self) -> None:
-        self.app.open_diagnostics_window()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            csv_path = Path(temp_dir) / "Riepilogo_File.csv"
-            with csv_path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=["Stato finale file", "File"])
-                writer.writeheader()
-                writer.writerow({"Stato finale file": "Riparato", "File": "a.mp3"})
-
-            original_open = gui_module.filedialog.askopenfilename
-            original_showerror = gui_module.messagebox.showerror
-            errors: list[str] = []
-            try:
-                gui_module.filedialog.askopenfilename = lambda **kwargs: str(csv_path)
-                gui_module.messagebox.showerror = lambda _title, message, **kwargs: errors.append(str(message))
-                self.app.start_selective_reverify()
-            finally:
-                gui_module.filedialog.askopenfilename = original_open
-                gui_module.messagebox.showerror = original_showerror
-
-            self.assertTrue(errors)
-            self.assertIn("Colonne obbligatorie mancanti", errors[0])
-
-    def test_selective_reverify_without_problematic_rows_shows_info(self) -> None:
-        self.app.open_diagnostics_window()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            original_mp3 = Path(temp_dir) / "a.mp3"
-            original_mp3.write_bytes(b"x")
-            csv_path = Path(temp_dir) / "Riepilogo_File.csv"
-            with csv_path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=["Stato finale file", "Percorso originale", "File"],
-                )
-                writer.writeheader()
-                writer.writerow(
-                    {
-                        "Stato finale file": "Integro",
-                        "Percorso originale": str(original_mp3),
-                        "File": "a.mp3",
-                    }
-                )
-
-            original_open = gui_module.filedialog.askopenfilename
-            original_showinfo = gui_module.messagebox.showinfo
-            infos: list[str] = []
-            try:
-                gui_module.filedialog.askopenfilename = lambda **kwargs: str(csv_path)
-                gui_module.messagebox.showinfo = lambda _title, message, **kwargs: infos.append(str(message))
-                self.app.start_selective_reverify()
-            finally:
-                gui_module.filedialog.askopenfilename = original_open
-                gui_module.messagebox.showinfo = original_showinfo
-
-            self.assertTrue(infos)
-            self.assertEqual(infos[0], "Nessun file problematico da riverificare nel report selezionato.")
-
-    def test_selective_mode_cleanup_on_error_and_cancel(self) -> None:
-        self.app.open_diagnostics_window()
-        self.app.diagnostics_run_mode = "selective_reverify"
-        self.app.diagnostics_reverify_selection = object()  # type: ignore[assignment]
-
-        original_showerror = gui_module.messagebox.showerror
-        try:
-            gui_module.messagebox.showerror = lambda *args, **kwargs: None
-            self.app._handle_diagnostics_worker_error("boom")
-        finally:
-            gui_module.messagebox.showerror = original_showerror
-
-        self.assertEqual(self.app.diagnostics_run_mode, "normal")
-        self.assertIsNone(self.app.diagnostics_reverify_selection)
-
-        self.app.diagnostics_run_mode = "selective_reverify"
-        self.app.diagnostics_reverify_selection = object()  # type: ignore[assignment]
-        self.app._handle_diagnostics_worker_cancelled("stop")
-        self.assertEqual(self.app.diagnostics_run_mode, "normal")
-        self.assertIsNone(self.app.diagnostics_reverify_selection)
-        self.assertEqual(str(self.app.diagnostics_reverify_button.cget("state")), "normal")
-
-    def test_comparative_report_includes_missing_original_row(self) -> None:
-        self.app.open_diagnostics_window()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            report_dir = Path(temp_dir) / "REPORT"
-            report_dir.mkdir(parents=True, exist_ok=True)
-            summary_path = report_dir / "Riepilogo_File.csv"
-            existing_original = Path(temp_dir) / "source" / "ok.mp3"
-            existing_original.parent.mkdir(parents=True, exist_ok=True)
-            existing_original.write_bytes(b"x")
-
-            with summary_path.open("w", encoding="utf-8", newline="") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=[
-                        "File",
-                        "Percorso originale",
-                        "Stato finale file",
-                        "Categoria finale",
-                        "Fine audio significativo",
-                        "Silenzio finale (ms)",
-                        "Percorso finale",
-                    ],
-                )
-                writer.writeheader()
-                writer.writerow(
-                    {
-                        "File": "ok.mp3",
-                        "Percorso originale": str(existing_original),
-                        "Stato finale file": "Integro",
-                        "Categoria finale": "File già rilevati OK",
-                        "Fine audio significativo": "00:00:10.000",
-                        "Silenzio finale (ms)": "0",
-                        "Percorso finale": str(report_dir / ".." / "File già rilevati OK" / "ok.mp3"),
-                    }
-                )
-
-            missing_original = str(Path(temp_dir) / "source" / "missing.mp3")
-            selection = SelectiveReverifySelection(
-                report_csv_path=summary_path,
-                total_rows=2,
-                repaired_rows=1,
-                unrecoverable_rows=1,
-                duplicates_excluded=0,
-                valid_original_files=[existing_original],
-                missing_originals=[
-                    MissingOriginalRow(
-                        row=PreviousReportRow(
-                            file_name="missing.mp3",
-                            original_path=missing_original,
-                            previous_status="Riparato",
-                            previous_category="File riparati",
-                            previous_significant_end="",
-                            previous_trailing_silence_ms="",
-                        ),
-                        reason="Originale non trovato",
-                    )
-                ],
-                selected_rows=[
-                    PreviousReportRow(
-                        file_name="ok.mp3",
-                        original_path=str(existing_original),
-                        previous_status="Riparato",
-                        previous_category="File riparati",
-                        previous_significant_end="00:00:09.500",
-                        previous_trailing_silence_ms="500",
-                    ),
-                    PreviousReportRow(
-                        file_name="missing.mp3",
-                        original_path=missing_original,
-                        previous_status="Non recuperabile",
-                        previous_category="Non recuperabili",
-                        previous_significant_end="",
-                        previous_trailing_silence_ms="",
-                    ),
-                ],
-            )
-
-            self.app.diagnostics_reverify_selection = selection
-            comparative_path = self.app._write_selective_comparative_report({"csv_summary": str(summary_path)})
-
-            self.assertTrue(Path(comparative_path).is_file())
-            with Path(comparative_path).open("r", encoding="utf-8", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-            missing_row = next(row for row in rows if row["File"] == "missing.mp3")
-            self.assertEqual(missing_row["Stato nuovo"], "Originale non trovato")
-
-            self.app.diagnostics_run_mode = "selective_reverify"
-            original_showinfo = gui_module.messagebox.showinfo
-            try:
-                gui_module.messagebox.showinfo = lambda *args, **kwargs: None
-                self.app._handle_diagnostics_worker_completed(
-                    {
-                        "summary": {
-                            "category_ok_files": 1,
-                            "category_repaired_files": 0,
-                            "category_unrecoverable_files": 0,
-                            "ignored_silent_anomalies": 0,
-                            "analyzed_files": 1,
-                        },
-                        "report_paths": {"csv_summary": str(summary_path)},
-                    }
-                )
-            finally:
-                gui_module.messagebox.showinfo = original_showinfo
-
-            self.assertEqual(self.app.diagnostics_run_mode, "normal")
-            self.assertIsNone(self.app.diagnostics_reverify_selection)
-            self.assertEqual(str(self.app.diagnostics_repair_button.cget("state")), "normal")
 
     def test_load_mp3_list_keeps_selection_model_in_sync(self) -> None:
         self.app.input_folder = "C:/Music"

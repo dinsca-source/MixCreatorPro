@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
+from unittest import mock
 
-from winlive_validation import AudioHashStatus, compute_mpeg_audio_hash
+from winlive_validation import AudioHashStatus, MpegFrame, compute_mpeg_audio_hash
 
 
 def _synchsafe(size: int) -> bytes:
@@ -81,6 +83,60 @@ def _ape_footer(size: int = 64) -> bytes:
 
 
 class WinLiveAudioHashTests(unittest.TestCase):
+    def test_hash_cancelled_before_processing(self) -> None:
+        audio = b"".join(_make_frame(version_bits=0x03, bitrate_index=9, sample_index=0) for _ in range(4))
+        event = threading.Event()
+        event.set()
+
+        result = compute_mpeg_audio_hash(audio, cancel_event=event)
+
+        self.assertEqual(result.status, AudioHashStatus.CANCELLED)
+        self.assertIsNone(result.audio_hash_sha256)
+        self.assertTrue(any(item == "HASH_CANCELLED" for item in result.anomalies + result.plan.notes))
+
+    def test_hash_cancelled_during_processing(self) -> None:
+        class _CancelAfterNChecks:
+            def __init__(self, trigger_after: int) -> None:
+                self._count = 0
+                self._trigger_after = trigger_after
+
+            def is_set(self) -> bool:
+                self._count += 1
+                return self._count >= self._trigger_after
+
+        audio = b"".join(_make_frame(version_bits=0x03, bitrate_index=9, sample_index=0) for _ in range(300))
+        result = compute_mpeg_audio_hash(audio, cancel_event=_CancelAfterNChecks(trigger_after=25))
+
+        self.assertEqual(result.status, AudioHashStatus.CANCELLED)
+        self.assertIsNone(result.audio_hash_sha256)
+        self.assertIn("HASH_CANCELLED", result.anomalies)
+
+    def test_non_progressive_frame_length_is_guarded(self) -> None:
+        data = b"\x00" * 64
+
+        def _fake_parse(_data: bytes, offset: int):
+            if offset == 0:
+                return (
+                    MpegFrame(
+                        offset=0,
+                        length=0,
+                        bitrate_kbps=128,
+                        sample_rate_hz=44100,
+                        version="MPEG1",
+                        layer="Layer III",
+                        padding=0,
+                        has_crc=False,
+                    ),
+                    None,
+                )
+            return None, None
+
+        with mock.patch("winlive_validation._parse_frame_at", side_effect=_fake_parse):
+            result = compute_mpeg_audio_hash(data)
+
+        self.assertEqual(result.status, AudioHashStatus.NO_AUDIO_STREAM)
+        self.assertTrue(any(item.startswith("NON_PROGRESSIVE_FRAME_LEN_") for item in result.anomalies))
+
     def test_cbr_mpeg1_layer3_stream(self) -> None:
         audio = b"".join(_make_frame(version_bits=0x03, bitrate_index=9, sample_index=0) for _ in range(4))
         result = compute_mpeg_audio_hash(audio)

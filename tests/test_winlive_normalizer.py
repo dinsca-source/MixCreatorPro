@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from winlive_normalizer import (
+    MAX_CANONICALIZATION_PASSES,
     LineSeparator,
+    NormalizationCounters,
+    build_logical_line_diffs,
     contains_semantic_text,
     count_unrecognized_chords,
     detect_line_separator,
@@ -84,6 +88,87 @@ class WinLiveNormalizerTests(unittest.TestCase):
         content = "|137747|PA|137747|\n|137747|(|137747|coro)|137797|"
         result = normalize_synct_content(content)
         self.assertEqual(result.normalized_text, content)
+
+    def test_synth_1_single_timed_row_between_text_rows_is_removed_and_relinked(self) -> None:
+        content = "0|\n|100|A|190|\n|195|\n|200|B|300|\n|0||"
+        first = normalize_synct_content(content)
+        second = normalize_synct_content(first.normalized_text)
+        self.assertNotIn("|195|", first.normalized_text)
+        self.assertIn("|100|A|200|", first.normalized_text)
+        self.assertEqual(first.normalized_text, second.normalized_text)
+
+    def test_synth_2_multiple_consecutive_timed_rows_are_all_removed(self) -> None:
+        content = "0|\n|100|A|150|\n|151|\n|152|\n|153|\n|160|B|200|\n|0||"
+        result = normalize_synct_content(content)
+        self.assertNotIn("|151|\n", result.normalized_text)
+        self.assertNotIn("|152|\n", result.normalized_text)
+        self.assertNotIn("|153|\n", result.normalized_text)
+        self.assertGreaterEqual(result.counters.empty_timed_lines_removed, 3)
+
+    def test_synth_3_chain_reduction_and_alignment_are_final_in_single_normalization(self) -> None:
+        content = "0|\n|1000||1200||1300|A|4950|\n|5000|B|7000|\n|0||"
+        first = normalize_synct_content(content)
+        second = normalize_synct_content(first.normalized_text)
+        self.assertIn("|1300|A|5000|", first.normalized_text)
+        self.assertEqual(second.counters.adjacent_time_tags_removed, 0)
+        self.assertEqual(second.counters.previous_row_end_adjustments, 0)
+
+    def test_synth_4_timed_only_row_at_beginning_is_removed(self) -> None:
+        content = "|90|\n|100|A|200|"
+        result = normalize_synct_content(content)
+        self.assertTrue(result.normalized_text.startswith("|100|A|200|"))
+        self.assertNotIn("|90|", result.normalized_text)
+
+    def test_synth_5_timed_only_row_at_end_is_removed(self) -> None:
+        content = "|100|A|200|\n|250|\n"
+        result = normalize_synct_content(content)
+        self.assertFalse(result.normalized_text.rstrip().endswith("|250|"))
+
+    def test_synth_6_reindex_after_removal_allows_new_adjacency_alignment(self) -> None:
+        content = "0|\n|100|LEFT|199|\n|199|\n|200|RIGHT|500|\n|0||"
+        result = normalize_synct_content(content)
+        self.assertIn("|100|LEFT|200|", result.normalized_text)
+        self.assertEqual(result.counters.previous_row_end_adjustments, 1)
+
+    def test_synth_7_cycle_detection_returns_non_stable_result(self) -> None:
+        a = "|100|A|200|"
+        b = "|100|B|200|"
+
+        def _flip(content: str, _sep: LineSeparator, iteration: int):
+            next_value = b if content == a else a
+            counters = NormalizationCounters()
+            return next_value, {
+                "iteration": iteration,
+                "changed": True,
+                "phase": "mock_flip",
+                "modification_count": 1,
+                "counters": counters,
+                "empty_values": [],
+                "alignment_events": [],
+                "input_hash": "in",
+                "output_hash": "out",
+            }
+
+        with mock.patch("winlive_normalizer._apply_canonical_rules_once", side_effect=_flip):
+            result = normalize_synct_content(a)
+        self.assertFalse(result.canonicalization_stabilized)
+        self.assertTrue(result.canonicalization_cycle_detected)
+        self.assertLessEqual(result.canonicalization_iterations, MAX_CANONICALIZATION_PASSES)
+
+    def test_synth_8_already_normalized_input_is_stable_immediately(self) -> None:
+        content = "0|\n|100|A|200|\n|200|B|300|\n|0||"
+        result = normalize_synct_content(content)
+        self.assertFalse(result.changed)
+        self.assertTrue(result.canonicalization_stabilized)
+        self.assertEqual(result.canonicalization_iterations, 1)
+
+    def test_structured_diff_reports_logical_line_and_tags(self) -> None:
+        before = "|100|A|150|\n|200|B|300|"
+        after = "|100|A|200|\n|200|B|300|"
+        diffs = build_logical_line_diffs(before, after)
+        self.assertEqual(diffs[0]["logical_line"], 1)
+        self.assertEqual(diffs[0]["tags_before"], [100, 150])
+        self.assertEqual(diffs[0]["tags_after"], [100, 200])
 
 
 if __name__ == "__main__":

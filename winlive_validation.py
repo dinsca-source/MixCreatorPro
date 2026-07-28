@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Callable
 
 from winlive_normalizer import extract_significant_text
 from winlive_tags import TAG_CHORD_CLOSE, TAG_SYNCT_CLOSE, WinLiveStructureState, parse_winlive_blocks_strict
@@ -15,6 +18,14 @@ class AudioHashStatus(str, Enum):
     PARTIAL_AUDIO_STREAM = "PARTIAL_AUDIO_STREAM"
     NO_AUDIO_STREAM = "NO_AUDIO_STREAM"
     AMBIGUOUS_AUDIO_STREAM = "AMBIGUOUS_AUDIO_STREAM"
+    CANCELLED = "CANCELLED"
+
+
+AudioHashDebugLog = Callable[[str], None]
+
+
+class AudioHashCancelled(RuntimeError):
+    pass
 
 
 @dataclass(slots=True)
@@ -51,6 +62,21 @@ class MpegFrame:
 
 
 @dataclass(slots=True)
+class MpegScanStats:
+    parse_calls: int = 0
+    unique_offsets: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    outer_iterations: int = 0
+    inner_iterations: int = 0
+    frames_found: int = 0
+    frames_valid: int = 0
+    frames_rejected: int = 0
+    scanner_elapsed_seconds: float = 0.0
+    average_speed_mb_s: float = 0.0
+
+
+@dataclass(slots=True)
 class AudioHashPlan:
     id3v2_region: ByteRegion | None
     id3v1_region: ByteRegion | None
@@ -75,11 +101,29 @@ class AudioHashResult:
     frame_sequence: list[MpegFrame] = field(default_factory=list)
 
 
-def parse_audio_hash_plan(data: bytes) -> AudioHashPlan:
+def parse_audio_hash_plan(
+    data: bytes,
+    *,
+    cancel_event: object | None = None,
+    debug_callback: AudioHashDebugLog | None = None,
+    source_label: str = "",
+) -> AudioHashPlan:
+    plan_started_at = time.monotonic()
+    _emit_debug(debug_callback, f"[HASH] Inizio parsing regioni escluse {source_label}")
+    _emit_telemetry_event(
+        debug_callback,
+        "HASH_PLAN_START",
+        {
+            "phase": "Parsing regioni escluse",
+            "message": f"Inizio parsing regioni escluse {source_label}",
+        },
+    )
+    _check_cancel(cancel_event)
     id3v2 = _detect_id3v2_region(data)
     id3v1 = _detect_id3v1_region(data)
     ape = _detect_apev2_footer_region(data)
     winlive_regions = _detect_winlive_regions(data)
+    _check_cancel(cancel_event)
 
     start = id3v2.end if id3v2 is not None else 0
     end = len(data)
@@ -88,7 +132,14 @@ def parse_audio_hash_plan(data: bytes) -> AudioHashPlan:
     if id3v1 is not None:
         end = min(end, id3v1.start)
 
-    chains, _ = _scan_mpeg_frames(data, start, end)
+    chains, _, _ = _scan_mpeg_frames(
+        data,
+        start,
+        end,
+        cancel_event=cancel_event,
+        debug_callback=debug_callback,
+        source_label=source_label,
+    )
     frames: list[MpegFrame] = []
     if chains:
         ranked = sorted(chains, key=lambda chain: (len(chain), sum(frame.length for frame in chain)), reverse=True)
@@ -107,6 +158,20 @@ def parse_audio_hash_plan(data: bytes) -> AudioHashPlan:
     if not frames:
         notes.append("Nessun frame MPEG valido trovato nella regione audio candidata.")
 
+    _emit_debug(
+        debug_callback,
+        f"[HASH] Fine parsing regioni escluse {source_label} | regioni_escluse={len(skipped)}",
+    )
+    _emit_telemetry_event(
+        debug_callback,
+        "HASH_PLAN_END",
+        {
+            "phase": "Parsing regioni escluse",
+            "message": f"Fine parsing regioni escluse {source_label}",
+            "plan_elapsed_seconds": max(0.0, time.monotonic() - plan_started_at),
+        },
+    )
+
     return AudioHashPlan(
         id3v2_region=id3v2,
         id3v1_region=id3v1,
@@ -118,21 +183,157 @@ def parse_audio_hash_plan(data: bytes) -> AudioHashPlan:
     )
 
 
-def compute_mpeg_audio_hash(data: bytes, min_chain_frames: int = 3) -> AudioHashResult:
-    plan = parse_audio_hash_plan(data)
+def compute_mpeg_audio_hash(
+    data: bytes,
+    min_chain_frames: int = 3,
+    *,
+    cancel_event: object | None = None,
+    debug_callback: AudioHashDebugLog | None = None,
+    source_label: str = "",
+) -> AudioHashResult:
+    started_at = time.monotonic()
+    scan_elapsed = 0.0
+    hash_elapsed = 0.0
+    _emit_debug(debug_callback, f"[HASH] Inizio calcolo {source_label} | dimensione_bytes={len(data)}")
+    _emit_telemetry_event(
+        debug_callback,
+        "HASH_START",
+        {
+            "phase": "Calcolo hash",
+            "message": f"Inizio calcolo hash {source_label}",
+            "bytes_processed": 0,
+        },
+    )
+    try:
+        plan = parse_audio_hash_plan(
+            data,
+            cancel_event=cancel_event,
+            debug_callback=debug_callback,
+            source_label=source_label,
+        )
+    except AudioHashCancelled:
+        _emit_debug(debug_callback, f"[HASH] Cancellato durante parsing regioni {source_label}")
+        _emit_telemetry_event(
+            debug_callback,
+            "CANCEL_DETECTED",
+            {
+                "phase": "Parsing regioni escluse",
+                "message": f"Cancellazione rilevata durante parsing regioni {source_label}",
+                "cancel_requested": True,
+            },
+            critical=True,
+        )
+        return AudioHashResult(
+            status=AudioHashStatus.CANCELLED,
+            audio_hash_sha256=None,
+            plan=AudioHashPlan(None, None, None, [], None, notes=["HASH_CANCELLED"]),
+            frames_count=0,
+            audio_bytes_hashed=0,
+            first_frame_offset=None,
+            last_frame_end_offset=None,
+            anomalies=["HASH_CANCELLED"],
+            non_audio_gaps=[],
+            frame_sequence=[],
+        )
     anomalies: list[str] = []
 
     skip_regions = [region for region in (plan.id3v2_region, plan.ape_region, plan.id3v1_region) if region is not None]
     skip_regions.extend(plan.winlive_regions)
     intervals = _build_candidate_intervals(len(data), skip_regions)
+    interval_start = intervals[0].start if intervals else 0
+    interval_end = intervals[-1].end if intervals else 0
 
     chains: list[list[MpegFrame]] = []
-    for interval in intervals:
-        interval_chains, interval_anomalies = _scan_mpeg_frames(data, interval.start, interval.end)
-        anomalies.extend(interval_anomalies)
-        chains.extend(interval_chains)
+    scan_parse_calls = 0
+    scan_unique_offsets = 0
+    scan_cache_hits = 0
+    scan_cache_misses = 0
+    scan_outer_iterations = 0
+    scan_inner_iterations = 0
+    scan_frames_found = 0
+    scan_frames_valid = 0
+    scan_frames_rejected = 0
+    scan_started_at = time.monotonic()
+    _emit_debug(debug_callback, f"[TECH] Fase -> Scansione frame MPEG")
+    _emit_debug(debug_callback, f"[HASH] Scanner MPEG avviato {source_label}")
+    _emit_debug(debug_callback, f"[HASH] Dimensione file {source_label} | bytes={len(data)}")
+    _emit_debug(debug_callback, f"[HASH] Offset iniziale {source_label} | offset={interval_start}")
+    _emit_debug(debug_callback, f"[HASH] Offset finale {source_label} | offset={interval_end}")
+    _emit_debug(debug_callback, f"[HASH] Numero intervalli {source_label} | intervalli={len(intervals)}")
+    _emit_debug(
+        debug_callback,
+        f"[HASH] Inizio scansione frame MPEG {source_label} | intervalli={len(intervals)}",
+    )
+    _emit_telemetry_event(
+        debug_callback,
+        "MPEG_SCAN_START",
+        {
+            "phase": "Scansione frame MPEG",
+            "message": f"Scanner MPEG avviato {source_label}",
+            "offset": interval_start,
+            "previous_offset": interval_start,
+            "next_offset": interval_start,
+            "frame_length": 0,
+            "bytes_processed": 0,
+            "percent": 0.0,
+            "speed_mb_s": 0.0,
+            "outer_iteration": 0,
+            "inner_iteration": 0,
+            "frames_found": 0,
+            "frames_valid": 0,
+            "frames_rejected": 0,
+        },
+        critical=True,
+    )
+    try:
+        for interval in intervals:
+            _check_cancel(cancel_event)
+            interval_chains, interval_anomalies, interval_stats = _scan_mpeg_frames(
+                data,
+                interval.start,
+                interval.end,
+                cancel_event=cancel_event,
+                debug_callback=debug_callback,
+                source_label=source_label,
+            )
+            anomalies.extend(interval_anomalies)
+            chains.extend(interval_chains)
+            scan_parse_calls += interval_stats.parse_calls
+            scan_unique_offsets += interval_stats.unique_offsets
+            scan_cache_hits += interval_stats.cache_hits
+            scan_cache_misses += interval_stats.cache_misses
+            scan_outer_iterations += interval_stats.outer_iterations
+            scan_inner_iterations += interval_stats.inner_iterations
+            scan_frames_found += interval_stats.frames_found
+            scan_frames_valid += interval_stats.frames_valid
+            scan_frames_rejected += interval_stats.frames_rejected
+    except AudioHashCancelled:
+        scan_elapsed = max(0.0, time.monotonic() - scan_started_at)
+        _emit_debug(debug_callback, f"[HASH] Cancellato durante scansione frame {source_label}")
+        _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame=0 | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
+        return AudioHashResult(
+            status=AudioHashStatus.CANCELLED,
+            audio_hash_sha256=None,
+            plan=plan,
+            frames_count=0,
+            audio_bytes_hashed=0,
+            first_frame_offset=None,
+            last_frame_end_offset=None,
+            anomalies=anomalies + ["HASH_CANCELLED"],
+            non_audio_gaps=[],
+            frame_sequence=[],
+        )
+
+    scan_elapsed = max(0.0, time.monotonic() - scan_started_at)
+    scan_speed_mb_s = 0.0 if scan_elapsed <= 0 else ((max(0, interval_end - interval_start) / (1024 * 1024)) / scan_elapsed)
+    _emit_debug(
+        debug_callback,
+        f"[HASH] Scanner completato in {scan_elapsed:.3f} s | {scan_speed_mb_s:.3f} MB/s | frame {scan_frames_valid} | parse calls {scan_parse_calls}",
+    )
+    _emit_debug(debug_callback, f"[HASH] Fine scansione frame MPEG {source_label} | catene={len(chains)}")
 
     if not chains:
+        _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame=0 | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
         return AudioHashResult(
             status=AudioHashStatus.NO_AUDIO_STREAM,
             audio_hash_sha256=None,
@@ -151,6 +352,7 @@ def compute_mpeg_audio_hash(data: bytes, min_chain_frames: int = 3) -> AudioHash
     ties = [chain for chain in ranked if len(chain) == len(best) and sum(frame.length for frame in chain) == sum(frame.length for frame in best)]
 
     if len(ties) > 1:
+        _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame={len(best)} | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
         return AudioHashResult(
             status=AudioHashStatus.AMBIGUOUS_AUDIO_STREAM,
             audio_hash_sha256=None,
@@ -165,7 +367,43 @@ def compute_mpeg_audio_hash(data: bytes, min_chain_frames: int = 3) -> AudioHash
         )
 
     if len(best) < min_chain_frames:
-        partial_hash = _hash_chain(data, best)
+        try:
+            hash_started_at = time.monotonic()
+            partial_hash = _hash_chain(
+                data,
+                best,
+                cancel_event=cancel_event,
+                debug_callback=debug_callback,
+                source_label=source_label,
+            )
+            hash_elapsed = max(0.0, time.monotonic() - hash_started_at)
+        except AudioHashCancelled:
+            hash_elapsed = max(0.0, time.monotonic() - hash_started_at)
+            _emit_debug(debug_callback, f"[HASH] Cancellato durante SHA-256 parziale {source_label}")
+            _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame={len(best)} | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
+            _emit_telemetry_event(
+                debug_callback,
+                "CANCEL_DETECTED",
+                {
+                    "phase": "SHA-256",
+                    "message": f"Cancellazione rilevata durante SHA-256 parziale {source_label}",
+                    "cancel_requested": True,
+                },
+                critical=True,
+            )
+            return AudioHashResult(
+                status=AudioHashStatus.CANCELLED,
+                audio_hash_sha256=None,
+                plan=plan,
+                frames_count=len(best),
+                audio_bytes_hashed=sum(frame.length for frame in best),
+                first_frame_offset=best[0].offset,
+                last_frame_end_offset=best[-1].offset + best[-1].length,
+                anomalies=anomalies + ["HASH_CANCELLED"],
+                non_audio_gaps=_compute_non_audio_gaps(best),
+                frame_sequence=best,
+            )
+        _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame={len(best)} | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
         return AudioHashResult(
             status=AudioHashStatus.PARTIAL_AUDIO_STREAM,
             audio_hash_sha256=partial_hash,
@@ -179,9 +417,77 @@ def compute_mpeg_audio_hash(data: bytes, min_chain_frames: int = 3) -> AudioHash
             frame_sequence=best,
         )
 
+    try:
+        hash_started_at = time.monotonic()
+        final_hash = _hash_chain(
+            data,
+            best,
+            cancel_event=cancel_event,
+            debug_callback=debug_callback,
+            source_label=source_label,
+        )
+        hash_elapsed = max(0.0, time.monotonic() - hash_started_at)
+    except AudioHashCancelled:
+        hash_elapsed = max(0.0, time.monotonic() - hash_started_at)
+        _emit_debug(debug_callback, f"[HASH] Cancellato durante SHA-256 finale {source_label}")
+        _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame={len(best)} | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
+        _emit_telemetry_event(
+            debug_callback,
+            "CANCEL_DETECTED",
+            {
+                "phase": "SHA-256",
+                "message": f"Cancellazione rilevata durante SHA-256 finale {source_label}",
+                "cancel_requested": True,
+            },
+            critical=True,
+        )
+        return AudioHashResult(
+            status=AudioHashStatus.CANCELLED,
+            audio_hash_sha256=None,
+            plan=plan,
+            frames_count=len(best),
+            audio_bytes_hashed=sum(frame.length for frame in best),
+            first_frame_offset=best[0].offset,
+            last_frame_end_offset=best[-1].offset + best[-1].length,
+            anomalies=anomalies + ["HASH_CANCELLED"],
+            non_audio_gaps=_compute_non_audio_gaps(best),
+            frame_sequence=best,
+        )
+
+    elapsed = max(0.0, time.monotonic() - started_at)
+    _emit_debug(debug_callback, f"[HASH] Scanner terminato {source_label} | numero_frame={len(best)} | tempo_scansione_s={scan_elapsed:.3f} | tempo_hash_s={hash_elapsed:.3f}")
+    _emit_telemetry_event(
+        debug_callback,
+        "HASH_END",
+        {
+            "phase": "Calcolo hash",
+            "message": f"Fine calcolo hash {source_label}",
+            "frames_found": len(best),
+            "frames_valid": len(best),
+            "frames_rejected": len(anomalies),
+            "audio_bytes_hashed": sum(frame.length for frame in best),
+            "hash_total_elapsed_seconds": elapsed,
+            "scan_elapsed_seconds": scan_elapsed,
+            "sha_elapsed_seconds": hash_elapsed,
+            "parse_calls_total": scan_parse_calls,
+            "unique_offsets_total": scan_unique_offsets,
+            "parse_cache_hits": scan_cache_hits,
+            "parse_cache_misses": scan_cache_misses,
+            "scanner_outer_iterations": scan_outer_iterations,
+            "scanner_inner_iterations": scan_inner_iterations,
+            "scanner_average_speed_mb_s": scan_speed_mb_s,
+            "bytes_processed": best[-1].offset + best[-1].length if best else 0,
+            "offset": best[-1].offset + best[-1].length if best else 0,
+            "speed_mb_s": 0.0 if elapsed <= 0 else (sum(frame.length for frame in best) / (1024 * 1024)) / elapsed,
+        },
+    )
+    _emit_debug(
+        debug_callback,
+        f"[HASH] Fine calcolo {source_label} | frame={len(best)} | byte_audio={sum(frame.length for frame in best)} | durata_s={elapsed:.3f}",
+    )
     return AudioHashResult(
         status=AudioHashStatus.VALID_AUDIO_STREAM,
-        audio_hash_sha256=_hash_chain(data, best),
+        audio_hash_sha256=final_hash,
         plan=plan,
         frames_count=len(best),
         audio_bytes_hashed=sum(frame.length for frame in best),
@@ -260,38 +566,442 @@ def _detect_winlive_regions(data: bytes) -> list[ByteRegion]:
     return regions
 
 
-def _scan_mpeg_frames(data: bytes, start: int, end: int) -> tuple[list[list[MpegFrame]], list[str]]:
+def _scan_mpeg_frames(
+    data: bytes,
+    start: int,
+    end: int,
+    *,
+    cancel_event: object | None = None,
+    debug_callback: AudioHashDebugLog | None = None,
+    source_label: str = "",
+) -> tuple[list[list[MpegFrame]], list[str], MpegScanStats]:
     chains: dict[tuple[int, int, int], list[MpegFrame]] = {}
     anomalies: list[str] = []
     offset = max(0, start)
     limit = min(len(data), end)
+    scan_origin = offset
+    scan_started_at = time.monotonic()
+    outer_iterations = 0
+    max_outer_iterations = max(1, (limit - offset) + 1)
+    frames_found = 0
+    frames_valid = 0
+    frames_discarded = 0
+    last_next_offset = offset
+    last_frame_length = 0
+    previous_offset = offset
+    total_inner_iterations = 0
+    last_heartbeat_at = scan_started_at - 1.0
+    parse_cache: dict[int, tuple[MpegFrame | None, str | None]] = {}
+    parse_cache_hits = 0
+    parse_cache_misses = 0
+
+    def _parse_with_cache(target_offset: int) -> tuple[MpegFrame | None, str | None]:
+        nonlocal parse_cache_hits, parse_cache_misses
+        cached = parse_cache.get(target_offset)
+        if cached is not None:
+            parse_cache_hits += 1
+            return cached
+        parsed = _parse_frame_at(data, target_offset)
+        parse_cache[target_offset] = parsed
+        parse_cache_misses += 1
+        return parsed
+
+    def _emit_heartbeat(force: bool = False) -> None:
+        nonlocal last_heartbeat_at
+        now = time.monotonic()
+        if not force and (now - last_heartbeat_at) < 1.0:
+            return
+        elapsed = max(0.0, now - scan_started_at)
+        bytes_processed = max(0, offset - scan_origin)
+        interval_size = max(1, limit - scan_origin)
+        percent = min(100.0, max(0.0, (bytes_processed / float(interval_size)) * 100.0))
+        speed_mb_s = 0.0 if elapsed <= 0 else (bytes_processed / (1024 * 1024)) / elapsed
+        cancel_requested = bool(cancel_event is not None and hasattr(cancel_event, "is_set") and cancel_event.is_set())
+        _emit_telemetry_event(
+            debug_callback,
+            "MPEG_SCAN_HEARTBEAT",
+            {
+                "phase": "Scansione frame MPEG",
+                "message": "Heartbeat scanner MPEG",
+                "offset": offset,
+                "previous_offset": previous_offset,
+                "next_offset": last_next_offset,
+                "frame_length": last_frame_length,
+                "outer_iteration": outer_iterations,
+                "inner_iteration": total_inner_iterations,
+                "parse_calls_total": parse_cache_misses,
+                "unique_offsets_total": len(parse_cache),
+                "parse_cache_hits": parse_cache_hits,
+                "parse_cache_misses": parse_cache_misses,
+                "frames_found": frames_found,
+                "frames_valid": frames_valid,
+                "frames_rejected": frames_discarded,
+                "bytes_processed": bytes_processed,
+                "percent": percent,
+                "speed_mb_s": speed_mb_s,
+                "cancel_requested": cancel_requested,
+                "thread_id": threading.get_ident(),
+                "monotonic_elapsed": elapsed,
+            },
+        )
+        last_heartbeat_at = now
 
     while offset + 4 <= limit:
-        frame, parse_anomaly = _parse_frame_at(data, offset)
+        try:
+            _check_cancel(cancel_event)
+        except AudioHashCancelled:
+            _emit_heartbeat(force=True)
+            _emit_telemetry_event(
+                debug_callback,
+                "CANCEL_DETECTED",
+                {
+                    "phase": "Interrotto",
+                    "last_phase": "Scansione frame MPEG",
+                    "message": f"Cancellazione rilevata durante scansione frame {source_label}",
+                    "offset": offset,
+                    "previous_offset": previous_offset,
+                    "next_offset": last_next_offset,
+                    "frame_length": last_frame_length,
+                    "outer_iteration": outer_iterations,
+                    "inner_iteration": total_inner_iterations,
+                    "parse_calls_total": parse_cache_misses,
+                    "unique_offsets_total": len(parse_cache),
+                    "parse_cache_hits": parse_cache_hits,
+                    "parse_cache_misses": parse_cache_misses,
+                    "frames_found": frames_found,
+                    "frames_valid": frames_valid,
+                    "frames_rejected": frames_discarded,
+                    "bytes_processed": max(0, offset - scan_origin),
+                    "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                    "speed_mb_s": 0.0 if (time.monotonic() - scan_started_at) <= 0 else ((max(0, offset - scan_origin) / (1024 * 1024)) / max(0.000001, time.monotonic() - scan_started_at)),
+                    "cancel_requested": True,
+                    "thread_id": threading.get_ident(),
+                    "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                },
+                critical=True,
+            )
+            raise
+        outer_iterations += 1
+        _emit_heartbeat()
+        if outer_iterations > max_outer_iterations:
+            anomalies.append(f"OUTER_SCAN_GUARD_TRIGGERED_{offset}")
+            _emit_debug(debug_callback, f"[HASH] Limite massimo iterazioni raggiunto {source_label} | outer_iteration={outer_iterations} | offset={offset}")
+            _emit_telemetry_event(
+                debug_callback,
+                "ERROR",
+                {
+                    "phase": "Scansione frame MPEG",
+                    "message": "Limite massimo iterazioni raggiunto nel ciclo esterno.",
+                    "offset": offset,
+                    "previous_offset": previous_offset,
+                    "next_offset": last_next_offset,
+                    "frame_length": last_frame_length,
+                    "outer_iteration": outer_iterations,
+                    "inner_iteration": total_inner_iterations,
+                    "frames_found": frames_found,
+                    "frames_valid": frames_valid,
+                    "frames_rejected": frames_discarded,
+                    "bytes_processed": max(0, offset - scan_origin),
+                    "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                    "speed_mb_s": 0.0,
+                    "thread_id": threading.get_ident(),
+                },
+                critical=True,
+            )
+            break
+
+        frame, parse_anomaly = _parse_with_cache(offset)
         if parse_anomaly is not None:
             anomalies.append(parse_anomaly)
+            frames_discarded += 1
         if frame is None:
+            previous_offset = offset
             offset += 1
+            if offset <= previous_offset:
+                _emit_debug(debug_callback, f"[HASH] OFFSET_NON_AVANZA {source_label} | old_offset={previous_offset} | new_offset={offset} | frame_length={last_frame_length} | next_offset={last_next_offset}")
+                _emit_telemetry_event(
+                    debug_callback,
+                    "NON_PROGRESS",
+                    {
+                        "phase": "Scansione frame MPEG",
+                        "message": "OFFSET_NON_AVANZA",
+                        "offset": offset,
+                        "previous_offset": previous_offset,
+                        "next_offset": last_next_offset,
+                        "frame_length": last_frame_length,
+                        "outer_iteration": outer_iterations,
+                        "inner_iteration": total_inner_iterations,
+                        "frames_found": frames_found,
+                        "frames_valid": frames_valid,
+                        "frames_rejected": frames_discarded,
+                        "bytes_processed": max(0, offset - scan_origin),
+                        "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                        "speed_mb_s": 0.0,
+                        "cancel_requested": False,
+                        "thread_id": threading.get_ident(),
+                        "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                    },
+                    critical=True,
+                )
+            continue
+
+        frames_found += 1
+        last_frame_length = frame.length
+        if frame.length <= 0:
+            anomalies.append(f"NON_PROGRESSIVE_FRAME_LEN_{offset}")
+            frames_discarded += 1
+            _emit_debug(debug_callback, f"[HASH] Frame non valido {source_label} | offset={offset} | frame_length={frame.length} | motivo=FRAME_LENGTH_NON_VALIDO")
+            previous_offset = offset
+            offset += 1
+            _emit_telemetry_event(
+                debug_callback,
+                "NON_PROGRESS",
+                {
+                    "phase": "Scansione frame MPEG",
+                    "message": "FRAME_LENGTH_NON_VALIDO",
+                    "offset": offset,
+                    "previous_offset": previous_offset,
+                    "next_offset": last_next_offset,
+                    "frame_length": frame.length,
+                    "outer_iteration": outer_iterations,
+                    "inner_iteration": total_inner_iterations,
+                    "frames_found": frames_found,
+                    "frames_valid": frames_valid,
+                    "frames_rejected": frames_discarded,
+                    "bytes_processed": max(0, offset - scan_origin),
+                    "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                    "speed_mb_s": 0.0,
+                    "thread_id": threading.get_ident(),
+                    "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                },
+                critical=True,
+            )
             continue
 
         chain = [frame]
         next_offset = frame.offset + frame.length
+        last_next_offset = next_offset
+        if next_offset <= offset:
+            anomalies.append(f"NON_PROGRESSIVE_NEXT_OFFSET_{offset}_{next_offset}")
+            frames_discarded += 1
+            _emit_debug(debug_callback, f"[HASH] Frame non valido {source_label} | offset={offset} | frame_length={frame.length} | motivo=NEXT_OFFSET_NON_PROGRESSIVO")
+            _emit_telemetry_event(
+                debug_callback,
+                "NON_PROGRESS",
+                {
+                    "phase": "Scansione frame MPEG",
+                    "message": "NEXT_OFFSET_NON_PROGRESSIVO",
+                    "offset": offset,
+                    "previous_offset": previous_offset,
+                    "next_offset": next_offset,
+                    "frame_length": frame.length,
+                    "outer_iteration": outer_iterations,
+                    "inner_iteration": total_inner_iterations,
+                    "frames_found": frames_found,
+                    "frames_valid": frames_valid,
+                    "frames_rejected": frames_discarded,
+                    "bytes_processed": max(0, offset - scan_origin),
+                    "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                    "speed_mb_s": 0.0,
+                    "thread_id": threading.get_ident(),
+                    "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                },
+                critical=True,
+            )
+            previous_offset = offset
+            offset += 1
+            continue
+
+        inner_iterations = 0
         while next_offset + 4 <= limit:
-            next_frame, next_anomaly = _parse_frame_at(data, next_offset)
+            try:
+                _check_cancel(cancel_event)
+            except AudioHashCancelled:
+                _emit_heartbeat(force=True)
+                _emit_telemetry_event(
+                    debug_callback,
+                    "CANCEL_DETECTED",
+                    {
+                        "phase": "Interrotto",
+                        "last_phase": "Scansione frame MPEG",
+                        "message": f"Cancellazione rilevata durante scansione frame {source_label}",
+                        "offset": offset,
+                        "previous_offset": previous_offset,
+                        "next_offset": next_offset,
+                        "frame_length": last_frame_length,
+                        "outer_iteration": outer_iterations,
+                        "inner_iteration": total_inner_iterations,
+                        "parse_calls_total": parse_cache_misses,
+                        "unique_offsets_total": len(parse_cache),
+                        "parse_cache_hits": parse_cache_hits,
+                        "parse_cache_misses": parse_cache_misses,
+                        "frames_found": frames_found,
+                        "frames_valid": frames_valid,
+                        "frames_rejected": frames_discarded,
+                        "bytes_processed": max(0, offset - scan_origin),
+                        "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                        "speed_mb_s": 0.0 if (time.monotonic() - scan_started_at) <= 0 else ((max(0, offset - scan_origin) / (1024 * 1024)) / max(0.000001, time.monotonic() - scan_started_at)),
+                        "cancel_requested": True,
+                        "thread_id": threading.get_ident(),
+                        "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                    },
+                    critical=True,
+                )
+                raise
+            inner_iterations += 1
+            total_inner_iterations += 1
+            _emit_heartbeat()
+
+            next_frame, next_anomaly = _parse_with_cache(next_offset)
             if next_anomaly is not None:
                 anomalies.append(next_anomaly)
+                frames_discarded += 1
             if next_frame is None:
+                break
+            if next_frame.length <= 0:
+                anomalies.append(f"NON_PROGRESSIVE_CHAIN_FRAME_LEN_{next_offset}")
+                frames_discarded += 1
+                _emit_debug(debug_callback, f"[HASH] Frame non valido {source_label} | offset={next_offset} | frame_length={next_frame.length} | motivo=FRAME_LENGTH_NON_VALIDO")
+                _emit_telemetry_event(
+                    debug_callback,
+                    "NON_PROGRESS",
+                    {
+                        "phase": "Scansione frame MPEG",
+                        "message": "FRAME_LENGTH_NON_VALIDO",
+                        "offset": offset,
+                        "previous_offset": previous_offset,
+                        "next_offset": next_offset,
+                        "frame_length": next_frame.length,
+                        "outer_iteration": outer_iterations,
+                        "inner_iteration": total_inner_iterations,
+                        "frames_found": frames_found,
+                        "frames_valid": frames_valid,
+                        "frames_rejected": frames_discarded,
+                        "bytes_processed": max(0, offset - scan_origin),
+                        "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                        "speed_mb_s": 0.0,
+                        "thread_id": threading.get_ident(),
+                        "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                    },
+                    critical=True,
+                )
                 break
             if not _is_chain_compatible(chain[-1], next_frame):
                 break
             chain.append(next_frame)
-            next_offset = next_frame.offset + next_frame.length
+            candidate_next_offset = next_frame.offset + next_frame.length
+            last_frame_length = next_frame.length
+            last_next_offset = candidate_next_offset
+            if candidate_next_offset <= next_offset:
+                anomalies.append(f"NON_PROGRESSIVE_CHAIN_OFFSET_{next_offset}_{candidate_next_offset}")
+                frames_discarded += 1
+                _emit_debug(debug_callback, f"[HASH] Frame non valido {source_label} | offset={next_offset} | frame_length={next_frame.length} | motivo=NEXT_OFFSET_NON_PROGRESSIVO")
+                _emit_telemetry_event(
+                    debug_callback,
+                    "NON_PROGRESS",
+                    {
+                        "phase": "Scansione frame MPEG",
+                        "message": "NEXT_OFFSET_NON_PROGRESSIVO",
+                        "offset": offset,
+                        "previous_offset": previous_offset,
+                        "next_offset": candidate_next_offset,
+                        "frame_length": next_frame.length,
+                        "outer_iteration": outer_iterations,
+                        "inner_iteration": total_inner_iterations,
+                        "frames_found": frames_found,
+                        "frames_valid": frames_valid,
+                        "frames_rejected": frames_discarded,
+                        "bytes_processed": max(0, offset - scan_origin),
+                        "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                        "speed_mb_s": 0.0,
+                        "thread_id": threading.get_ident(),
+                        "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                    },
+                    critical=True,
+                )
+                break
+            next_offset = candidate_next_offset
 
         key = (chain[0].offset, chain[-1].offset + chain[-1].length, len(chain))
         chains[key] = chain
-        offset += 1
+        frames_valid += len(chain)
 
-    return list(chains.values()), anomalies
+        previous_offset = offset
+        new_offset = chain[-1].offset + chain[-1].length
+        if new_offset <= offset:
+            anomalies.append(f"OUTER_OFFSET_NOT_ADVANCING_{offset}_{new_offset}")
+            frames_discarded += 1
+            _emit_debug(debug_callback, f"[HASH] Frame non valido {source_label} | offset={offset} | frame_length={frame.length} | motivo=OFFSET_NON_AVANZA")
+            offset += 1
+            _emit_telemetry_event(
+                debug_callback,
+                "NON_PROGRESS",
+                {
+                    "phase": "Scansione frame MPEG",
+                    "message": "OFFSET_NON_AVANZA",
+                    "offset": offset,
+                    "previous_offset": previous_offset,
+                    "next_offset": next_offset,
+                    "frame_length": frame.length,
+                    "outer_iteration": outer_iterations,
+                    "inner_iteration": total_inner_iterations,
+                    "frames_found": frames_found,
+                    "frames_valid": frames_valid,
+                    "frames_rejected": frames_discarded,
+                    "bytes_processed": max(0, offset - scan_origin),
+                    "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+                    "speed_mb_s": 0.0,
+                    "thread_id": threading.get_ident(),
+                    "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+                },
+                critical=True,
+            )
+        else:
+            offset = new_offset
+
+    _emit_telemetry_event(
+        debug_callback,
+        "MPEG_SCAN_END",
+        {
+            "phase": "Scansione frame MPEG",
+            "message": f"Scanner MPEG terminato {source_label}",
+            "offset": offset,
+            "previous_offset": previous_offset,
+            "next_offset": last_next_offset,
+            "frame_length": last_frame_length,
+            "outer_iteration": outer_iterations,
+            "inner_iteration": total_inner_iterations,
+            "parse_calls_total": parse_cache_misses,
+            "unique_offsets_total": len(parse_cache),
+            "parse_cache_hits": parse_cache_hits,
+            "parse_cache_misses": parse_cache_misses,
+            "frames_found": frames_found,
+            "frames_valid": frames_valid,
+            "frames_rejected": frames_discarded,
+            "bytes_processed": max(0, offset - scan_origin),
+            "percent": min(100.0, max(0.0, (max(0, offset - scan_origin) / float(max(1, limit - scan_origin))) * 100.0)),
+            "speed_mb_s": 0.0 if (time.monotonic() - scan_started_at) <= 0 else ((max(0, offset - scan_origin) / (1024 * 1024)) / max(0.000001, time.monotonic() - scan_started_at)),
+            "thread_id": threading.get_ident(),
+            "monotonic_elapsed": max(0.0, time.monotonic() - scan_started_at),
+        },
+    )
+
+    elapsed = max(0.0, time.monotonic() - scan_started_at)
+    stats = MpegScanStats(
+        parse_calls=parse_cache_misses,
+        unique_offsets=len(parse_cache),
+        cache_hits=parse_cache_hits,
+        cache_misses=parse_cache_misses,
+        outer_iterations=outer_iterations,
+        inner_iterations=total_inner_iterations,
+        frames_found=frames_found,
+        frames_valid=frames_valid,
+        frames_rejected=frames_discarded,
+        scanner_elapsed_seconds=elapsed,
+        average_speed_mb_s=0.0 if elapsed <= 0 else ((max(0, offset - scan_origin) / (1024 * 1024)) / elapsed),
+    )
+
+    return list(chains.values()), anomalies, stats
 
 
 def _build_candidate_intervals(total_len: int, skipped: list[ByteRegion]) -> list[ByteRegion]:
@@ -329,11 +1039,41 @@ def _merge_regions(regions: list[ByteRegion], total_len: int) -> list[ByteRegion
     return merged
 
 
-def _hash_chain(data: bytes, chain: list[MpegFrame]) -> str:
+def _hash_chain(
+    data: bytes,
+    chain: list[MpegFrame],
+    *,
+    cancel_event: object | None = None,
+    debug_callback: AudioHashDebugLog | None = None,
+    source_label: str = "",
+) -> str:
     digest = hashlib.sha256()
+    processed_bytes = 0
+    last_debug_bytes = 0
     for frame in chain:
+        _check_cancel(cancel_event)
         digest.update(data[frame.offset : frame.offset + frame.length])
+        processed_bytes += frame.length
+        if processed_bytes - last_debug_bytes >= 5 * 1024 * 1024:
+            _emit_debug(debug_callback, f"[HASH] SHA avanzamento {source_label} | byte_audio={processed_bytes}")
+            last_debug_bytes = processed_bytes
+    _emit_debug(debug_callback, f"[HASH] Fine SHA-256 {source_label} | byte_audio={processed_bytes}")
     return digest.hexdigest()
+
+
+def _check_cancel(cancel_event: object | None) -> None:
+    if cancel_event is not None and hasattr(cancel_event, "is_set") and bool(cancel_event.is_set()):
+        raise AudioHashCancelled("HASH_CANCELLED")
+
+
+def _emit_debug(callback: AudioHashDebugLog | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
+def _emit_telemetry_event(callback: AudioHashDebugLog | None, event_type: str, payload: dict[str, object], critical: bool = False) -> None:
+    if callback is not None and hasattr(callback, "telemetry_event"):
+        callback.telemetry_event(event_type, payload, critical=critical)
 
 
 def _compute_non_audio_gaps(chain: list[MpegFrame]) -> list[ByteRegion]:

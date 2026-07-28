@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum
 import re
+from typing import Any
 
 
 class LineSeparator(str, Enum):
@@ -48,6 +50,15 @@ class SynctNormalizationResult:
     empty_timed_line_values: list[int] = field(default_factory=list)
     alignment_events: list[dict[str, object]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    canonicalization_iterations: int = 0
+    canonicalization_stabilized: bool = True
+    canonicalization_cycle_detected: bool = False
+    canonicalization_cycle_at_iteration: int = 0
+    canonicalization_state_hashes: list[str] = field(default_factory=list)
+    canonicalization_pass_summaries: list[dict[str, Any]] = field(default_factory=list)
+
+
+MAX_CANONICALIZATION_PASSES = 8
 
 
 def detect_line_separator(content: str) -> LineSeparator:
@@ -69,43 +80,79 @@ def normalize_synct_content(content: str) -> SynctNormalizationResult:
     counters = NormalizationCounters()
     notes: list[str] = []
 
-    prefix, body = _split_initial_value_prefix(content)
-    body_without_terminator, protected_terminator = _strip_final_synct_terminator(body)
-    body_without_empty_lines, empty_detected, empty_removed, empty_values = _remove_empty_timed_lines(body_without_terminator)
-    collapsed_body, reduced_chains, removed_tags = _collapse_adjacent_time_chains(body_without_empty_lines)
-    normalized_body, post_empty_detected, post_empty_removed, post_empty_values = _remove_empty_timed_lines(collapsed_body)
-    aligned_body, alignment_events = _align_link_timestamps_between_rows(
-        normalized_body,
-        separator,
-        counters,
-    )
+    current = content
+    seen_hashes: dict[str, int] = {}
+    state_hashes: list[str] = []
+    pass_summaries: list[dict[str, Any]] = []
+    all_empty_values: list[int] = []
+    all_alignment_events: list[dict[str, object]] = []
+    stabilized = False
+    cycle_detected = False
+    cycle_at_iteration = 0
 
-    counters.adjacent_time_chains_reduced = reduced_chains
-    counters.adjacent_time_tags_removed = removed_tags
-    counters.consecutive_time_reductions = removed_tags
-    counters.empty_timed_lines_detected = empty_detected + post_empty_detected
-    counters.empty_timed_lines_removed = empty_removed + post_empty_removed
-    all_empty_values = empty_values + post_empty_values
+    for iteration in range(1, MAX_CANONICALIZATION_PASSES + 1):
+        input_hash = _hash_text(current)
+        state_hashes.append(input_hash)
+        seen_hashes[input_hash] = iteration
 
-    normalized_text = prefix + aligned_body + protected_terminator
+        next_value, pass_info = _apply_canonical_rules_once(
+            current,
+            separator,
+            iteration,
+        )
+        _accumulate_counters(counters, pass_info["counters"])
+        all_empty_values.extend(pass_info["empty_values"])
+        all_alignment_events.extend(pass_info["alignment_events"])
+        pass_summaries.append(pass_info)
+
+        if next_value == current:
+            stabilized = True
+            break
+
+        output_hash = _hash_text(next_value)
+        if output_hash in seen_hashes:
+            cycle_detected = True
+            cycle_at_iteration = iteration
+            state_hashes.append(output_hash)
+            current = next_value
+            break
+
+        current = next_value
+
+    normalized_text = current
     changed = normalized_text != content
     text_valid = contains_semantic_text(normalized_text)
 
-    if reduced_chains > 0:
+    if counters.adjacent_time_chains_reduced > 0:
         notes.append(
-            f"Ridotte {reduced_chains} catene di TAG temporali adiacenti ({removed_tags} TAG rimossi)."
+            "Ridotte "
+            f"{counters.adjacent_time_chains_reduced} catene di TAG temporali adiacenti "
+            f"({counters.adjacent_time_tags_removed} TAG rimossi)."
         )
     if counters.empty_timed_lines_removed > 0:
         notes.append(
             f"Eliminate {counters.empty_timed_lines_removed} righe composte solo da TAG temporale ({all_empty_values})."
         )
-    if alignment_events:
+    if all_alignment_events:
         notes.append(
-            f"Allineati {len(alignment_events)} timestamp finali di collegamento tra righe testuali consecutive."
+            f"Allineati {len(all_alignment_events)} timestamp finali di collegamento tra righe testuali consecutive."
         )
 
-    temporal_attempted = reduced_chains > 0 or counters.empty_timed_lines_removed > 0 or bool(alignment_events)
-    temporal_ok = True
+    if stabilized:
+        notes.append(f"Canonicalizzazione stabile in {len(pass_summaries)} passate.")
+    elif cycle_detected:
+        notes.append(
+            "Canonicalizzazione non stabile: ciclo rilevato "
+            f"alla passata {cycle_at_iteration} (max={MAX_CANONICALIZATION_PASSES})."
+        )
+    else:
+        notes.append(
+            "Canonicalizzazione non stabile entro il limite massimo "
+            f"di {MAX_CANONICALIZATION_PASSES} passate."
+        )
+
+    temporal_attempted = any(pass_info["changed"] for pass_info in pass_summaries)
+    temporal_ok = stabilized and text_valid and not cycle_detected
 
     return SynctNormalizationResult(
         line_separator=separator,
@@ -116,9 +163,125 @@ def normalize_synct_content(content: str) -> SynctNormalizationResult:
         temporal_normalization_succeeded=temporal_ok,
         counters=counters,
         empty_timed_line_values=all_empty_values,
-        alignment_events=alignment_events,
+        alignment_events=all_alignment_events,
         notes=notes,
+        canonicalization_iterations=len(pass_summaries),
+        canonicalization_stabilized=stabilized,
+        canonicalization_cycle_detected=cycle_detected,
+        canonicalization_cycle_at_iteration=cycle_at_iteration,
+        canonicalization_state_hashes=state_hashes,
+        canonicalization_pass_summaries=pass_summaries,
     )
+
+
+def build_logical_line_diffs(before: str, after: str, *, max_items: int = 200) -> list[dict[str, Any]]:
+    before_lines = _split_lines(before)
+    after_lines = _split_lines(after)
+    max_len = max(len(before_lines), len(after_lines))
+    diffs: list[dict[str, Any]] = []
+
+    for idx in range(max_len):
+        old = before_lines[idx] if idx < len(before_lines) else None
+        new = after_lines[idx] if idx < len(after_lines) else None
+        if old == new:
+            continue
+
+        if old is None:
+            operation = "added"
+        elif new is None:
+            operation = "removed"
+        else:
+            operation = "changed"
+
+        diffs.append(
+            {
+                "logical_line": idx + 1,
+                "operation": operation,
+                "before": old,
+                "after": new,
+                "tags_before": _extract_time_tags(old or ""),
+                "tags_after": _extract_time_tags(new or ""),
+                "old_index": idx + 1 if old is not None else None,
+                "new_index": idx + 1 if new is not None else None,
+            }
+        )
+        if len(diffs) >= max_items:
+            break
+
+    return diffs
+
+
+def _extract_time_tags(line: str) -> list[int]:
+    return [int(match.group(1)) for match in _TOKEN_TIME_RE.finditer(line or "")]
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _accumulate_counters(total: NormalizationCounters, delta: NormalizationCounters) -> None:
+    total.non_significant_rows_removed += delta.non_significant_rows_removed
+    total.consecutive_time_reductions += delta.consecutive_time_reductions
+    total.adjacent_time_chains_reduced += delta.adjacent_time_chains_reduced
+    total.adjacent_time_tags_removed += delta.adjacent_time_tags_removed
+    total.left_trims += delta.left_trims
+    total.right_trims += delta.right_trims
+    total.previous_row_end_adjustments += delta.previous_row_end_adjustments
+    total.current_row_start_adjustments += delta.current_row_start_adjustments
+    total.empty_timed_lines_detected += delta.empty_timed_lines_detected
+    total.empty_timed_lines_removed += delta.empty_timed_lines_removed
+
+
+def _apply_canonical_rules_once(
+    content: str,
+    separator: LineSeparator,
+    iteration: int,
+) -> tuple[str, dict[str, Any]]:
+    pass_counters = NormalizationCounters()
+    prefix, body = _split_initial_value_prefix(content)
+    body_without_terminator, protected_terminator = _strip_final_synct_terminator(body)
+
+    body_a, empty_detected_a, empty_removed_a, empty_values_a = _remove_empty_timed_lines(body_without_terminator)
+    body_b, reduced_chains_a, removed_tags_a = _collapse_adjacent_time_chains(body_a)
+    body_c, empty_detected_b, empty_removed_b, empty_values_b = _remove_empty_timed_lines(body_b)
+    body_d, alignment_events = _align_link_timestamps_between_rows(body_c, separator, pass_counters)
+    body_e, reduced_chains_b, removed_tags_b = _collapse_adjacent_time_chains(body_d)
+    body_f, empty_detected_c, empty_removed_c, empty_values_c = _remove_empty_timed_lines(body_e)
+
+    pass_counters.adjacent_time_chains_reduced = reduced_chains_a + reduced_chains_b
+    pass_counters.adjacent_time_tags_removed = removed_tags_a + removed_tags_b
+    pass_counters.consecutive_time_reductions = removed_tags_a + removed_tags_b
+    pass_counters.empty_timed_lines_detected = empty_detected_a + empty_detected_b + empty_detected_c
+    pass_counters.empty_timed_lines_removed = empty_removed_a + empty_removed_b + empty_removed_c
+
+    next_value = prefix + body_f + protected_terminator
+    changed = next_value != content
+    modification_count = (
+        pass_counters.adjacent_time_tags_removed
+        + pass_counters.empty_timed_lines_removed
+        + pass_counters.previous_row_end_adjustments
+        + pass_counters.current_row_start_adjustments
+    )
+    phase = "stable"
+    if pass_counters.empty_timed_lines_removed > 0:
+        phase = "remove_empty_timed_rows"
+    elif pass_counters.adjacent_time_tags_removed > 0:
+        phase = "collapse_adjacent_time_chains"
+    elif alignment_events:
+        phase = "align_consecutive_text_rows"
+
+    pass_info = {
+        "iteration": iteration,
+        "changed": changed,
+        "phase": phase,
+        "modification_count": modification_count,
+        "counters": pass_counters,
+        "empty_values": empty_values_a + empty_values_b + empty_values_c,
+        "alignment_events": alignment_events,
+        "input_hash": _hash_text(content),
+        "output_hash": _hash_text(next_value),
+    }
+    return next_value, pass_info
 
 
 def contains_semantic_text(content: str) -> bool:
@@ -427,7 +590,9 @@ def _align_link_timestamps_between_rows(
     modified_rows: set[int] = set()
 
     textual_indices = [idx for idx, row in enumerate(row_states) if row.has_significant_text]
-    for pos in range(len(textual_indices) - 1):
+    # Align from bottom to top so changes on a single-timestamp row are
+    # immediately visible to the previous row in the same canonical pass.
+    for pos in range(len(textual_indices) - 2, -1, -1):
         prev_idx = textual_indices[pos]
         next_idx = textual_indices[pos + 1]
         previous = row_states[prev_idx]
@@ -467,6 +632,8 @@ def _align_link_timestamps_between_rows(
 
     if not events:
         return content, []
+
+    events.sort(key=lambda item: int(item.get("line_current", 0)))
 
     updated_lines: list[str] = []
     for idx, row in enumerate(row_states):

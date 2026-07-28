@@ -19,6 +19,7 @@ import csv
 import json
 import os
 import io
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, SINGLE, filedialog, messagebox
@@ -41,16 +42,13 @@ from project_manager import (
 from settings import SettingsManager
 from tooltip import Tooltip
 from utils import AdaptiveTimeEstimator, scan_mp3_files
-from worker import MixWorker, SongExtractionWorker, MP3DiagnosticsWorker
+from worker import MixWorker, SongExtractionWorker, MP3DiagnosticsWorker, MP3RecoveryWorker
+from mp3_recovery_batch import MP3BatchOutcome
+from mp3_recovery import RecoveryMode
 from mp3_diagnostics import (
     STATUS_PERFECT,
     STATUS_REPAIRED,
     STATUS_UNRECOVERABLE,
-)
-from selective_reverify import (
-    SelectiveReverifyError,
-    SelectiveReverifySelection,
-    prepare_selective_reverify_selection,
 )
 
 
@@ -115,6 +113,55 @@ class MixCreatorApp(ctk.CTk):
         self._extract_progress_cancel_button = None
         self._extract_tracks_snapshot: list[dict[str, Any]] = []
         self._extract_has_temporal_mode = False
+        self.recovery_worker = MP3RecoveryWorker(
+            on_progress=self._recovery_worker_progress,
+            on_completed=self._recovery_worker_completed,
+            on_error=self._recovery_worker_error,
+            on_cancelled=self._recovery_worker_cancelled,
+            on_log=self._recovery_worker_log,
+        )
+        self._recovery_dialog: ctk.CTkToplevel | None = None
+        self._recovery_problematic_entry = None
+        self._recovery_original_entry = None
+        self._recovery_output_entry = None
+        self._recovery_mode_var = tk.StringVar(value=RecoveryMode.NORMAL.value)
+        self._recovery_mode_normal_radio = None
+        self._recovery_mode_forced_radio = None
+        self._recovery_forced_confirmation_dialog = None
+        self._recovery_status_label = None
+        self._recovery_counters_label = None
+        self._recovery_progress_bar = None
+        self._recovery_log_box = None
+        self._recovery_start_button = None
+        self._recovery_stop_button = None
+        self._recovery_close_button = None
+        self._recovery_open_results_button = None
+        self._recovery_command_bar = None
+        self._recovery_monitor_frame = None
+        self._recovery_examined_label = None
+        self._recovery_completed_label = None
+        self._recovery_batch_status_label = None
+        self._recovery_current_file_label = None
+        self._recovery_phase_label = None
+        self._recovery_elapsed_label = None
+        self._recovery_current_file_elapsed_label = None
+        self._recovery_eta_label = None
+        self._recovery_percent_label = None
+        self._recovery_path_widgets: list[Any] = []
+        self._recovery_live_counters: dict[str, int] = {}
+        self._recovery_started_at: float | None = None
+        self._recovery_current_file_started_at: float | None = None
+        self._recovery_timer_job = None
+        self._recovery_total_files = 0
+        self._recovery_examined_files = 0
+        self._recovery_completed_files = 0
+        self._recovery_current_file_name = "-"
+        self._recovery_current_phase = "Pronto"
+        self._recovery_completed_file_durations: list[float] = []
+        self._recovery_session_folder: str | None = None
+        self._recovery_allow_session_log_updates = False
+        self._recovery_expected_output_root = ""
+        self._recovery_min_session_timestamp = ""
         self._diagnostics_integrity_by_file: dict[str, dict[str, Any]] = {}
         self._diagnostics_status_by_file: dict[str, str] = {}
         self._diagnostics_path_index: dict[str, dict[str, Any]] = {}
@@ -137,8 +184,8 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_last_progress = 0
         self.diagnostics_eta_estimator = AdaptiveTimeEstimator(initial_seconds_per_unit=8.0)
         self.diagnostics_window: ctk.CTkToplevel | None = None
-        self.diagnostics_run_mode = "normal"
-        self.diagnostics_reverify_selection: SelectiveReverifySelection | None = None
+        self._diagnostics_session_snapshot: dict[str, Any] | None = None
+        self._recovery_session_snapshot: dict[str, Any] | None = None
         self._diagnostics_toggle_guard = False
 
         self.current_project_path: str | None = None
@@ -288,12 +335,24 @@ class MixCreatorApp(ctk.CTk):
             "Apri la finestra Diagnostica e Riparazione MP3."
         )
 
+        self.recover_mp3_button = ctk.CTkButton(
+            project_bar,
+            text="Recupera MP3",
+            width=150,
+            command=self.open_mp3_recovery_window,
+        )
+        self.recover_mp3_button.grid(row=0, column=5, padx=(8, 0), sticky="w")
+        self._add_tooltip(
+            self.recover_mp3_button,
+            "Recupera un MP3 problematico usando come base una copia originale integra dello stesso brano."
+        )
+
         self.project_status_label = ctk.CTkLabel(
             project_bar,
             text="Progetto: Nessuno",
             anchor="e"
         )
-        self.project_status_label.grid(row=0, column=5, padx=(12, 0), sticky="ew")
+        self.project_status_label.grid(row=0, column=6, padx=(12, 0), sticky="ew")
 
         self.left_panel = ctk.CTkScrollableFrame(self, label_text="Impostazioni")
         self.left_panel.grid(
@@ -676,7 +735,7 @@ class MixCreatorApp(ctk.CTk):
 
         buttons_frame = ctk.CTkFrame(diag_card, fg_color="transparent")
         buttons_frame.grid(row=11, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
-        buttons_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        buttons_frame.grid_columnconfigure((0, 1), weight=1)
 
         self.diagnostics_repair_button = ctk.CTkButton(
             buttons_frame,
@@ -689,20 +748,13 @@ class MixCreatorApp(ctk.CTk):
             "Analizza i file selezionati, applica le correzioni disponibili quando necessarie e genera un'unica cartella di esito in base ai controlli attivati.",
         )
 
-        self.diagnostics_reverify_button = ctk.CTkButton(
-            buttons_frame,
-            text="Riverifica file problematici",
-            command=self.start_selective_reverify,
-        )
-        self.diagnostics_reverify_button.grid(row=0, column=1, sticky="ew", padx=4)
-
         self.diagnostics_stop_button = ctk.CTkButton(
             buttons_frame,
             text="Interrompi",
             state="disabled",
             command=self.stop_diagnostics,
         )
-        self.diagnostics_stop_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+        self.diagnostics_stop_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
         self.diagnostics_progress = ctk.CTkProgressBar(diag_card)
         self.diagnostics_progress.grid(row=12, column=0, columnspan=3, sticky="ew", padx=10, pady=(6, 4))
@@ -1338,19 +1390,38 @@ class MixCreatorApp(ctk.CTk):
                 else:
                     self._extract_song_tooltip.text = "Non sono disponibili i dati temporali dell'ultimo mix."
 
-        if hasattr(self, "diagnostics_repair_button"):
-            diagnostics_enabled = self._diagnostics_actions_enabled()
-            self.diagnostics_repair_button.configure(state="normal" if diagnostics_enabled and not is_diag_running else "disabled")
-        if hasattr(self, "diagnostics_reverify_button"):
-            self.diagnostics_reverify_button.configure(state="disabled" if is_diag_running else "normal")
-        if hasattr(self, "diagnostics_stop_button"):
-            self.diagnostics_stop_button.configure(state="normal" if is_diag_running else "disabled")
-        if hasattr(self, "diagnostics_placement_copy_radio"):
-            self.diagnostics_placement_copy_radio.configure(state="disabled" if is_diag_running else "normal")
-        if hasattr(self, "diagnostics_placement_move_radio"):
-            self.diagnostics_placement_move_radio.configure(state="disabled" if is_diag_running else "normal")
-        if hasattr(self, "diagnostics_winlive_checkbox"):
-            self.diagnostics_winlive_checkbox.configure(state="disabled" if is_diag_running else "normal")
+        diagnostics_enabled = self._diagnostics_actions_enabled()
+        self._safe_widget_configure(
+            getattr(self, "diagnostics_repair_button", None),
+            state="normal" if diagnostics_enabled and not is_diag_running else "disabled",
+        )
+        self._safe_widget_configure(
+            getattr(self, "diagnostics_stop_button", None),
+            state="normal" if is_diag_running else "disabled",
+        )
+        self._safe_widget_configure(
+            getattr(self, "diagnostics_placement_copy_radio", None),
+            state="disabled" if is_diag_running else "normal",
+        )
+        self._safe_widget_configure(
+            getattr(self, "diagnostics_placement_move_radio", None),
+            state="disabled" if is_diag_running else "normal",
+        )
+        self._safe_widget_configure(
+            getattr(self, "diagnostics_winlive_checkbox", None),
+            state="disabled" if is_diag_running else "normal",
+        )
+
+    @staticmethod
+    def _safe_widget_configure(widget: Any, **kwargs: Any) -> None:
+        if widget is None:
+            return
+        try:
+            if hasattr(widget, "winfo_exists") and not bool(widget.winfo_exists()):
+                return
+            widget.configure(**kwargs)
+        except Exception:
+            return
 
     def _diagnostics_actions_enabled(self) -> bool:
         verify_mp3 = bool(self.diagnostics_verify_mp3_integrity_var.get())
@@ -2422,6 +2493,899 @@ class MixCreatorApp(ctk.CTk):
         self._update_controls_state()
         self.save_settings()
 
+    def _select_recovery_problematic_file(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Seleziona la cartella contenente i file problematici",
+            parent=self._recovery_dialog,
+        )
+        if selected and self._recovery_problematic_entry is not None:
+            self._replace_entry(self._recovery_problematic_entry, selected)
+
+    def _select_recovery_original_file(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Seleziona la cartella contenente gli originali integri",
+            parent=self._recovery_dialog,
+        )
+        if selected and self._recovery_original_entry is not None:
+            self._replace_entry(self._recovery_original_entry, selected)
+
+    def _select_recovery_output_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Seleziona la cartella di destinazione",
+            parent=self._recovery_dialog,
+        )
+        if selected and self._recovery_output_entry is not None:
+            self._replace_entry(self._recovery_output_entry, selected)
+
+    def _open_recovery_results_folder(self) -> None:
+        target = (self._recovery_session_folder or "").strip()
+        if not target:
+            return
+        path = Path(target)
+        if not path.exists():
+            messagebox.showwarning("Recupero MP3", f"Cartella non trovata:\n{path}", parent=self._recovery_dialog)
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as error:
+            messagebox.showerror("Recupero MP3", f"Impossibile aprire la cartella esiti:\n{error}", parent=self._recovery_dialog)
+
+    @staticmethod
+    def _compute_recovery_window_geometry(screen_width: int, screen_height: int) -> tuple[int, int, int, int]:
+        safe_screen_width = max(900, int(screen_width))
+        safe_screen_height = max(700, int(screen_height))
+        horizontal_margin = 64
+        vertical_margin = 96
+        desired_width = 1320
+        desired_height = 900
+        window_width = min(desired_width, max(860, safe_screen_width - horizontal_margin))
+        window_height = min(desired_height, max(620, safe_screen_height - vertical_margin))
+        return window_width, window_height, horizontal_margin, vertical_margin
+
+    def open_mp3_recovery_window(self) -> None:
+        if self.recovery_worker.is_running:
+            messagebox.showwarning(
+                "Recupero MP3",
+                "Un recupero MP3 è già in corso.",
+                parent=self,
+            )
+            return
+
+        if self._recovery_dialog is not None and self._recovery_dialog.winfo_exists():
+            self._recovery_dialog.deiconify()
+            self._recovery_dialog.lift()
+            self._recovery_dialog.focus_force()
+            return
+
+        window = ctk.CTkToplevel(self)
+        window.title("Recupero massivo MP3 da Originali")
+        screen_width = max(900, int(window.winfo_screenwidth()))
+        screen_height = max(700, int(window.winfo_screenheight()))
+        window_width, window_height, _horizontal_margin, _vertical_margin = self._compute_recovery_window_geometry(
+            screen_width,
+            screen_height,
+        )
+        x_position = max(0, (screen_width - window_width) // 2)
+        y_position = max(0, (screen_height - window_height) // 2)
+        window.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
+        window.minsize(860, 620)
+        window.resizable(True, True)
+        window.transient(self)
+        window.protocol("WM_DELETE_WINDOW", self._close_recovery_window)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=0)
+        self._recovery_dialog = window
+
+        frame = ctk.CTkFrame(window)
+        frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        frame.grid_columnconfigure(0, weight=0)
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_columnconfigure(2, weight=0)
+        for fixed_row in (0, 1, 2, 3, 4, 5):
+            frame.grid_rowconfigure(fixed_row, weight=0)
+        frame.grid_rowconfigure(6, weight=1)
+
+        ctk.CTkLabel(
+            frame,
+            text="Cartella file problematici",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        self._recovery_problematic_entry = ctk.CTkEntry(frame)
+        self._recovery_problematic_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=(10, 4))
+        problematic_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_recovery_problematic_file)
+        problematic_browse.grid(row=0, column=2, padx=(0, 10), pady=(10, 4))
+
+        ctk.CTkLabel(
+            frame,
+            text="Cartella MP3 originali integri",
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        self._recovery_original_entry = ctk.CTkEntry(frame)
+        self._recovery_original_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
+        original_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_recovery_original_file)
+        original_browse.grid(row=1, column=2, padx=(0, 10), pady=4)
+
+        ctk.CTkLabel(
+            frame,
+            text="Cartella di destinazione",
+            anchor="w",
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        self._recovery_output_entry = ctk.CTkEntry(frame)
+        self._recovery_output_entry.grid(row=2, column=1, sticky="ew", padx=10, pady=4)
+        default_output_folder = self.output_folder or self.input_folder or str(Path.home())
+        self._recovery_output_entry.insert(0, default_output_folder)
+        output_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_recovery_output_folder)
+        output_browse.grid(row=2, column=2, padx=(0, 10), pady=4)
+
+        mode_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        mode_frame.grid(row=3, column=0, columnspan=3, sticky="ew", padx=10, pady=(8, 2))
+        mode_frame.grid_columnconfigure(0, weight=1)
+        mode_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(mode_frame, text="Modalita recupero", anchor="w").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._recovery_mode_normal_radio = ctk.CTkRadioButton(
+            mode_frame,
+            text="Recupero normale",
+            variable=self._recovery_mode_var,
+            value=RecoveryMode.NORMAL.value,
+        )
+        self._recovery_mode_normal_radio.grid(row=1, column=0, sticky="w", padx=(0, 12))
+        self._recovery_mode_forced_radio = ctk.CTkRadioButton(
+            mode_frame,
+            text="Recupero forzato / esperto",
+            variable=self._recovery_mode_var,
+            value=RecoveryMode.FORCED.value,
+        )
+        self._recovery_mode_forced_radio.grid(row=1, column=1, sticky="w")
+        self._add_tooltip(
+            self._recovery_mode_normal_radio,
+            "Confronta il contenuto audio del file da recuperare con l’originale e procede solo quando la compatibilità richiesta è confermata.",
+        )
+        self._add_tooltip(
+            self._recovery_mode_forced_radio,
+            "Ignora il confronto di compatibilità audio e utilizza comunque l’originale trovato per il recupero. I TAG WinLive vengono trasferiti e il file finale viene sottoposto a verifica di integrità. Usare solo quando si è certi che l’originale associato sia corretto.",
+        )
+
+        self._recovery_status_label = ctk.CTkLabel(frame, text="Pronto", anchor="w")
+        self._recovery_status_label.grid(row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=(8, 3))
+
+        self._recovery_counters_label = ctk.CTkLabel(frame, text="", anchor="w", justify="left")
+        self._recovery_counters_label.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 4))
+        self._reset_recovery_live_counters()
+
+        split_container = tk.PanedWindow(
+            frame,
+            orient=tk.VERTICAL,
+            sashwidth=8,
+            bd=0,
+            relief="flat",
+            showhandle=False,
+        )
+        split_container.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=10, pady=(0, 8))
+
+        self._recovery_monitor_frame = ctk.CTkFrame(split_container)
+        self._recovery_monitor_frame.grid_columnconfigure(0, weight=1)
+        self._recovery_examined_label = ctk.CTkLabel(self._recovery_monitor_frame, text="File esaminati: 0 / 0", anchor="w")
+        self._recovery_examined_label.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 1))
+        self._recovery_completed_label = ctk.CTkLabel(self._recovery_monitor_frame, text="File completati: 0 / 0", anchor="w")
+        self._recovery_completed_label.grid(row=1, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_batch_status_label = ctk.CTkLabel(self._recovery_monitor_frame, text="Stato batch: Pronto", anchor="w")
+        self._recovery_batch_status_label.grid(row=2, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_current_file_label = ctk.CTkLabel(self._recovery_monitor_frame, text="File corrente: -", anchor="w")
+        self._recovery_current_file_label.grid(row=3, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_phase_label = ctk.CTkLabel(self._recovery_monitor_frame, text="Fase corrente: Pronto", anchor="w")
+        self._recovery_phase_label.grid(row=4, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_elapsed_label = ctk.CTkLabel(self._recovery_monitor_frame, text="Tempo trascorso complessivo: 00:00:00", anchor="w")
+        self._recovery_elapsed_label.grid(row=5, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_current_file_elapsed_label = ctk.CTkLabel(self._recovery_monitor_frame, text="Tempo elaborazione file corrente: 00:00:00", anchor="w")
+        self._recovery_current_file_elapsed_label.grid(row=6, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_eta_label = ctk.CTkLabel(self._recovery_monitor_frame, text="Tempo restante stimato: Calcolo in corso...", anchor="w")
+        self._recovery_eta_label.grid(row=7, column=0, sticky="ew", padx=10, pady=1)
+        self._recovery_percent_label = ctk.CTkLabel(self._recovery_monitor_frame, text="Percentuale batch: 0%", anchor="w")
+        self._recovery_percent_label.grid(row=8, column=0, sticky="ew", padx=10, pady=(1, 3))
+
+        self._recovery_progress_bar = ctk.CTkProgressBar(self._recovery_monitor_frame)
+        self._recovery_progress_bar.grid(row=9, column=0, sticky="ew", padx=10, pady=(2, 6))
+        self._recovery_progress_bar.set(0)
+
+        log_container = ctk.CTkFrame(split_container)
+        log_container.grid_columnconfigure(0, weight=1)
+        log_container.grid_rowconfigure(1, weight=1)
+
+        log_title = ctk.CTkLabel(log_container, text="Log operazioni", anchor="w")
+        log_title.grid(row=0, column=0, sticky="ew", padx=10, pady=(6, 2))
+
+        self._recovery_log_box = ctk.CTkTextbox(log_container, height=240)
+        self._recovery_log_box.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        self._recovery_log_box.configure(state="disabled")
+
+        split_container.add(self._recovery_monitor_frame, minsize=210)
+        split_container.add(log_container, minsize=220)
+        desired_log_height = max(220, min(280, int(window_height * 0.33)))
+        desired_monitor_height = max(220, int(window_height - desired_log_height - 260))
+        try:
+            split_container.sash_place(0, 0, desired_monitor_height)
+        except Exception:
+            pass
+        self._reset_recovery_monitor_state()
+
+        button_row = ctk.CTkFrame(window, fg_color="transparent")
+        button_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        button_row.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        self._recovery_command_bar = button_row
+
+        self._recovery_start_button = ctk.CTkButton(
+            button_row,
+            text="Avvia recupero massivo",
+            height=42,
+            command=self._start_mp3_recovery,
+        )
+        self._recovery_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        self._recovery_stop_button = ctk.CTkButton(
+            button_row,
+            text="Interrompi",
+            height=42,
+            command=self._request_stop_mp3_recovery,
+            state="disabled",
+        )
+        self._recovery_stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+
+        self._recovery_close_button = ctk.CTkButton(
+            button_row,
+            text="Chiudi",
+            height=42,
+            command=self._close_recovery_window,
+        )
+        self._recovery_close_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        self._recovery_open_results_button = ctk.CTkButton(
+            button_row,
+            text="Apri cartella esiti",
+            height=42,
+            state="disabled",
+            command=self._open_recovery_results_folder,
+        )
+        self._recovery_open_results_button.grid(row=0, column=2, sticky="ew", padx=(6, 6))
+
+        self._recovery_path_widgets = [
+            self._recovery_problematic_entry,
+            self._recovery_original_entry,
+            self._recovery_output_entry,
+            problematic_browse,
+            original_browse,
+            output_browse,
+            self._recovery_mode_normal_radio,
+            self._recovery_mode_forced_radio,
+        ]
+
+        self._add_tooltip(
+            self._recovery_problematic_entry,
+            "Seleziona la cartella contenente gli MP3 da recuperare. Verranno analizzati soltanto i file presenti direttamente nella cartella.",
+        )
+        self._add_tooltip(
+            problematic_browse,
+            "Seleziona la cartella contenente gli MP3 da recuperare. Verranno analizzati soltanto i file presenti direttamente nella cartella.",
+        )
+        self._add_tooltip(
+            self._recovery_original_entry,
+            "Seleziona la cartella contenente gli MP3 originali integri con lo stesso nome dei file problematici.",
+        )
+        self._add_tooltip(
+            original_browse,
+            "Seleziona la cartella contenente gli MP3 originali integri con lo stesso nome dei file problematici.",
+        )
+        self._add_tooltip(
+            self._recovery_output_entry,
+            "Seleziona la cartella in cui creare direttamente la sessione Diagnosi Recupero. Puo coincidere con la cartella dei file problematici.",
+        )
+        self._add_tooltip(
+            output_browse,
+            "Seleziona la cartella in cui creare direttamente la sessione Diagnosi Recupero. Puo coincidere con la cartella dei file problematici.",
+        )
+        self._add_tooltip(
+            self._recovery_start_button,
+            "Avvia il recupero degli MP3 presenti direttamente nelle cartelle selezionate.",
+        )
+        self._add_tooltip(
+            self._recovery_stop_button,
+            "Interrompe il recupero dopo il file attualmente in elaborazione, senza modificare i file originali.",
+        )
+        self._add_tooltip(
+            self._recovery_open_results_button,
+            "Apre la cartella della sessione corrente con esiti, report e diagnostica scanner.",
+        )
+
+        self._append_log("Apertura finestra recupero MP3.")
+
+        self._recovery_mode_var.set(RecoveryMode.NORMAL.value)
+
+    def _confirm_forced_recovery(self) -> bool:
+        if self._recovery_dialog is None:
+            return False
+
+        dialog = ctk.CTkToplevel(self._recovery_dialog)
+        self._recovery_forced_confirmation_dialog = dialog
+        dialog.title("Conferma recupero forzato")
+        dialog.resizable(False, False)
+        dialog.transient(self._recovery_dialog)
+        dialog.grab_set()
+
+        width = 680
+        height = 300
+        parent = self._recovery_dialog
+        x_position = max(0, parent.winfo_rootx() + (max(1, parent.winfo_width()) - width) // 2)
+        y_position = max(0, parent.winfo_rooty() + (max(1, parent.winfo_height()) - height) // 2)
+        dialog.geometry(f"{width}x{height}+{x_position}+{y_position}")
+
+        confirmed = {"value": False}
+
+        def _finish(value: bool) -> None:
+            confirmed["value"] = value
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            if dialog.winfo_exists():
+                dialog.destroy()
+
+        def _on_close() -> None:
+            _finish(False)
+
+        dialog.protocol("WM_DELETE_WINDOW", _on_close)
+
+        content = ctk.CTkFrame(dialog)
+        content.pack(fill="both", expand=True, padx=16, pady=16)
+        content.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            content,
+            text=(
+                "La modalita Recupero forzato ignora il confronto di compatibilita audio tra il file da recuperare e l’originale.\n\n"
+                "Il programma utilizzera comunque l’originale associato, trasferira gli eventuali TAG WinLive ed eseguira la verifica di integrita finale.\n\n"
+                "Utilizzare questa modalita solo se si e certi che gli originali selezionati siano corretti.\n\n"
+                "Procedere?"
+            ),
+            justify="left",
+            anchor="w",
+            wraplength=620,
+        ).grid(row=0, column=0, sticky="ew", padx=6, pady=(4, 18))
+
+        button_row = ctk.CTkFrame(content, fg_color="transparent")
+        button_row.grid(row=1, column=0, sticky="ew")
+        button_row.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(button_row, text="Procedi", command=lambda: _finish(True)).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        ctk.CTkButton(button_row, text="Annulla", command=lambda: _finish(False)).grid(row=0, column=1, sticky="ew", padx=(8, 0))
+
+        parent.wait_window(dialog)
+        self._recovery_forced_confirmation_dialog = None
+        return confirmed["value"]
+
+    def _close_recovery_window(self) -> None:
+        if self.recovery_worker.is_running:
+            should_hide = messagebox.askyesno(
+                "Recupero MP3",
+                "Un recupero massivo e in esecuzione. Vuoi nascondere la finestra?",
+                parent=self._recovery_dialog,
+            )
+            if not should_hide:
+                return
+            if self._recovery_dialog is not None:
+                self._recovery_dialog.withdraw()
+            return
+
+        if self._recovery_forced_confirmation_dialog is not None:
+            try:
+                self._recovery_forced_confirmation_dialog.destroy()
+            except Exception:
+                pass
+            self._recovery_forced_confirmation_dialog = None
+
+        if self._recovery_dialog is not None:
+            try:
+                self._recovery_dialog.destroy()
+            except Exception:
+                pass
+        self._recovery_dialog = None
+        self._recovery_problematic_entry = None
+        self._recovery_original_entry = None
+        self._recovery_output_entry = None
+        self._recovery_mode_normal_radio = None
+        self._recovery_mode_forced_radio = None
+        self._recovery_status_label = None
+        self._recovery_counters_label = None
+        self._recovery_progress_bar = None
+        self._recovery_log_box = None
+        self._recovery_command_bar = None
+        self._recovery_monitor_frame = None
+        self._recovery_examined_label = None
+        self._recovery_completed_label = None
+        self._recovery_batch_status_label = None
+        self._recovery_current_file_label = None
+        self._recovery_phase_label = None
+        self._recovery_elapsed_label = None
+        self._recovery_current_file_elapsed_label = None
+        self._recovery_eta_label = None
+        self._recovery_percent_label = None
+        self._recovery_start_button = None
+        self._recovery_stop_button = None
+        self._recovery_close_button = None
+        self._recovery_open_results_button = None
+        self._recovery_path_widgets = []
+        self._recovery_session_folder = None
+        self._recovery_session_snapshot = None
+        self._recovery_allow_session_log_updates = False
+        self._recovery_expected_output_root = ""
+        self._recovery_min_session_timestamp = ""
+        self._stop_recovery_timer()
+
+    def _reset_recovery_monitor_state(self) -> None:
+        self._recovery_started_at = None
+        self._recovery_current_file_started_at = None
+        self._recovery_total_files = 0
+        self._recovery_examined_files = 0
+        self._recovery_completed_files = 0
+        self._recovery_current_file_name = "-"
+        self._recovery_current_phase = "Pronto"
+        self._recovery_completed_file_durations = []
+        self._render_recovery_monitor()
+
+    def _start_recovery_timer(self) -> None:
+        if self._recovery_timer_job is not None:
+            self.after_cancel(self._recovery_timer_job)
+        self._tick_recovery_timer()
+
+    def _stop_recovery_timer(self) -> None:
+        if self._recovery_timer_job is not None:
+            self.after_cancel(self._recovery_timer_job)
+            self._recovery_timer_job = None
+
+    def _tick_recovery_timer(self) -> None:
+        if self._recovery_started_at is None:
+            self._recovery_timer_job = None
+            return
+        self._render_recovery_monitor()
+        self._recovery_timer_job = self.after(1000, self._tick_recovery_timer)
+
+    def _render_recovery_monitor(self) -> None:
+        examined_text = f"File esaminati: {self._recovery_examined_files} / {self._recovery_total_files}"
+        completed_text = f"File completati: {self._recovery_completed_files} / {self._recovery_total_files}"
+        current_file_text = f"File corrente: {self._recovery_current_file_name}"
+        phase_text = f"Fase corrente: {self._recovery_current_phase}"
+        batch_status = "In corso"
+        if self._recovery_current_phase in {"Interrotto", "Errore"}:
+            batch_status = self._recovery_current_phase
+        elif self._recovery_current_phase == "Completato":
+            batch_status = "Completato"
+        elif self._recovery_started_at is None:
+            batch_status = "Pronto"
+
+        elapsed_total = 0.0 if self._recovery_started_at is None else max(0.0, time.monotonic() - self._recovery_started_at)
+        elapsed_file = 0.0 if self._recovery_current_file_started_at is None else max(0.0, time.monotonic() - self._recovery_current_file_started_at)
+
+        if self._recovery_completed_files <= 0:
+            eta_text = "Calcolo in corso..."
+        else:
+            average = sum(self._recovery_completed_file_durations) / float(self._recovery_completed_files)
+            remaining = max(0, self._recovery_total_files - self._recovery_completed_files)
+            eta_text = self._format_duration(average * remaining)
+
+        percent = 0
+        if self._recovery_total_files > 0:
+            percent = int((self._recovery_completed_files / float(self._recovery_total_files)) * 100)
+
+        if self._recovery_examined_label is not None:
+            self._recovery_examined_label.configure(text=examined_text)
+        if self._recovery_completed_label is not None:
+            self._recovery_completed_label.configure(text=completed_text)
+        if self._recovery_batch_status_label is not None:
+            self._recovery_batch_status_label.configure(text=f"Stato batch: {batch_status}")
+        if self._recovery_current_file_label is not None:
+            self._recovery_current_file_label.configure(text=current_file_text)
+        if self._recovery_phase_label is not None:
+            self._recovery_phase_label.configure(text=phase_text)
+        if self._recovery_elapsed_label is not None:
+            self._recovery_elapsed_label.configure(text=f"Tempo trascorso complessivo: {self._format_duration(elapsed_total)}")
+        if self._recovery_current_file_elapsed_label is not None:
+            self._recovery_current_file_elapsed_label.configure(text=f"Tempo elaborazione file corrente: {self._format_duration(elapsed_file)}")
+        if self._recovery_eta_label is not None:
+            self._recovery_eta_label.configure(text=f"Tempo restante stimato: {eta_text}")
+        if self._recovery_percent_label is not None:
+            self._recovery_percent_label.configure(text=f"Percentuale batch: {percent}%")
+
+    def _set_recovery_phase(self, phase: str) -> None:
+        self._recovery_current_phase = phase.strip() or "Pronto"
+        self._render_recovery_monitor()
+
+    def _set_recovery_current_file(self, current: int, total: int, file_name: str) -> None:
+        self._recovery_total_files = max(self._recovery_total_files, max(0, int(total)))
+        self._recovery_examined_files = max(self._recovery_examined_files, max(0, int(current)))
+        self._recovery_current_file_name = file_name.strip() or "-"
+        self._recovery_current_file_started_at = time.monotonic()
+        self._render_recovery_monitor()
+
+    def _mark_recovery_file_completed(self, current: int, total: int) -> None:
+        now = time.monotonic()
+        self._recovery_total_files = max(self._recovery_total_files, max(0, int(total)))
+        self._recovery_completed_files = max(self._recovery_completed_files, max(0, min(int(current), self._recovery_total_files if self._recovery_total_files > 0 else int(current))))
+        if self._recovery_current_file_started_at is not None and self._recovery_completed_files > len(self._recovery_completed_file_durations):
+            self._recovery_completed_file_durations.append(max(0.0, now - self._recovery_current_file_started_at))
+        self._render_recovery_monitor()
+
+    def _process_recovery_tech_message(self, message: str) -> None:
+        if message.startswith("[TECH] Conteggio problematici="):
+            try:
+                self._recovery_total_files = max(0, int(message.split("=", 1)[1].strip()))
+            except ValueError:
+                return
+            self._render_recovery_monitor()
+            return
+
+        if message.startswith("[TECH] Inizio file "):
+            payload = message[len("[TECH] Inizio file "):]
+            progress_text, _, file_name = payload.partition(" | ")
+            current_text, _, total_text = progress_text.partition("/")
+            try:
+                current = int(current_text)
+                total = int(total_text)
+            except ValueError:
+                return
+            self._set_recovery_current_file(current, total, file_name)
+            return
+
+        if message.startswith("[TECH] Fase -> "):
+            self._set_recovery_phase(message.split("->", 1)[1].strip())
+            return
+
+        if message.startswith("[TECH] Sessione esiti creata | path="):
+            if not self._recovery_allow_session_log_updates:
+                return
+            candidate = message.split("path=", 1)[1].strip()
+            if not candidate:
+                return
+            try:
+                candidate_path = Path(candidate).resolve()
+            except Exception:
+                return
+
+            if self._recovery_expected_output_root:
+                expected_root = Path(self._recovery_expected_output_root).resolve()
+                expected_prefix = str(expected_root).casefold()
+                if not str(candidate_path).casefold().startswith(expected_prefix):
+                    return
+
+            if self._recovery_min_session_timestamp:
+                name = candidate_path.name
+                prefix = "Diagnosi Recupero "
+                if name.startswith(prefix):
+                    stamp = name[len(prefix):]
+                    if stamp < self._recovery_min_session_timestamp:
+                        return
+
+            self._recovery_session_folder = str(candidate_path)
+            if self._recovery_open_results_button is not None:
+                self._recovery_open_results_button.configure(state="normal")
+
+    def _reset_recovery_live_counters(self) -> None:
+        self._recovery_live_counters = {
+            MP3BatchOutcome.RECOVERED_TAGS.value: 0,
+            MP3BatchOutcome.RECOVERED_UNCHANGED.value: 0,
+            MP3BatchOutcome.RECOVERED_FORCED.value: 0,
+            MP3BatchOutcome.ORIGINAL_NOT_FOUND.value: 0,
+            MP3BatchOutcome.ORIGINAL_INCOMPATIBLE.value: 0,
+            MP3BatchOutcome.MULTIPLE_COMPATIBLE_ORIGINALS.value: 0,
+            "errori": 0,
+        }
+        self._render_recovery_counters()
+
+    def _render_recovery_counters(self) -> None:
+        if self._recovery_counters_label is None:
+            return
+        counters = self._recovery_live_counters
+        text = (
+            f"Recuperati con TAG trasferiti: {counters[MP3BatchOutcome.RECOVERED_TAGS.value]} | "
+            f"Recuperati come copia invariata: {counters[MP3BatchOutcome.RECOVERED_UNCHANGED.value]} | "
+            f"Recuperati forzatamente: {counters[MP3BatchOutcome.RECOVERED_FORCED.value]} | "
+            f"Originale non trovato: {counters[MP3BatchOutcome.ORIGINAL_NOT_FOUND.value]}\n"
+            f"Originale incompatibile: {counters[MP3BatchOutcome.ORIGINAL_INCOMPATIBLE.value]} | "
+            f"Piu originali compatibili: {counters[MP3BatchOutcome.MULTIPLE_COMPATIBLE_ORIGINALS.value]} | "
+            f"Errori: {counters['errori']}"
+        )
+        self._recovery_counters_label.configure(text=text)
+
+    def _update_recovery_live_counters_from_log(self, message: str) -> None:
+        if message.startswith("[RECUPERATO TAG]"):
+            self._recovery_live_counters[MP3BatchOutcome.RECOVERED_TAGS.value] += 1
+        elif message.startswith("[COPIA INVARIATA]"):
+            self._recovery_live_counters[MP3BatchOutcome.RECOVERED_UNCHANGED.value] += 1
+        elif message.startswith("[RECUPERATO FORZATO]"):
+            self._recovery_live_counters[MP3BatchOutcome.RECOVERED_FORCED.value] += 1
+        elif message.startswith("[NON TROVATO]"):
+            self._recovery_live_counters[MP3BatchOutcome.ORIGINAL_NOT_FOUND.value] += 1
+        elif message.startswith("[INCOMPATIBILE]"):
+            self._recovery_live_counters[MP3BatchOutcome.ORIGINAL_INCOMPATIBLE.value] += 1
+        elif message.startswith("[AMBIGUO]"):
+            self._recovery_live_counters[MP3BatchOutcome.MULTIPLE_COMPATIBLE_ORIGINALS.value] += 1
+        elif message.startswith("[ERRORE]"):
+            self._recovery_live_counters["errori"] += 1
+        self._render_recovery_counters()
+
+    def _set_recovery_ui_running_state(self, running: bool) -> None:
+        state = "disabled" if running else "normal"
+        for widget in self._recovery_path_widgets:
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
+        if self._recovery_start_button is not None:
+            self._recovery_start_button.configure(state="disabled" if running else "normal")
+        if self._recovery_stop_button is not None:
+            self._recovery_stop_button.configure(state="normal" if running else "disabled")
+        if self._recovery_open_results_button is not None and not self._recovery_session_folder:
+            self._recovery_open_results_button.configure(state="disabled")
+
+    def _append_recovery_log(self, message: str) -> None:
+        if self._recovery_log_box is not None:
+            self._recovery_log_box.configure(state="normal")
+            self._recovery_log_box.insert("end", f"{message}\n")
+            self._recovery_log_box.see("end")
+            self._recovery_log_box.configure(state="disabled")
+        self._process_recovery_tech_message(message)
+        self._update_recovery_live_counters_from_log(message)
+        self._append_log(message)
+
+    def _start_mp3_recovery(self) -> None:
+        if self.recovery_worker.is_running:
+            messagebox.showwarning("Recupero MP3", "Un recupero MP3 è già in corso.", parent=self._recovery_dialog)
+            return
+
+        # Reset the previous session state on every new start click, before any validation.
+        self._recovery_session_folder = None
+        self._recovery_allow_session_log_updates = False
+        self._recovery_expected_output_root = ""
+        self._recovery_min_session_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if self._recovery_open_results_button is not None:
+            self._recovery_open_results_button.configure(state="disabled")
+
+        problematic_dir = self._recovery_problematic_entry.get().strip() if self._recovery_problematic_entry is not None else ""
+        originals_dir = self._recovery_original_entry.get().strip() if self._recovery_original_entry is not None else ""
+        destination_dir = self._recovery_output_entry.get().strip() if self._recovery_output_entry is not None else ""
+
+        if not problematic_dir or not Path(problematic_dir).is_dir():
+            messagebox.showerror("Recupero MP3", "Seleziona una cartella file problematici valida.", parent=self._recovery_dialog)
+            return
+
+        if not originals_dir or not Path(originals_dir).is_dir():
+            messagebox.showerror("Recupero MP3", "Seleziona una cartella MP3 originali integri valida.", parent=self._recovery_dialog)
+            return
+
+        if not destination_dir:
+            messagebox.showerror("Recupero MP3", "Seleziona una cartella di destinazione valida.", parent=self._recovery_dialog)
+            return
+
+        try:
+            Path(destination_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            messagebox.showerror("Recupero MP3", f"Impossibile creare la cartella di destinazione:\n{error}", parent=self._recovery_dialog)
+            return
+
+        if Path(problematic_dir).resolve() == Path(originals_dir).resolve():
+            messagebox.showerror(
+                "Recupero MP3",
+                "La cartella problematici deve essere diversa dalla cartella originali.",
+                parent=self._recovery_dialog,
+            )
+            return
+
+        destination_path = Path(destination_dir).resolve()
+        if destination_path == Path(originals_dir).resolve():
+            messagebox.showerror(
+                "Recupero MP3",
+                "La cartella di destinazione non puo coincidere con la cartella originali.",
+                parent=self._recovery_dialog,
+            )
+            return
+
+        selected_recovery_mode = RecoveryMode.coerce(self._recovery_mode_var.get())
+        if selected_recovery_mode == RecoveryMode.FORCED and not self._confirm_forced_recovery():
+            return
+
+        problematic_top = [
+            item for item in Path(problematic_dir).iterdir()
+            if item.is_file() and item.suffix.lower() == ".mp3"
+        ]
+        originals_top = [
+            item for item in Path(originals_dir).iterdir()
+            if item.is_file() and item.suffix.lower() == ".mp3"
+        ]
+        if not problematic_top:
+            messagebox.showerror(
+                "Recupero MP3",
+                "Nessun file MP3 trovato nella cartella dei problematici.",
+                parent=self._recovery_dialog,
+            )
+            return
+        if not originals_top:
+            messagebox.showerror(
+                "Recupero MP3",
+                "Nessun file MP3 trovato nella cartella degli originali.",
+                parent=self._recovery_dialog,
+            )
+            return
+
+        if self._recovery_status_label is not None:
+            self._recovery_status_label.configure(text="Recupero massivo in corso...")
+        if self._recovery_progress_bar is not None:
+            self._recovery_progress_bar.set(0)
+        self._recovery_expected_output_root = str(destination_path)
+        self._recovery_allow_session_log_updates = True
+        self._reset_recovery_monitor_state()
+        self._recovery_started_at = time.monotonic()
+        self._reset_recovery_live_counters()
+        self._set_recovery_ui_running_state(True)
+        self._set_recovery_phase("Ricerca originale")
+        self._start_recovery_timer()
+
+        self._append_recovery_log("Avvio recupero massivo MP3.")
+        forced_mode = selected_recovery_mode == RecoveryMode.FORCED
+        self._recovery_session_snapshot = {
+            "processing_type": "Recupero MP3",
+            "recovery_mode": selected_recovery_mode.value,
+            "recovery_mode_label": "Forzato" if forced_mode else "Normale",
+            "forced_recovery": forced_mode,
+            "audio_comparison_enabled": not forced_mode,
+            "matching_by_filename": True,
+            "problematic_dir": str(Path(problematic_dir).expanduser().resolve()),
+            "originals_dir": str(Path(originals_dir).expanduser().resolve()),
+            "destination_dir": str(Path(destination_dir).expanduser().resolve()),
+        }
+
+        try:
+            self.recovery_worker.start(
+                problematic_dir=problematic_dir,
+                originals_dir=originals_dir,
+                destination_dir=destination_dir,
+                recovery_mode=selected_recovery_mode,
+                session_snapshot=dict(self._recovery_session_snapshot),
+            )
+        except Exception as error:
+            self._recovery_allow_session_log_updates = False
+            messagebox.showerror("Recupero MP3", str(error), parent=self._recovery_dialog)
+            if self._recovery_status_label is not None:
+                self._recovery_status_label.configure(text="Errore recupero MP3")
+            self._set_recovery_ui_running_state(False)
+
+    def _request_stop_mp3_recovery(self) -> None:
+        if not self.recovery_worker.is_running:
+            return
+        should_stop = messagebox.askyesno(
+            "Recupero MP3",
+            "Vuoi interrompere il recupero dopo il file attualmente in elaborazione?",
+            parent=self._recovery_dialog,
+        )
+        if not should_stop:
+            return
+        self.recovery_worker.cancel()
+        self._append_recovery_log("Richiesta di interruzione inviata.")
+
+    def _recovery_worker_progress(self, current: int, total: int, message: str) -> None:
+        self.after(0, self._handle_recovery_worker_progress, current, total, message)
+
+    def _handle_recovery_worker_progress(self, current: int, total: int, message: str) -> None:
+        self._mark_recovery_file_completed(current, total)
+        if self._recovery_status_label is not None:
+            self._recovery_status_label.configure(text=message)
+        if self._recovery_progress_bar is not None:
+            self._recovery_progress_bar.set(0 if total <= 0 else min(1.0, max(0.0, current / total)))
+
+
+    def _recovery_worker_log(self, message: str) -> None:
+        self.after(0, self._append_recovery_log, message)
+
+    def _recovery_worker_completed(self, result) -> None:
+        self.after(0, self._handle_recovery_worker_completed, result)
+
+    def _handle_recovery_worker_completed(self, result) -> None:
+        self._stop_recovery_timer()
+        self._recovery_session_snapshot = None
+        self._recovery_allow_session_log_updates = False
+        examined = int(getattr(result, "examined_problematic", result.processed_problematic))
+        completed = int(getattr(result, "completed_problematic", result.processed_problematic if not result.interrupted else 0))
+        self._recovery_examined_files = max(self._recovery_examined_files, examined)
+        self._recovery_completed_files = max(self._recovery_completed_files, completed)
+        self._recovery_total_files = max(self._recovery_total_files, int(result.total_problematic))
+        self._recovery_session_folder = str(getattr(result, "session_folder", "") or result.output_root)
+        if self._recovery_open_results_button is not None and self._recovery_session_folder:
+            self._recovery_open_results_button.configure(state="normal")
+        self._set_recovery_phase("Completato" if not result.interrupted else "Interrotto")
+        self._set_recovery_ui_running_state(False)
+        if self._recovery_status_label is not None:
+            self._recovery_status_label.configure(text="Recupero completato" if not result.interrupted else "Operazione interrotta")
+        if self._recovery_progress_bar is not None:
+            progress = 0 if result.total_problematic <= 0 else min(1.0, completed / result.total_problematic)
+            self._recovery_progress_bar.set(progress)
+
+        self._append_recovery_log(
+            f"Sintesi: tot={result.total_problematic}, esaminati={examined}, completati={completed}, "
+            f"tempo={result.elapsed_seconds:.2f}s"
+        )
+        self._append_recovery_log(f"Report CSV: {result.report_paths.get('csv', '')}")
+        self._append_recovery_log(f"Cartella output: {result.output_root}")
+        self._append_recovery_log(f"Cartella sessione esiti: {self._recovery_session_folder}")
+
+        total_recovered = (
+            result.counters.get(MP3BatchOutcome.RECOVERED_TAGS.value, 0)
+            + result.counters.get(MP3BatchOutcome.RECOVERED_UNCHANGED.value, 0)
+            + result.counters.get(MP3BatchOutcome.RECOVERED_FORCED.value, 0)
+        )
+        total_errors = (
+            result.counters.get(MP3BatchOutcome.READ_ERROR.value, 0)
+            + result.counters.get(MP3BatchOutcome.WRITE_ERROR.value, 0)
+            + result.counters.get(MP3BatchOutcome.FINAL_VERIFICATION_FAILED.value, 0)
+            + result.counters.get(MP3BatchOutcome.ERROR.value, 0)
+        )
+        total_not_recovered = result.total_problematic - total_recovered
+
+        if result.interrupted:
+            info_text = (
+                "Operazione interrotta.\n"
+                f"File esaminati: {examined}\n"
+                f"File completati: {completed}\n"
+                f"Stato parziale salvato in:\n{self._recovery_session_folder}"
+            )
+        elif total_recovered > 0:
+            info_text = (
+                "Operazione completata.\n"
+                f"File recuperati: {total_recovered}\n"
+                f"File non recuperati: {total_not_recovered}\n"
+                f"Esiti salvati in:\n{self._recovery_session_folder}"
+            )
+        else:
+            info_text = (
+                "Operazione completata senza file recuperati.\n"
+                f"Originali incompatibili: {result.counters.get(MP3BatchOutcome.ORIGINAL_INCOMPATIBLE.value, 0)}\n"
+                f"Esiti e motivazioni salvati in:\n{self._recovery_session_folder}"
+            )
+
+        messagebox.showinfo("Recupero MP3", info_text, parent=self._recovery_dialog)
+
+    def _recovery_worker_error(self, message: str) -> None:
+        self.after(0, self._handle_recovery_worker_error, message)
+
+    def _handle_recovery_worker_error(self, message: str) -> None:
+        self._stop_recovery_timer()
+        self._recovery_session_snapshot = None
+        self._recovery_allow_session_log_updates = False
+        self._set_recovery_phase("Errore")
+        self._set_recovery_ui_running_state(False)
+        if self._recovery_status_label is not None:
+            self._recovery_status_label.configure(text="Errore recupero MP3")
+        self._append_recovery_log(f"ERRORE: {message}")
+        if self._recovery_session_folder:
+            self._append_recovery_log(f"Stato parziale salvato in: {self._recovery_session_folder}")
+            message = f"{message}\n\nStato parziale salvato in:\n{self._recovery_session_folder}"
+        messagebox.showerror("Recupero MP3", message, parent=self._recovery_dialog)
+
+    def _recovery_worker_cancelled(self, message: str) -> None:
+        self.after(0, self._handle_recovery_worker_cancelled, message)
+
+    def _handle_recovery_worker_cancelled(self, message: str) -> None:
+        self._stop_recovery_timer()
+        self._recovery_session_snapshot = None
+        self._recovery_allow_session_log_updates = False
+        self._set_recovery_phase("Interrotto")
+        self._set_recovery_ui_running_state(False)
+        if self._recovery_status_label is not None:
+            self._recovery_status_label.configure(text="Recupero interrotto")
+        self._append_recovery_log(message)
+        if self._recovery_session_folder:
+            self._append_recovery_log(f"Stato parziale salvato in: {self._recovery_session_folder}")
+
     def open_diagnostics_window(self) -> None:
         if self.diagnostics_window is not None and self.diagnostics_window.winfo_exists():
             self.diagnostics_window.deiconify()
@@ -2475,7 +3439,24 @@ class MixCreatorApp(ctk.CTk):
                 self.diagnostics_window.destroy()
             except Exception:
                 pass
+        self._stop_diagnostics_timer()
         self.diagnostics_window = None
+        self.diagnostics_input_entry = None
+        self.diagnostics_output_entry = None
+        self.diagnostics_subfolders_checkbox = None
+        self.diagnostics_integrity_checkbox = None
+        self.diagnostics_winlive_group_label = None
+        self.diagnostics_winlive_checkbox = None
+        self.diagnostics_placement_copy_radio = None
+        self.diagnostics_placement_move_radio = None
+        self.diagnostics_repair_button = None
+        self.diagnostics_stop_button = None
+        self.diagnostics_progress = None
+        self.diagnostics_status_label = None
+        self.diagnostics_count_label = None
+        self.diagnostics_elapsed_label = None
+        self.diagnostics_eta_label = None
+        self.diagnostics_log_box = None
 
     def _set_diagnostics_entry_values(
         self,
@@ -2521,178 +3502,6 @@ class MixCreatorApp(ctk.CTk):
             return self.diagnostics_output_entry.get().strip()
         return ""
 
-    def _selective_reverify_report_picker(self) -> Path | None:
-        last_path = str(self.settings.get("diagnostics_last_reverify_csv", "") or "").strip()
-        initial_dir = ""
-        initial_file = ""
-        if last_path:
-            last = Path(last_path).expanduser()
-            if last.is_file():
-                initial_dir = str(last.parent)
-                initial_file = last.name
-            elif last.parent.is_dir():
-                initial_dir = str(last.parent)
-
-        if not initial_dir:
-            output = self._diagnostics_output_value() or self.output_entry.get().strip()
-            if output and Path(output).is_dir():
-                initial_dir = output
-
-        selected = filedialog.askopenfilename(
-            title="Seleziona report CSV della diagnostica precedente",
-            parent=self._diagnostics_dialog_parent(),
-            filetypes=[("CSV", "*.csv"), ("Tutti i file", "*.*")],
-            initialdir=initial_dir or None,
-            initialfile=initial_file or None,
-        )
-        if not selected:
-            return None
-
-        selected_path = Path(selected).expanduser().resolve()
-        self.settings["diagnostics_last_reverify_csv"] = str(selected_path)
-        self.save_settings()
-        return selected_path
-
-    def _show_selective_reverify_summary(self, selection: SelectiveReverifySelection) -> bool:
-        dialog = ctk.CTkToplevel(self._diagnostics_dialog_parent())
-        dialog.title("Riverifica file problematici")
-        dialog.geometry("760x420")
-        dialog.resizable(False, False)
-        dialog.transient(self._diagnostics_dialog_parent())
-        dialog.grab_set()
-        dialog.grid_columnconfigure(0, weight=1)
-        dialog.grid_rowconfigure(1, weight=1)
-
-        title = ctk.CTkLabel(
-            dialog,
-            text="Riepilogo pre-avvio riverifica",
-            font=ctk.CTkFont(size=15, weight="bold"),
-            anchor="w",
-        )
-        title.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
-
-        summary_box = ctk.CTkTextbox(dialog, height=260)
-        summary_box.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
-        summary_box.insert(
-            "end",
-            "\n".join(
-                [
-                    f"Report selezionato: {selection.report_csv_path}",
-                    f"Righe totali: {selection.total_rows}",
-                    f"Precedentemente Riparati: {selection.repaired_rows}",
-                    f"Precedentemente Non recuperabili: {selection.unrecoverable_rows}",
-                    f"Duplicati esclusi: {selection.duplicates_excluded}",
-                    f"Originali mancanti: {len(selection.missing_originals)}",
-                    f"Originali validi: {len(selection.valid_original_files)}",
-                    f"Numero finale da riverificare: {selection.final_reverify_count}",
-                ]
-            ),
-        )
-        summary_box.configure(state="disabled")
-
-        result = {"start": False}
-
-        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
-        buttons.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 12))
-        buttons.grid_columnconfigure((0, 1), weight=1)
-
-        def _cancel() -> None:
-            result["start"] = False
-            dialog.destroy()
-
-        def _start() -> None:
-            result["start"] = True
-            dialog.destroy()
-
-        start_button = ctk.CTkButton(
-            buttons,
-            text="Avvia riverifica",
-            command=_start,
-            state="normal" if selection.final_reverify_count > 0 else "disabled",
-        )
-        start_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-
-        cancel_button = ctk.CTkButton(
-            buttons,
-            text="Annulla",
-            command=_cancel,
-        )
-        cancel_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-
-        dialog.protocol("WM_DELETE_WINDOW", _cancel)
-        self.wait_window(dialog)
-        return bool(result["start"])
-
-    def _selective_reverify_output_picker(self) -> str:
-        initial = self._diagnostics_output_value() or self.output_entry.get().strip()
-        selected = filedialog.askdirectory(
-            title="Seleziona cartella output riverifica file problematici",
-            parent=self._diagnostics_dialog_parent(),
-            initialdir=initial or None,
-        )
-        if not selected:
-            return ""
-        return str(Path(selected).expanduser().resolve())
-
-    def _confirm_selective_reverify_output(self, selection: SelectiveReverifySelection, output_folder: str) -> bool:
-        out_path = Path(output_folder).expanduser().resolve()
-        report_dir = selection.report_csv_path.parent.resolve()
-        report_root = report_dir.parent.resolve()
-
-        if self._is_same_or_subpath(out_path, report_dir) or self._is_same_or_subpath(out_path, report_root):
-            confirm = messagebox.askyesno(
-                "Riverifica file problematici",
-                "La cartella di output coincide con la cartella del report precedente "
-                "o con una sua sottocartella. Vuoi continuare comunque?",
-                parent=self._diagnostics_dialog_parent(),
-            )
-            if not confirm:
-                return False
-
-        source_dirs = {path.parent.resolve() for path in selection.valid_original_files}
-        if any(out_path == source_dir for source_dir in source_dirs):
-            confirm = messagebox.askyesno(
-                "Riverifica file problematici",
-                "La cartella di output coincide con una cartella sorgente dei file originali. "
-                "Vuoi continuare comunque?",
-                parent=self._diagnostics_dialog_parent(),
-            )
-            if not confirm:
-                return False
-
-        return True
-
-    @staticmethod
-    def _is_same_or_subpath(path: Path, root: Path) -> bool:
-        try:
-            resolved_path = path.resolve()
-            resolved_root = root.resolve()
-        except Exception:
-            return False
-
-        return resolved_path == resolved_root or MixCreatorApp._is_relative_to(resolved_path, resolved_root)
-
-    @staticmethod
-    def _common_parent_for_files(paths: list[Path]) -> Path | None:
-        if not paths:
-            return None
-        try:
-            common = os.path.commonpath([str(path.resolve().parent) for path in paths])
-            candidate = Path(common).resolve()
-            if candidate.is_dir():
-                return candidate
-        except Exception:
-            return None
-        return None
-
-    @staticmethod
-    def _is_relative_to(path: Path, root: Path) -> bool:
-        try:
-            path.resolve().relative_to(root.resolve())
-            return True
-        except ValueError:
-            return False
-
     def select_diagnostics_input(self) -> None:
         folder = filedialog.askdirectory(
             title="Seleziona cartella input diagnostica MP3",
@@ -2718,76 +3527,6 @@ class MixCreatorApp(ctk.CTk):
     def start_diagnostics_repair(self) -> None:
         self._start_diagnostics_worker(repair_mode=True)
 
-    def start_selective_reverify(self) -> None:
-        if self.diagnostics_worker.is_running:
-            messagebox.showwarning(
-                "Diagnostica MP3",
-                "Una diagnostica e gia in esecuzione.",
-                parent=self._diagnostics_dialog_parent(),
-            )
-            return
-
-        csv_path = self._selective_reverify_report_picker()
-        if csv_path is None:
-            self._raise_diagnostics_window()
-            return
-
-        try:
-            selection = prepare_selective_reverify_selection(csv_path)
-        except SelectiveReverifyError as error:
-            messagebox.showerror("Riverifica file problematici", str(error), parent=self._diagnostics_dialog_parent())
-            self._raise_diagnostics_window()
-            return
-
-        if (selection.repaired_rows + selection.unrecoverable_rows) == 0:
-            messagebox.showinfo(
-                "Riverifica file problematici",
-                "Nessun file problematico da riverificare nel report selezionato.",
-                parent=self._diagnostics_dialog_parent(),
-            )
-            self._raise_diagnostics_window()
-            return
-
-        should_start = self._show_selective_reverify_summary(selection)
-        if not should_start:
-            self._raise_diagnostics_window()
-            return
-
-        output_folder = self._selective_reverify_output_picker()
-        if not output_folder:
-            self._raise_diagnostics_window()
-            return
-
-        if not self._confirm_selective_reverify_output(selection, output_folder):
-            self._raise_diagnostics_window()
-            return
-
-        selected_files = list(selection.valid_original_files)
-        source_folder = self._common_parent_for_files(selected_files)
-        if source_folder is None and selected_files:
-            source_folder = selected_files[0].parent
-
-        if source_folder is None:
-            messagebox.showerror(
-                "Riverifica file problematici",
-                "Nessun file originale valido disponibile per l'avvio.",
-                parent=self._diagnostics_dialog_parent(),
-            )
-            self._raise_diagnostics_window()
-            return
-
-        self.diagnostics_reverify_selection = selection
-        self._start_diagnostics_worker(
-            repair_mode=True,
-            input_folder=str(source_folder),
-            output_folder=output_folder,
-            include_subfolders=True,
-            selected_input_files=selected_files,
-            run_mode="selective_reverify",
-            start_message="Avvio riverifica file problematici...",
-            log_message="Avvio riverifica file problematici.",
-        )
-
     def _start_diagnostics_worker(
         self,
         repair_mode: bool,
@@ -2796,7 +3535,6 @@ class MixCreatorApp(ctk.CTk):
         output_folder: str | None = None,
         include_subfolders: bool | None = None,
         selected_input_files: list[Path] | None = None,
-        run_mode: str = "normal",
         start_message: str = "Avvio diagnostica MP3...",
         log_message: str = "Avvio diagnostica MP3.",
     ) -> None:
@@ -2858,10 +3596,19 @@ class MixCreatorApp(ctk.CTk):
             self._raise_diagnostics_window()
             return
 
-        self.diagnostics_run_mode = run_mode
         self._set_diagnostics_entry_values(input_folder=selected_input, output_folder=selected_output)
         self.settings["diagnostics_placement_mode"] = placement_mode
         self.save_settings()
+        self._diagnostics_session_snapshot = {
+            "processing_type": "Diagnostica MP3",
+            "include_subfolders": bool(selected_subfolders),
+            "verify_mp3_integrity": bool(verify_mp3_integrity),
+            "verify_winlive": bool(verify_winlive),
+            "placement_mode": placement_mode,
+            "placement_mode_label": "Copia" if placement_mode == "copy" else "Sposta",
+            "input_folder": str(Path(selected_input).expanduser().resolve()),
+            "output_folder": str(Path(selected_output).expanduser().resolve()),
+        }
 
         self.diagnostics_worker_total = 0
         self.diagnostics_last_progress = 0
@@ -2893,10 +3640,9 @@ class MixCreatorApp(ctk.CTk):
                 selected_input_files=selected_input_files,
                 verify_mp3_integrity=verify_mp3_integrity,
                 verify_winlive=verify_winlive,
+                session_snapshot=dict(self._diagnostics_session_snapshot),
             )
         except Exception as error:
-            self.diagnostics_run_mode = "normal"
-            self.diagnostics_reverify_selection = None
             self._stop_diagnostics_timer()
             messagebox.showerror("Diagnostica MP3", str(error), parent=self._diagnostics_dialog_parent())
             self._raise_diagnostics_window()
@@ -2950,22 +3696,11 @@ class MixCreatorApp(ctk.CTk):
         self._append_diagnostics_log(f"Report HTML: {report_paths.get('html', '')}")
         self._append_winlive_completion_logs(diagnostic_results, winlive_summary)
 
-        comparative_path = ""
-        comparative_error = ""
-        if self.diagnostics_run_mode == "selective_reverify":
-            try:
-                comparative_path = self._write_selective_comparative_report(report_paths)
-                if comparative_path:
-                    self._append_diagnostics_log(f"Report comparativo: {comparative_path}")
-            except Exception as error:
-                comparative_error = str(error)
-                self._append_diagnostics_log(f"ERRORE report comparativo: {comparative_error}")
-
         self._load_latest_diagnostics_index(preferred_output_folder=self._diagnostics_output_value())
         self._refresh_track_list_box()
         self.update_preview()
 
-        title = "Riverifica file problematici" if self.diagnostics_run_mode == "selective_reverify" else "Diagnostica MP3"
+        title = "Diagnostica MP3"
         verify_integrity = bool(summary.get("verify_mp3_integrity", True))
         if verify_integrity:
             base_message = (
@@ -2991,22 +3726,9 @@ class MixCreatorApp(ctk.CTk):
                 f"Errori WinLive: {winlive_summary['errors']}"
             )
 
-        if comparative_path:
-            base_message += f"\n\nReport comparativo: {comparative_path}"
-
         self._update_controls_state()
         messagebox.showinfo(title, base_message, parent=self._diagnostics_dialog_parent())
-
-        if comparative_error:
-            messagebox.showwarning(
-                title,
-                "La diagnostica è stata completata, ma la scrittura del report comparativo è fallita.\n\n"
-                f"Dettaglio: {comparative_error}",
-                parent=self._diagnostics_dialog_parent(),
-            )
-
-        self.diagnostics_run_mode = "normal"
-        self.diagnostics_reverify_selection = None
+        self._diagnostics_session_snapshot = None
         self.diagnostics_eta_label.configure(text="Tempo stimato restante: completato")
         self._raise_diagnostics_window()
 
@@ -3074,8 +3796,7 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_status_label.configure(text="Errore diagnostica MP3")
         self.diagnostics_eta_label.configure(text="Tempo stimato restante: non disponibile")
         self._append_diagnostics_log(f"ERRORE: {message}")
-        self.diagnostics_run_mode = "normal"
-        self.diagnostics_reverify_selection = None
+        self._diagnostics_session_snapshot = None
         self._update_controls_state()
         messagebox.showerror("Diagnostica MP3", message, parent=self._diagnostics_dialog_parent())
         self._raise_diagnostics_window()
@@ -3088,114 +3809,8 @@ class MixCreatorApp(ctk.CTk):
         self.diagnostics_status_label.configure(text="Diagnostica MP3 interrotta")
         self.diagnostics_eta_label.configure(text="Tempo stimato restante: annullato")
         self._append_diagnostics_log(message)
-        self.diagnostics_run_mode = "normal"
-        self.diagnostics_reverify_selection = None
+        self._diagnostics_session_snapshot = None
         self._update_controls_state()
-
-    def _write_selective_comparative_report(self, report_paths: dict[str, Any]) -> str:
-        selection = self.diagnostics_reverify_selection
-        if selection is None:
-            return ""
-
-        summary_path_text = str(report_paths.get("csv_summary", "")).strip()
-        if not summary_path_text:
-            return ""
-
-        summary_path = Path(summary_path_text)
-        if not summary_path.is_file():
-            return ""
-
-        with summary_path.open("r", encoding="utf-8", newline="") as handle:
-            summary_rows = list(csv.DictReader(handle))
-
-        by_original_path: dict[str, dict[str, str]] = {}
-        for row in summary_rows:
-            key = self._normalize_path_key(str(row.get("Percorso originale", "")).strip())
-            if key and key not in by_original_path:
-                by_original_path[key] = row
-
-        missing_reason_by_key: dict[str, str] = {}
-        for missing in selection.missing_originals:
-            key = self._normalize_path_key(missing.row.original_path)
-            missing_reason_by_key[key] = missing.reason
-
-        output_rows: list[dict[str, str]] = []
-        for previous in selection.selected_rows:
-            key = self._normalize_path_key(previous.original_path)
-            current = by_original_path.get(key)
-
-            if current is None:
-                new_status = "Originale non trovato"
-                new_category = ""
-                new_significant_end = ""
-                new_trailing = ""
-                output_path = ""
-                reason = missing_reason_by_key.get(key, "Originale non trovato")
-            else:
-                new_status = str(current.get("Stato finale file", "")).strip()
-                new_category = str(current.get("Categoria finale", "")).strip()
-                new_significant_end = str(current.get("Fine audio significativo", "")).strip()
-                new_trailing = str(current.get("Silenzio finale (ms)", "")).strip()
-                output_path = str(current.get("Percorso finale", "")).strip()
-
-                changes: list[str] = []
-                if previous.previous_status != new_status:
-                    changes.append("Stato aggiornato")
-                if previous.previous_category != new_category:
-                    changes.append("Categoria aggiornata")
-                if previous.previous_significant_end != new_significant_end:
-                    changes.append("Fine audio significativo aggiornata")
-                if previous.previous_trailing_silence_ms != new_trailing:
-                    changes.append("Silenzio finale aggiornato")
-                reason = "; ".join(changes) if changes else "Nessun cambiamento"
-
-            changed = "SI" if (
-                previous.previous_status != new_status
-                or previous.previous_category != new_category
-                or previous.previous_significant_end != new_significant_end
-                or previous.previous_trailing_silence_ms != new_trailing
-            ) else "NO"
-
-            output_rows.append(
-                {
-                    "File": previous.file_name,
-                    "Percorso originale": previous.original_path,
-                    "Stato precedente": previous.previous_status,
-                    "Stato nuovo": new_status,
-                    "Categoria precedente": previous.previous_category,
-                    "Categoria nuova": new_category,
-                    "Fine audio significativo precedente": previous.previous_significant_end,
-                    "Fine audio significativo nuova": new_significant_end,
-                    "Silenzio finale precedente (ms)": previous.previous_trailing_silence_ms,
-                    "Silenzio finale nuovo (ms)": new_trailing,
-                    "Esito cambiato Sì/No": changed,
-                    "Motivo del cambiamento": reason,
-                    "Percorso output nuovo": output_path,
-                }
-            )
-
-        comparative_path = summary_path.parent / "Riverifica_Comparativa.csv"
-        fieldnames = [
-            "File",
-            "Percorso originale",
-            "Stato precedente",
-            "Stato nuovo",
-            "Categoria precedente",
-            "Categoria nuova",
-            "Fine audio significativo precedente",
-            "Fine audio significativo nuova",
-            "Silenzio finale precedente (ms)",
-            "Silenzio finale nuovo (ms)",
-            "Esito cambiato Sì/No",
-            "Motivo del cambiamento",
-            "Percorso output nuovo",
-        ]
-        with comparative_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(output_rows)
-
-        return str(comparative_path)
 
     def _start_diagnostics_timer(self) -> None:
         if self.diagnostics_timer_job is not None:
@@ -4870,36 +5485,58 @@ class MixCreatorApp(ctk.CTk):
         )
         self.settings_manager.save(self.settings)
 
-    def on_close(self) -> None:
+    def on_close(self, _shutdown_after_cancel: bool = False) -> None:
         if self.worker.is_running:
-            confirm = messagebox.askyesno(
-                "Operazione in corso",
-                "La creazione del mix è ancora in corso.\n"
-                "Vuoi annullarla e chiudere il programma?"
-            )
-            if not confirm:
-                return
+            if not _shutdown_after_cancel:
+                confirm = messagebox.askyesno(
+                    "Operazione in corso",
+                    "La creazione del mix è ancora in corso.\n"
+                    "Vuoi annullarla e chiudere il programma?"
+                )
+                if not confirm:
+                    return
             self.worker.cancel()
+            self.after(150, lambda: self.on_close(True))
+            return
 
         if self.extract_worker.is_running:
-            confirm = messagebox.askyesno(
-                "Operazione in corso",
-                "L'estrazione song è ancora in corso.\n"
-                "Vuoi annullarla e chiudere il programma?"
-            )
-            if not confirm:
-                return
+            if not _shutdown_after_cancel:
+                confirm = messagebox.askyesno(
+                    "Operazione in corso",
+                    "L'estrazione song è ancora in corso.\n"
+                    "Vuoi annullarla e chiudere il programma?"
+                )
+                if not confirm:
+                    return
             self.extract_worker.cancel()
+            self.after(150, lambda: self.on_close(True))
+            return
 
         if self.diagnostics_worker.is_running:
-            confirm = messagebox.askyesno(
-                "Operazione in corso",
-                "La diagnostica MP3 è ancora in corso.\n"
-                "Vuoi annullarla e chiudere il programma?"
-            )
-            if not confirm:
-                return
+            if not _shutdown_after_cancel:
+                confirm = messagebox.askyesno(
+                    "Operazione in corso",
+                    "La diagnostica MP3 è ancora in corso.\n"
+                    "Vuoi annullarla e chiudere il programma?"
+                )
+                if not confirm:
+                    return
             self.diagnostics_worker.cancel()
+            self.after(150, lambda: self.on_close(True))
+            return
+
+        if self.recovery_worker.is_running:
+            if not _shutdown_after_cancel:
+                confirm = messagebox.askyesno(
+                    "Operazione in corso",
+                    "Il recupero MP3 è ancora in corso.\n"
+                    "Vuoi interromperlo e chiudere il programma?"
+                )
+                if not confirm:
+                    return
+            self.recovery_worker.cancel()
+            self.after(150, lambda: self.on_close(True))
+            return
 
         if not self._confirm_save_if_dirty():
             return
