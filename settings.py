@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 MixCreator PRO
 settings.py - Versione 1.2
 
@@ -38,6 +38,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "diagnostics_verify_winlive": False,
     "diagnostics_placement_mode": "copy",
     "diagnostics_last_reverify_csv": "",
+    "repertory_updates_folder": "",
+    "repertory_library_folder": "",
+    "repertory_general_folder": "",
+    "repertory_results_folder": "",
+    "rep003_new_tracks_folder": "",
+    "rep003_split_folder": "",
+    "rep003_general_folder": "",
+    "rep003_smartphone_folder": "",
+    "repertory_backup_enabled": True,
     "appearance_mode": "System"
 }
 
@@ -197,6 +206,38 @@ class SettingsManager:
             validated.get("diagnostics_last_reverify_csv", "") or ""
         ).strip()
 
+        validated["repertory_updates_folder"] = str(
+            validated.get("repertory_updates_folder", "") or ""
+        ).strip()
+
+        validated["repertory_library_folder"] = str(
+            validated.get("repertory_library_folder", "") or ""
+        ).strip()
+
+        validated["repertory_general_folder"] = str(
+            validated.get("repertory_general_folder", "") or ""
+        ).strip()
+
+        validated["repertory_results_folder"] = str(
+            validated.get("repertory_results_folder", "") or ""
+        ).strip()
+
+        validated["rep003_new_tracks_folder"] = str(
+            validated.get("rep003_new_tracks_folder", "") or ""
+        ).strip()
+
+        validated["rep003_split_folder"] = str(
+            validated.get("rep003_split_folder", "") or ""
+        ).strip()
+
+        validated["rep003_general_folder"] = str(
+            validated.get("rep003_general_folder", "") or ""
+        ).strip()
+
+        validated["rep003_smartphone_folder"] = str(
+            validated.get("rep003_smartphone_folder", "") or ""
+        ).strip()
+
         if not validated["output_name"]:
             validated["output_name"] = "MixFinale"
 
@@ -272,6 +313,10 @@ class SettingsManager:
 
         validated["diagnostics_verify_winlive"] = bool(
             validated.get("diagnostics_verify_winlive", False)
+        )
+
+        validated["repertory_backup_enabled"] = bool(
+            validated.get("repertory_backup_enabled", True)
         )
 
         valid_placement_modes = {

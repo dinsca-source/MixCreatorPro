@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import gui as gui_module
@@ -120,7 +121,8 @@ class GuiProjectOpenVariationsTests(unittest.TestCase):
         tracks = [_track(name) for name in self.app.ordered_track_names]
         project_path = self._save_project(source_folder=source, tracks=tracks, include_subfolders=True)
 
-        self.app.new_project()
+        with mock.patch.object(gui_module.messagebox, "askyesnocancel", return_value=False):
+            self.app.new_project()
 
         originals = self._silence_popups()
         ask_calls: list[int] = []

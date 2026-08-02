@@ -62,6 +62,7 @@ class Tooltip:
             self._after_id = None
 
     def _show_tip(self) -> None:
+        self._after_id = None
         if not self._widget_exists() or self._tip_window is not None:
             return
 
@@ -91,6 +92,18 @@ class Tooltip:
             wraplength=300
         )
         label.pack(fill="both", expand=True)
+        tw.update_idletasks()
+
+        try:
+            screen_w = tw.winfo_screenwidth()
+            screen_h = tw.winfo_screenheight()
+            tip_w = tw.winfo_reqwidth()
+            tip_h = tw.winfo_reqheight()
+
+            x = min(max(0, x), max(0, screen_w - tip_w))
+            y = min(max(0, y), max(0, screen_h - tip_h))
+        except tk.TclError:
+            pass
 
         tw.geometry(f"+{x}+{y}")
 
@@ -104,6 +117,9 @@ class Tooltip:
             self._tip_window = None
 
         self._unschedule()
+
+    def destroy(self) -> None:
+        self._hide_tip()
 
     def _widget_exists(self) -> bool:
         try:

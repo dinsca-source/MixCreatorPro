@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
-"""
-MixCreator PRO
+"""MixCreator PRO
 gui.py - Versione 2.8
 Patch 1.3.05
 
 Novità:
 - tempo trascorso
-- tempo residuo stimato
-- contatore avanzamento
 - barra di stato
 - numero build visibile
 """
@@ -15,6 +12,7 @@ Novità:
 from __future__ import annotations
 
 import time
+import threading
 import csv
 import json
 import os
@@ -22,7 +20,7 @@ import io
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from tkinter import END, SINGLE, filedialog, messagebox
+from tkinter import END, SINGLE, filedialog, messagebox, ttk
 import tkinter as tk
 from typing import Any
 
@@ -37,19 +35,63 @@ from project_manager import (
     ProjectValidationError,
     load_project as load_project_file,
     resolve_project_files,
-    save_project as save_project_file
+    save_project as save_project_file,
 )
 from settings import SettingsManager
 from tooltip import Tooltip
 from utils import AdaptiveTimeEstimator, scan_mp3_files
-from worker import MixWorker, SongExtractionWorker, MP3DiagnosticsWorker, MP3RecoveryWorker
+from worker import (
+    MixWorker,
+    SongExtractionWorker,
+    MP3DiagnosticsWorker,
+    MP3RecoveryWorker,
+    MP3RepertoryDiagnosticsWorker,
+    MP3RepertoryNewTracksWorker,
+    MP3RepertoryOrganizerWorker,
+)
+from mp3_repertory_new_tracks import (
+    NewTrackItem,
+    NewTracksAssignmentModel,
+    RepertoryFolderItem,
+    STATUS_DA_GESTIRE,
+    STATUS_GESTITO,
+    ensure_folder_available,
+    format_size_megabytes,
+    list_new_tracks_non_recursive,
+    scan_repertory_folders_non_recursive_stats,
+)
+from mp3_repertory_new_tracks_update import (
+    DECISION_SKIP_AND_BYPASS_SESSION as REP003_DECISION_SKIP_AND_BYPASS_SESSION,
+    DECISION_SKIP_CURRENT as REP003_DECISION_SKIP_CURRENT,
+    DECISION_UPDATE_AND_BYPASS_SESSION as REP003_DECISION_UPDATE_AND_BYPASS_SESSION,
+    DECISION_UPDATE_CURRENT as REP003_DECISION_UPDATE_CURRENT,
+    Rep003UpdateResult,
+)
 from mp3_recovery_batch import MP3BatchOutcome
 from mp3_recovery import RecoveryMode
+from mp3_repertory_organizer import (
+    COUNTER_BRANI_AGGIORNATI,
+    COUNTER_BRANI_DA_INSERIRE,
+    COUNTER_BRANI_DA_INSERIRE_ERRORI,
+    COUNTER_COPIE_AGGIORNATE_REPERTORIO,
+    COUNTER_FILE_MANTENUTI,
+    COUNTER_FILE_NON_TROVATI_COPIATI,
+    COUNTER_FILE_NON_TROVATI_ERRORI_COPIA,
+    COUNTER_FILE_NON_TROVATI_NEL_REPERTORIO,
+    COUNTER_SMARTPHONE_TABLET_COPIATI,
+    COUNTER_SMARTPHONE_TABLET_ERRORI,
+    RepertoryStatus,
+    SMARTPHONE_TABLET_ROOT,
+    assert_smartphone_tablet_dir_accessible,
+    reset_smartphone_tablet_dir,
+)
 from mp3_diagnostics import (
     STATUS_PERFECT,
     STATUS_REPAIRED,
     STATUS_UNRECOVERABLE,
 )
+from mp3_repertory_diagnostics import enumerate_split_repertory_nodes
+from mp3_repertory_diagnostics import ROOT_FILES_TOKEN
 
 
 APP_VERSION = "4.3.0-winlive-stable"
@@ -75,10 +117,264 @@ CUT_MODE_LABELS = {
     "Fine del brano": "fine",
     "Punto casuale": "casuale",
     "Intro + finale": "intro_fine",
-    "Brano intero": "intero"
+    "Brano intero": "intero",
 }
 
 CUT_MODE_VALUES = {value: key for key, value in CUT_MODE_LABELS.items()}
+
+REPERTORY_MODE_UPDATE = "update"
+REPERTORY_MODE_DIAGNOSTICS = "diagnostics"
+REPERTORY_MODE_INSERT_TRACKS = "insert_tracks"
+REPERTORY_MODE_LABELS = {
+    REPERTORY_MODE_UPDATE: "Aggiornamento Repertorio",
+    REPERTORY_MODE_DIAGNOSTICS: "Diagnosi Repertorio",
+    REPERTORY_MODE_INSERT_TRACKS: "Inserimento nuovi brani",
+}
+REPERTORY_MODE_BY_LABEL = {
+    label.casefold(): mode
+    for mode, label in REPERTORY_MODE_LABELS.items()
+}
+
+REP003_SORT_NAME = "name"
+REP003_SORT_STATUS = "status"
+REP003_SORT_FOLDERS = "folders"
+REP003_SORT_FOLDER_NAME = "folder"
+REP003_SORT_FOLDER_RELATIVE = "relative"
+REP003_SORT_FOLDER_COUNT = "count"
+REP003_SORT_FOLDER_SIZE = "size"
+
+REP003_INVALID_FOLDER_CHARS = set('<>:"/\\|?*')
+REP003_RESERVED_FOLDER_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+}
+REP003_BLOCKED_TECHNICAL_FOLDER_NAMES = {
+    "diagnosi",
+    "report",
+    "log",
+    "file non trovati in repertorio",
+    "file non trovati nel repertorio",
+    "repertorio_generale_da_mixcreator",
+}
+
+REP003_SESSION_NOT_LOADED = "NOT_LOADED"
+REP003_SESSION_LOADED_UNASSIGNED = "LOADED_UNASSIGNED"
+REP003_SESSION_ASSIGNMENTS_PENDING = "ASSIGNMENTS_PENDING"
+REP003_SESSION_PROCESSING = "PROCESSING"
+REP003_SESSION_COMPLETED = "COMPLETED"
+REP003_SESSION_COMPLETED_WITH_ERRORS = "COMPLETED_WITH_ERRORS"
+REP003_SESSION_READY_FOR_NEW_SESSION = "READY_FOR_NEW_SESSION"
+
+
+class ManagedCTkToplevel(ctk.CTkToplevel):
+    def __init__(self, *args, **kwargs):
+        self._managed_after_jobs: set[str] = set()
+        self._managed_destroying = False
+        super().__init__(*args, **kwargs)
+
+    def after(self, ms, func=None, *args):
+        if func is None:
+            return super().after(ms)
+        if self._managed_destroying:
+            return None
+
+        job_id = None
+
+        def _runner() -> None:
+            nonlocal job_id
+            if job_id is not None:
+                self._managed_after_jobs.discard(job_id)
+                job_id = None
+            if self._managed_destroying:
+                return
+            func(*args)
+
+        try:
+            job_id = super().after(ms, _runner)
+        except (tk.TclError, RuntimeError):
+            return None
+        self._managed_after_jobs.add(job_id)
+        return job_id
+
+    def after_idle(self, func, *args):
+        if self._managed_destroying:
+            return None
+
+        job_id = None
+
+        def _runner() -> None:
+            nonlocal job_id
+            if job_id is not None:
+                self._managed_after_jobs.discard(job_id)
+                job_id = None
+            if self._managed_destroying:
+                return
+            func(*args)
+
+        try:
+            job_id = super().after_idle(_runner)
+        except (tk.TclError, RuntimeError):
+            return None
+        self._managed_after_jobs.add(job_id)
+        return job_id
+
+    def after_cancel(self, identifier):
+        if identifier is not None:
+            self._managed_after_jobs.discard(identifier)
+        return super().after_cancel(identifier)
+
+    def _cancel_managed_after_jobs(self) -> None:
+        pending_jobs = list(self._managed_after_jobs)
+        self._managed_after_jobs.clear()
+        for job_id in pending_jobs:
+            try:
+                self.tk.call("after", "cancel", job_id)
+            except (tk.TclError, RuntimeError):
+                pass
+
+    def _cancel_matching_after_scripts(self, *fragments: str) -> None:
+        try:
+            pending_jobs = self.tk.splitlist(self.tk.call("after", "info"))
+        except (tk.TclError, RuntimeError):
+            return
+
+        for job_id in pending_jobs:
+            try:
+                callback_info = self.tk.splitlist(self.tk.call("after", "info", job_id))
+            except (tk.TclError, RuntimeError):
+                continue
+            callback_text = " ".join(str(item) for item in callback_info)
+            if any(fragment in callback_text for fragment in fragments):
+                try:
+                    self.tk.call("after", "cancel", job_id)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+    def destroy(self):
+        if self._managed_destroying:
+            return
+        self._managed_destroying = True
+        self._cancel_matching_after_scripts(
+            "<lambda>",
+            "_windows_set_titlebar_icon",
+            "_revert_withdraw_after_windows_set_titlebar_color",
+            "focus_set",
+        )
+        self._cancel_managed_after_jobs()
+        super().destroy()
+
+
+class ManagedCTkTextbox(ctk.CTkTextbox):
+    def __init__(self, *args, **kwargs):
+        self._managed_after_jobs: set[str] = set()
+        self._managed_destroying = False
+        super().__init__(*args, **kwargs)
+
+    def after(self, ms, func=None, *args):
+        if func is None:
+            return super().after(ms)
+        if self._managed_destroying:
+            return None
+
+        job_id = None
+
+        def _runner() -> None:
+            nonlocal job_id
+            if job_id is not None:
+                self._managed_after_jobs.discard(job_id)
+                job_id = None
+            if self._managed_destroying:
+                return
+            func(*args)
+
+        try:
+            job_id = super().after(ms, _runner)
+        except (tk.TclError, RuntimeError):
+            return None
+        self._managed_after_jobs.add(job_id)
+        return job_id
+
+    def after_idle(self, func, *args):
+        if self._managed_destroying:
+            return None
+
+        job_id = None
+
+        def _runner() -> None:
+            nonlocal job_id
+            if job_id is not None:
+                self._managed_after_jobs.discard(job_id)
+                job_id = None
+            if self._managed_destroying:
+                return
+            func(*args)
+
+        try:
+            job_id = super().after_idle(_runner)
+        except (tk.TclError, RuntimeError):
+            return None
+        self._managed_after_jobs.add(job_id)
+        return job_id
+
+    def after_cancel(self, identifier):
+        if identifier is not None:
+            self._managed_after_jobs.discard(identifier)
+        return super().after_cancel(identifier)
+
+    def _cancel_managed_after_jobs(self) -> None:
+        pending_jobs = list(self._managed_after_jobs)
+        self._managed_after_jobs.clear()
+        for job_id in pending_jobs:
+            try:
+                self.tk.call("after", "cancel", job_id)
+            except (tk.TclError, RuntimeError):
+                pass
+
+    def _cancel_matching_after_scripts(self, *fragments: str) -> None:
+        try:
+            pending_jobs = self.tk.splitlist(self.tk.call("after", "info"))
+        except (tk.TclError, RuntimeError):
+            return
+
+        for job_id in pending_jobs:
+            try:
+                callback_info = self.tk.splitlist(self.tk.call("after", "info", job_id))
+            except (tk.TclError, RuntimeError):
+                continue
+            callback_text = " ".join(str(item) for item in callback_info)
+            if any(fragment in callback_text for fragment in fragments):
+                try:
+                    self.tk.call("after", "cancel", job_id)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+    def destroy(self):
+        if self._managed_destroying:
+            return
+        self._managed_destroying = True
+        self._cancel_matching_after_scripts("<lambda>", "_check_if_scrollbars_needed")
+        self._cancel_managed_after_jobs()
+        super().destroy()
 
 
 class MixCreatorApp(ctk.CTk):
@@ -99,6 +395,11 @@ class MixCreatorApp(ctk.CTk):
         self.track_clip_info: dict[str, ClipInfo] = {}
         self.ordered_track_names: list[str] = []
         self.tooltips: list[Tooltip] = []
+        self._tracked_after_jobs: set[str] = set()
+        self._shutdown_after_job = None
+        self._is_destroying = False
+        self._destroy_completed = False
+        self.timer_job = None
         self._updating_track_list = False
         self.reuse_previous_clips_var = tk.BooleanVar(value=False)
         self.last_generated_mix_data: dict[str, Any] | None = None
@@ -113,6 +414,158 @@ class MixCreatorApp(ctk.CTk):
         self._extract_progress_cancel_button = None
         self._extract_tracks_snapshot: list[dict[str, Any]] = []
         self._extract_has_temporal_mode = False
+        self.repertory_worker = MP3RepertoryOrganizerWorker(
+            on_progress=self._repertory_worker_progress,
+            on_completed=self._repertory_worker_completed,
+            on_error=self._repertory_worker_error,
+            on_cancelled=self._repertory_worker_cancelled,
+            on_log=self._repertory_worker_log,
+            on_decision_required=self._repertory_worker_decision_required,
+        )
+        self.repertory_diagnostics_worker = MP3RepertoryDiagnosticsWorker(
+            on_progress=self._repertory_diagnostics_worker_progress,
+            on_completed=self._repertory_diagnostics_worker_completed,
+            on_error=self._repertory_diagnostics_worker_error,
+            on_cancelled=self._repertory_diagnostics_worker_cancelled,
+            on_log=self._repertory_diagnostics_worker_log,
+        )
+        self._repertory_dialog: ctk.CTkToplevel | None = None
+        self._repertory_general_label = None
+        self._repertory_updates_entry = None
+        self._repertory_library_entry = None
+        self._repertory_general_entry = None
+        self._repertory_results_entry = None
+        self._repertory_smartphone_label = None
+        self._repertory_smartphone_entry = None
+        self._repertory_smartphone_browse_button = None
+        self._repertory_backup_var = tk.BooleanVar(value=bool(self.settings.get("repertory_backup_enabled", True)))
+        self._repertory_status_label = None
+        self._repertory_log_box = None
+        self._repertory_progress_bar = None
+        self._repertory_start_button = None
+        self._repertory_stop_button = None
+        self._repertory_close_button = None
+        self._repertory_open_results_button = None
+        self._repertory_open_smartphone_button = None
+        self._repertory_reset_smartphone_button = None
+        self._repertory_general_browse_button = None
+        self._repertory_path_widgets: list[Any] = []
+        self._repertory_session_folder: str | None = None
+        self._repertory_result_folder_update: str | None = None
+        self._repertory_result_folder_diagnostics: str | None = None
+        self._repertory_result_folder_insert_tracks: str | None = None
+        self._repertory_selected_smartphone_folder: str | None = None
+        self._repertory_last_completed_smartphone_folder: str | None = None
+        self._repertory_allow_session_log_updates = False
+        self._repertory_expected_output_root = ""
+        self._repertory_min_session_timestamp = ""
+        self._repertory_total_files = 0
+        self._repertory_processed_files = 0
+        self._repertory_matches_found = 0
+        self._repertory_files_updated = 0
+        self._repertory_files_not_found = 0
+        self._repertory_errors = 0
+        self._repertory_started_at: float | None = None
+        self._repertory_timer_job = None
+        self._repertory_file_counter_label = None
+        self._repertory_matches_label = None
+        self._repertory_updated_label = None
+        self._repertory_not_found_label = None
+        self._repertory_errors_label = None
+        self._repertory_elapsed_label = None
+        self._repertory_eta_label = None
+        self._repertory_decision_dialog = None
+        self._repertory_decision_tooltips: list[Tooltip] = []
+        self._repertory_updates_entry_tooltip: Tooltip | None = None
+        self._repertory_library_entry_tooltip: Tooltip | None = None
+        self._repertory_general_entry_tooltip: Tooltip | None = None
+        self._repertory_results_entry_tooltip: Tooltip | None = None
+        self._repertory_smartphone_entry_tooltip: Tooltip | None = None
+        self._repertory_start_button_tooltip: Tooltip | None = None
+        self._repertory_stop_button_tooltip: Tooltip | None = None
+        self._repertory_open_results_button_tooltip: Tooltip | None = None
+        self._repertory_open_smartphone_button_tooltip: Tooltip | None = None
+        self._repertory_reset_smartphone_button_tooltip: Tooltip | None = None
+        self._repertory_backup_check_tooltip: Tooltip | None = None
+        self._repertory_diagnostics_refresh_tooltip: Tooltip | None = None
+        self._repertory_diagnostics_select_all_tooltip: Tooltip | None = None
+        self._repertory_diagnostics_deselect_all_tooltip: Tooltip | None = None
+        self._rep003_new_tracks_entry_tooltip: Tooltip | None = None
+        self._rep003_split_entry_tooltip: Tooltip | None = None
+        self._rep003_general_entry_tooltip: Tooltip | None = None
+        self._rep003_smartphone_entry_tooltip: Tooltip | None = None
+        self._rep003_load_button_tooltip: Tooltip | None = None
+        self._rep003_show_managed_tooltip: Tooltip | None = None
+        self._rep003_create_folder_tooltip: Tooltip | None = None
+        self._rep003_refresh_folders_tooltip: Tooltip | None = None
+        self._rep003_assign_button_tooltip: Tooltip | None = None
+        self._rep003_remove_button_tooltip: Tooltip | None = None
+        self._repertory_pending_decision_request_id: str | None = None
+        self._repertory_mtime_bypass_active = False
+        self._repertory_mtime_session_choice = "ASK"
+        self._repertory_smartphone_root = str(
+            self.settings.get("repertory_smartphone_folder", "")
+            or SMARTPHONE_TABLET_ROOT
+        )
+        self._repertory_reset_in_progress = False
+        self._repertory_close_requested = False
+        self._repertory_mode_var = tk.StringVar(value=REPERTORY_MODE_UPDATE)
+        self._repertory_mode_label_var = tk.StringVar(value=REPERTORY_MODE_LABELS[REPERTORY_MODE_UPDATE])
+        self._repertory_mode_selector = None
+        self._repertory_mode_radios: list[Any] = []
+        self._repertory_mode_frame = None
+        self._repertory_diagnostics_tree_scrollable = None
+        self._repertory_diagnostics_refresh_button = None
+        self._repertory_diagnostics_select_all_button = None
+        self._repertory_diagnostics_deselect_all_button = None
+        self._repertory_diagnostics_tree_items: dict[str, dict[str, Any]] = {}
+        self._repertory_diagnostics_tree_order: list[str] = []
+        self._repertory_diagnostics_tree_widgets: list[Any] = []
+        self._rep003_model = NewTracksAssignmentModel()
+        self.rep003_worker = MP3RepertoryNewTracksWorker(
+            on_progress=self._rep003_worker_progress,
+            on_completed=self._rep003_worker_completed,
+            on_error=self._rep003_worker_error,
+            on_cancelled=self._rep003_worker_cancelled,
+            on_log=self._rep003_worker_log,
+            on_decision_required=self._rep003_worker_decision_required,
+        )
+        self._rep003_window: ctk.CTkToplevel | None = None
+        self._rep003_panel_frame = None
+        self._rep003_tracks_tree = None
+        self._rep003_folders_tree = None
+        self._rep003_new_tracks_entry = None
+        self._rep003_split_entry = None
+        self._rep003_general_entry = None
+        self._rep003_smartphone_entry = None
+        self._rep003_status_label = None
+        self._rep003_load_button = None
+        self._rep003_create_folder_button = None
+        self._rep003_refresh_folders_button = None
+        self._rep003_assign_button = None
+        self._rep003_remove_button = None
+        self._rep003_show_managed_switch = None
+        self._rep003_browse_buttons: list[Any] = []
+        self._rep003_path_widgets: list[Any] = []
+        self._rep003_tracks_h_scroll = None
+        self._rep003_folders_h_scroll = None
+        self._rep003_ttk_style_configured = False
+        self._rep003_show_managed_var = tk.BooleanVar(value=True)
+        self._rep003_sort_key = REP003_SORT_NAME
+        self._rep003_sort_reverse = False
+        self._rep003_track_row_by_iid: dict[str, str] = {}
+        self._rep003_folder_iid_by_relative: dict[str, str] = {}
+        self._rep003_folder_sort_key = REP003_SORT_FOLDER_RELATIVE
+        self._rep003_folder_sort_reverse = False
+        self._rep003_pending_decision_request_id: str | None = None
+        self._rep003_decision_dialog = None
+        self._rep003_create_folder_dialog = None
+        self._rep003_create_folder_entry = None
+        self._rep003_create_folder_focus_after_id = None
+        self._rep003_create_folder_preview_var = tk.StringVar(value="")
+        self._rep003_session_policy = "ASK"
+        self._rep003_session_state = REP003_SESSION_NOT_LOADED
+        self._rep003_last_processed_sources: set[str] = set()
         self.recovery_worker = MP3RecoveryWorker(
             on_progress=self._recovery_worker_progress,
             on_completed=self._recovery_worker_completed,
@@ -192,10 +645,7 @@ class MixCreatorApp(ctk.CTk):
         self.project_dirty = False
         self.project_source_folder = self.input_folder or ""
         self.project_name = ""
-        self._suspend_project_dirty_tracking = False
-
         self.start_time: float | None = None
-        self.timer_job = None
         self.last_progress_percent = 0
         self.mix_eta_estimator = AdaptiveTimeEstimator(initial_seconds_per_unit=8.0)
         self.mix_eta_phase = ""
@@ -204,7 +654,7 @@ class MixCreatorApp(ctk.CTk):
             on_progress=self._worker_progress,
             on_completed=self._worker_completed,
             on_error=self._worker_error,
-            on_cancelled=self._worker_cancelled
+            on_cancelled=self._worker_cancelled,
         )
         self.extract_worker = SongExtractionWorker(
             on_progress=self._extract_worker_progress,
@@ -219,73 +669,15 @@ class MixCreatorApp(ctk.CTk):
             on_cancelled=self._diagnostics_worker_cancelled,
         )
 
-        self._configure_window()
-        self._build_ui()
-        self._load_settings_into_ui()
+        self._configure_main_window_geometry()
 
-        if self.input_folder and Path(self.input_folder).is_dir():
-            self.load_mp3_list()
-
-        self._update_window_title()
-
-    def _configure_window(self) -> None:
-        screen_width = self.winfo_screenwidth()
-        screen_height = self.winfo_screenheight()
-
-        window_width = min(1180, max(900, screen_width - 80))
-        window_height = min(790, max(650, screen_height - 120))
-
-        x_position = max(0, (screen_width - window_width) // 2)
-        y_position = max(0, (screen_height - window_height) // 2)
-
-        self.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
-        self.minsize(900, 630)
-        self.resizable(True, True)
-
-        self.grid_columnconfigure(0, weight=3)
-        self.grid_columnconfigure(1, weight=2)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
-    def _build_ui(self) -> None:
-        title_frame = ctk.CTkFrame(self, fg_color="transparent")
-        title_frame.grid(
-            row=0, column=0, columnspan=2,
-            sticky="ew", padx=12, pady=(10, 4)
-        )
-        title_frame.grid_columnconfigure(0, weight=1)
-
-        ctk.CTkLabel(
-            title_frame,
-            text=f"MIXCREATOR PRO {APP_VERSION}",
-            font=ctk.CTkFont(size=27, weight="bold")
-        ).grid(row=0, column=0, sticky="w")
-
-        self.appearance_combo = ctk.CTkComboBox(
-            title_frame,
-            width=120,
-            values=["System", "Light", "Dark"],
-            command=self.change_appearance
-        )
-        self.appearance_combo.grid(row=0, column=1, sticky="e")
-
-        project_bar = ctk.CTkFrame(self, fg_color="transparent")
-        project_bar.grid(
-            row=1, column=0, columnspan=2,
-            sticky="ew", padx=12, pady=(0, 4)
-        )
-        project_bar.grid_columnconfigure(5, weight=1)
-
-        self.new_project_button = ctk.CTkButton(
-            project_bar,
-            text="Nuovo progetto",
-            width=140,
-            command=self.new_project
-        )
-        self.new_project_button.grid(row=0, column=0, padx=(0, 6), sticky="w")
-        self._add_tooltip(
-            self.new_project_button,
-            "Crea un nuovo progetto e ripristina la schermata iniziale."
-        )
+        project_bar = ctk.CTkFrame(self)
+        project_bar.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 6))
+        project_bar.grid_columnconfigure(7, weight=1)
 
         self.open_project_button = ctk.CTkButton(
             project_bar,
@@ -347,12 +739,24 @@ class MixCreatorApp(ctk.CTk):
             "Recupera un MP3 problematico usando come base una copia originale integra dello stesso brano."
         )
 
+        self.organize_repertory_button = ctk.CTkButton(
+            project_bar,
+            text="Organizza repertorio",
+            width=170,
+            command=self.open_repertory_organizer_window,
+        )
+        self.organize_repertory_button.grid(row=0, column=6, padx=(8, 0), sticky="w")
+        self._add_tooltip(
+            self.organize_repertory_button,
+            "Aggiorna in blocco i file del repertorio usando una cartella aggiornamenti con confronto per nome normalizzato.",
+        )
+
         self.project_status_label = ctk.CTkLabel(
             project_bar,
             text="Progetto: Nessuno",
             anchor="e"
         )
-        self.project_status_label.grid(row=0, column=6, padx=(12, 0), sticky="ew")
+        self.project_status_label.grid(row=0, column=7, padx=(12, 0), sticky="ew")
 
         self.left_panel = ctk.CTkScrollableFrame(self, label_text="Impostazioni")
         self.left_panel.grid(
@@ -1314,6 +1718,7 @@ class MixCreatorApp(ctk.CTk):
             if placement_mode not in ("copy", "move"):
                 placement_mode = "copy"
             self.diagnostics_placement_mode_var.set(placement_mode)
+            self._repertory_backup_var.set(bool(self.settings.get("repertory_backup_enabled", True)))
 
             self.reuse_previous_clips_var.set(False)
             self.appearance_combo.set(self.settings["appearance_mode"])
@@ -1353,10 +1758,13 @@ class MixCreatorApp(ctk.CTk):
         has_folder = bool(self.input_entry.get().strip()) if hasattr(self, "input_entry") else False
         has_tracks = self.track_count > 0
         has_selection = bool(self.track_list.curselection()) if hasattr(self, "track_list") else False
-        is_mix_running = self.worker.is_running if hasattr(self, "worker") else False
-        is_extract_running = self.extract_worker.is_running if hasattr(self, "extract_worker") else False
-        is_diag_running = self.diagnostics_worker.is_running if hasattr(self, "diagnostics_worker") else False
-        is_busy = is_mix_running or is_extract_running or is_diag_running
+        is_mix_running = bool(getattr(getattr(self, "worker", None), "is_running", False))
+        is_extract_running = bool(getattr(getattr(self, "extract_worker", None), "is_running", False))
+        is_diag_running = bool(getattr(getattr(self, "diagnostics_worker", None), "is_running", False))
+        is_repertory_running = bool(getattr(getattr(self, "repertory_worker", None), "is_running", False))
+        is_repertory_diagnostics_running = bool(getattr(getattr(self, "repertory_diagnostics_worker", None), "is_running", False))
+        is_rep003_running = bool(getattr(getattr(self, "rep003_worker", None), "is_running", False))
+        is_busy = is_mix_running or is_extract_running or is_diag_running or is_repertory_running or is_repertory_diagnostics_running or is_rep003_running
 
         if hasattr(self, "create_button"):
             self.create_button.configure(state="normal" if has_tracks and not is_busy else "disabled")
@@ -1411,6 +1819,11 @@ class MixCreatorApp(ctk.CTk):
             getattr(self, "diagnostics_winlive_checkbox", None),
             state="disabled" if is_diag_running else "normal",
         )
+
+        if hasattr(self, "organize_repertory_button"):
+            self.organize_repertory_button.configure(
+                state="disabled" if is_repertory_running or is_repertory_diagnostics_running else "normal"
+            )
 
     @staticmethod
     def _safe_widget_configure(widget: Any, **kwargs: Any) -> None:
@@ -1922,6 +2335,7 @@ class MixCreatorApp(ctk.CTk):
             self.diagnostics_verify_mp3_integrity_var.set(True)
             self.diagnostics_verify_winlive_var.set(False)
             self._sync_diagnostics_winlive_controls_state()
+            self._repertory_backup_var.set(bool(self.settings.get("repertory_backup_enabled", True)))
 
             self.last_generated_mix_data = None
             self._reusable_previous_clips = {}
@@ -2492,6 +2906,4609 @@ class MixCreatorApp(ctk.CTk):
         self._mark_project_dirty()
         self._update_controls_state()
         self.save_settings()
+
+    def _select_repertory_updates_folder(self) -> None:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        title = (
+            "Seleziona la cartella del Repertorio suddiviso da controllare"
+            if mode == REPERTORY_MODE_DIAGNOSTICS
+            else "Seleziona la cartella contenente i file da aggiornare"
+        )
+        selected = filedialog.askdirectory(
+            title=title,
+            parent=self._repertory_dialog,
+        )
+        if selected and self._repertory_updates_entry is not None:
+            self._replace_entry(self._repertory_updates_entry, selected)
+            self._validate_repertory_diagnostics_paths(show_message=True)
+            self._refresh_repertory_diagnostics_folder_tree()
+            self._update_repertory_primary_action_state()
+
+    def _select_repertory_library_folder(self) -> None:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        title = (
+            "Seleziona la cartella del Repertorio generale da confrontare"
+            if mode == REPERTORY_MODE_DIAGNOSTICS
+            else "Seleziona la cartella del Repertorio suddiviso"
+        )
+        selected = filedialog.askdirectory(
+            title=title,
+            parent=self._repertory_dialog,
+        )
+        if selected and self._repertory_library_entry is not None:
+            self._replace_entry(self._repertory_library_entry, selected)
+            self._validate_repertory_diagnostics_paths(show_message=True)
+            self._refresh_repertory_diagnostics_folder_tree()
+            self._update_repertory_primary_action_state()
+
+    def _select_repertory_general_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Seleziona la cartella del Repertorio generale",
+            parent=self._repertory_dialog,
+        )
+        if selected and self._repertory_general_entry is not None:
+            self._replace_entry(self._repertory_general_entry, selected)
+            self._update_repertory_primary_action_state()
+
+    def _select_repertory_results_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Seleziona la cartella dei risultati",
+            parent=self._repertory_dialog,
+        )
+        if selected and self._repertory_results_entry is not None:
+            self._replace_entry(self._repertory_results_entry, selected)
+            self._update_repertory_primary_action_state()
+
+    def _select_repertory_smartphone_folder(self) -> None:
+        selected = filedialog.askdirectory(
+            title="Seleziona la cartella per dispositivo Android",
+            parent=self._repertory_dialog,
+        )
+        if selected and self._repertory_smartphone_entry is not None:
+            resolved = str(Path(selected).expanduser().resolve())
+            self._replace_entry(self._repertory_smartphone_entry, resolved)
+            self._repertory_smartphone_root = resolved
+            self._repertory_selected_smartphone_folder = resolved
+            self._repertory_last_completed_smartphone_folder = None
+            self._update_repertory_android_buttons_state()
+            self._update_repertory_primary_action_state()
+
+    def _open_repertory_results_folder(self) -> None:
+        target = self._active_repertory_results_folder()
+        if not target:
+            return
+        path = Path(target)
+        if not path.exists():
+            self._set_repertory_results_folder_for_mode(self._normalize_repertory_mode(self._repertory_mode_var.get()), "")
+            self._update_repertory_open_results_button_state()
+            messagebox.showwarning("Organizza repertorio", f"Cartella non trovata:\n{path}", parent=self._repertory_dialog)
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as error:
+            messagebox.showerror("Organizza repertorio", f"Impossibile aprire la cartella risultati:\n{error}", parent=self._repertory_dialog)
+
+    def _set_repertory_results_folder_for_mode(self, mode: str, folder_path: str | None) -> None:
+        normalized_mode = self._normalize_repertory_mode(mode)
+        cleaned = str(folder_path or "").strip() or None
+        if normalized_mode == REPERTORY_MODE_UPDATE:
+            self._repertory_result_folder_update = cleaned
+            return
+        if normalized_mode == REPERTORY_MODE_DIAGNOSTICS:
+            self._repertory_result_folder_diagnostics = cleaned
+            return
+        self._repertory_result_folder_insert_tracks = cleaned
+
+    def _active_repertory_results_folder(self) -> str:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode == REPERTORY_MODE_UPDATE:
+            return str(self._repertory_result_folder_update or "").strip()
+        if mode == REPERTORY_MODE_DIAGNOSTICS:
+            return str(self._repertory_result_folder_diagnostics or "").strip()
+        return str(self._repertory_result_folder_insert_tracks or "").strip()
+
+    @staticmethod
+    def _is_existing_directory(folder_path: str) -> bool:
+        candidate = str(folder_path or "").strip()
+        if not candidate:
+            return False
+        try:
+            path = Path(candidate).expanduser()
+        except Exception:
+            return False
+        return path.exists() and path.is_dir()
+
+    def _update_repertory_open_results_button_state(self) -> None:
+        if self._repertory_open_results_button is None:
+            return
+
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        diagnostics_mode = mode == REPERTORY_MODE_DIAGNOSTICS
+        insert_tracks_mode = mode == REPERTORY_MODE_INSERT_TRACKS
+        self._repertory_open_results_button.configure(
+            text="Apri cartella Diagnosi" if diagnostics_mode else "Apri cartella risultati"
+        )
+
+        if self._repertory_dialog is None:
+            self._repertory_open_results_button.configure(state="disabled")
+            return
+        try:
+            if not bool(self._repertory_dialog.winfo_exists()):
+                self._repertory_open_results_button.configure(state="disabled")
+                return
+        except Exception:
+            self._repertory_open_results_button.configure(state="disabled")
+            return
+
+        active_results_folder = self._active_repertory_results_folder()
+        if self._is_any_repertory_worker_running() or not active_results_folder:
+            self._repertory_open_results_button.configure(state="disabled")
+            return
+
+        if insert_tracks_mode:
+            if self._rep003_session_state not in {
+                REP003_SESSION_COMPLETED,
+                REP003_SESSION_COMPLETED_WITH_ERRORS,
+                REP003_SESSION_READY_FOR_NEW_SESSION,
+            }:
+                self._repertory_open_results_button.configure(state="disabled")
+                return
+            if not self._is_existing_directory(active_results_folder):
+                self._set_repertory_results_folder_for_mode(REPERTORY_MODE_INSERT_TRACKS, "")
+                self._repertory_open_results_button.configure(state="disabled")
+                return
+
+        self._repertory_open_results_button.configure(
+            state="normal" if active_results_folder else "disabled"
+        )
+
+    def _get_repertory_smartphone_root(self) -> Path:
+        if self._repertory_smartphone_entry is not None:
+            candidate = self._repertory_smartphone_entry.get().strip()
+            if candidate:
+                return Path(candidate).expanduser().resolve()
+        return Path(self._repertory_smartphone_root).expanduser().resolve()
+
+    def _active_repertory_smartphone_folder(self) -> str:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode not in {REPERTORY_MODE_UPDATE, REPERTORY_MODE_INSERT_TRACKS}:
+            return ""
+        selected = str(self._repertory_selected_smartphone_folder or "").strip()
+        completed = str(self._repertory_last_completed_smartphone_folder or "").strip()
+        if not selected or not completed:
+            return ""
+        if self._canonical_path_for_compare(selected) != self._canonical_path_for_compare(completed):
+            return ""
+        entry_widget = self._repertory_smartphone_entry
+        if mode == REPERTORY_MODE_INSERT_TRACKS and self._rep003_smartphone_entry is not None:
+            entry_widget = self._rep003_smartphone_entry
+        if entry_widget is None:
+            return ""
+        current_entry = str(entry_widget.get() or "").strip()
+        if not current_entry:
+            return ""
+        if self._canonical_path_for_compare(current_entry) != self._canonical_path_for_compare(selected):
+            return ""
+        return completed
+
+    def _is_valid_repertory_smartphone_destination(self, folder_path: str) -> bool:
+        if not folder_path:
+            return False
+        try:
+            target = Path(folder_path).expanduser().resolve()
+        except Exception:
+            return False
+        try:
+            assert_smartphone_tablet_dir_accessible(target, require_exists=True)
+        except RuntimeError:
+            return False
+        return True
+
+    def _update_repertory_android_buttons_state(self) -> None:
+        if self._repertory_open_smartphone_button is None and self._repertory_reset_smartphone_button is None:
+            return
+
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        running = self._is_any_repertory_worker_running()
+        active_folder = self._active_repertory_smartphone_folder()
+        can_use = (
+            mode in {REPERTORY_MODE_UPDATE, REPERTORY_MODE_INSERT_TRACKS}
+            and not running
+            and not self._repertory_reset_in_progress
+            and self._is_valid_repertory_smartphone_destination(active_folder)
+        )
+
+        if self._repertory_open_smartphone_button is not None:
+            self._repertory_open_smartphone_button.configure(state="normal" if can_use else "disabled")
+
+        can_reset = False
+        if can_use:
+            try:
+                target = Path(active_folder).expanduser().resolve()
+                can_reset, _ = self._validate_repertory_smartphone_reset_target(target)
+            except Exception:
+                can_reset = False
+        if self._repertory_reset_smartphone_button is not None:
+            self._repertory_reset_smartphone_button.configure(state="normal" if can_reset else "disabled")
+
+    @staticmethod
+    def _is_filesystem_root(path: Path) -> bool:
+        return path.parent == path
+
+    def _validate_repertory_smartphone_reset_target(self, target: Path) -> tuple[bool, str]:
+        if not str(target).strip():
+            return False, "Cartella Smartphone/Tablet non valida: percorso vuoto."
+        if not target.exists() or not target.is_dir():
+            return False, "Cartella Smartphone/Tablet non valida: il percorso selezionato non esiste o non e una cartella."
+        if self._is_filesystem_root(target):
+            return False, "Operazione annullata: il reset della root del disco non e consentito."
+
+        disallowed_roots: list[Path] = []
+        for entry in (
+            self._repertory_updates_entry,
+            self._repertory_library_entry,
+            self._repertory_general_entry,
+            self._rep003_new_tracks_entry,
+            self._rep003_split_entry,
+            self._rep003_general_entry,
+        ):
+            if entry is None:
+                continue
+            raw = str(entry.get() or "").strip()
+            if not raw:
+                continue
+            try:
+                disallowed_roots.append(Path(raw).expanduser().resolve())
+            except Exception:
+                continue
+
+        for disallowed in disallowed_roots:
+            if target == disallowed:
+                return (
+                    False,
+                    "Operazione annullata: la cartella Smartphone/Tablet coincide con un percorso sorgente o repertorio.",
+                )
+        session_folder = str(self._repertory_session_folder or "").strip()
+        if session_folder:
+            try:
+                if target == Path(session_folder).expanduser().resolve():
+                    return (
+                        False,
+                        "Operazione annullata: la cartella Smartphone/Tablet coincide con la cartella di sessione.",
+                    )
+            except Exception:
+                pass
+        return True, ""
+
+    def _prompt_repertory_smartphone_folder_creation(self, parent, folder_path: Path, reason: str) -> bool:
+        dialog = ManagedCTkToplevel(parent)
+        dialog.title("Cartella Smartphone/Tablet non disponibile")
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.geometry("760x360")
+        dialog.minsize(680, 320)
+
+        user_choice = {"verify": False}
+
+        def _close(verify: bool) -> None:
+            user_choice["verify"] = verify
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
+        dialog.grid_columnconfigure(0, weight=1)
+
+        body = ctk.CTkFrame(dialog)
+        body.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        body.grid_columnconfigure(0, weight=1)
+
+        text = (
+            "Per procedere con Organizzazione Repertorio e necessario che la cartella seguente esista, "
+            "sia accessibile e scrivibile:\n\n"
+            f"{folder_path}\n\n"
+            "Correggi il percorso o rendi disponibile la cartella, poi usa Verifica.\n\n"
+            f"Dettaglio controllo: {reason}"
+        )
+        ctk.CTkLabel(body, text=text, justify="left", anchor="w", wraplength=700).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(10, 12),
+        )
+
+        button_row = ctk.CTkFrame(body, fg_color="transparent")
+        button_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        button_row.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            button_row,
+            text="Ho creato la cartella - Verifica",
+            command=lambda: _close(True),
+            height=40,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ctk.CTkButton(
+            button_row,
+            text="Annulla",
+            command=lambda: _close(False),
+            height=40,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        parent.wait_window(dialog)
+        return bool(user_choice["verify"])
+
+    def _ensure_repertory_smartphone_folder_ready(self) -> bool:
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        target = self._get_repertory_smartphone_root()
+        while True:
+            try:
+                assert_smartphone_tablet_dir_accessible(target, require_exists=True)
+                return True
+            except RuntimeError as error:
+                should_verify = self._prompt_repertory_smartphone_folder_creation(parent, target, str(error))
+                if not should_verify:
+                    return False
+
+    def _open_repertory_smartphone_folder(self) -> None:
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        active_folder = self._active_repertory_smartphone_folder()
+        if not active_folder:
+            self._update_repertory_android_buttons_state()
+            return
+        target = Path(active_folder).expanduser().resolve()
+        if not target.exists() or not target.is_dir():
+            self._repertory_last_completed_smartphone_folder = None
+            self._update_repertory_android_buttons_state()
+            messagebox.showwarning(
+                "Organizza repertorio",
+                f"Cartella Smartphone/Tablet non trovata:\n{target}",
+                parent=parent,
+            )
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(target))
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as error:
+            messagebox.showerror(
+                "Organizza repertorio",
+                f"Impossibile aprire la cartella Smartphone/Tablet:\n{error}",
+                parent=parent,
+            )
+
+    def _confirm_reset_repertory_smartphone_folder(self) -> bool:
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        active_folder = self._active_repertory_smartphone_folder()
+        if not active_folder:
+            self._update_repertory_android_buttons_state()
+            return False
+        target = Path(active_folder).expanduser().resolve()
+        dialog = ManagedCTkToplevel(parent)
+        dialog.title("Reset cartella Smartphone/Tablet")
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.geometry("820x420")
+        dialog.minsize(760, 380)
+
+        accepted = {"value": False}
+
+        def _close(value: bool) -> None:
+            accepted["value"] = value
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
+        dialog.grid_columnconfigure(0, weight=1)
+
+        content = ctk.CTkFrame(dialog)
+        content.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        content.grid_columnconfigure(0, weight=1)
+
+        message = (
+            "Tutti i file e tutte le sottocartelle presenti nella cartella:\n\n"
+            f"{target}\n\n"
+            "verranno eliminati.\n\n"
+            "La cartella principale verra mantenuta e sara pronta per una nuova sincronizzazione.\n\n"
+            "L'operazione e irreversibile.\n\n"
+            "Vuoi continuare?"
+        )
+        ctk.CTkLabel(content, text=message, justify="left", anchor="w", wraplength=760).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(10, 12),
+        )
+
+        row = ctk.CTkFrame(content, fg_color="transparent")
+        row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        row.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            row,
+            text="Si, svuota la cartella",
+            command=lambda: _close(True),
+            height=40,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            row,
+            text="Annulla",
+            command=lambda: _close(False),
+            height=40,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        parent.wait_window(dialog)
+        return bool(accepted["value"])
+
+    def _reset_repertory_smartphone_folder(self) -> None:
+        if self._repertory_reset_in_progress:
+            return
+
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        active_folder = self._active_repertory_smartphone_folder()
+        if not active_folder:
+            self._update_repertory_android_buttons_state()
+            return
+        target = Path(active_folder).expanduser().resolve()
+        allowed, reason = self._validate_repertory_smartphone_reset_target(target)
+        if not allowed:
+            messagebox.showerror("Reset cartella Smartphone/Tablet", reason, parent=parent)
+            self._update_repertory_android_buttons_state()
+            return
+
+        if not self._confirm_reset_repertory_smartphone_folder():
+            return
+
+        self._repertory_reset_in_progress = True
+        self._update_repertory_android_buttons_state()
+
+        def _run_reset() -> None:
+            try:
+                deleted_files, deleted_dirs = reset_smartphone_tablet_dir(
+                    target,
+                    expected_root=target,
+                )
+            except Exception as error:
+                self.after(0, self._on_repertory_smartphone_reset_failed, str(error))
+                return
+            self.after(0, self._on_repertory_smartphone_reset_completed, deleted_files, deleted_dirs)
+
+        threading.Thread(target=_run_reset, daemon=True).start()
+
+    def _on_repertory_smartphone_reset_failed(self, error_message: str) -> None:
+        self._repertory_reset_in_progress = False
+        self._update_repertory_android_buttons_state()
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        messagebox.showerror(
+            "Reset cartella Smartphone/Tablet",
+            f"Impossibile completare il reset:\n{error_message}",
+            parent=parent,
+        )
+
+    def _on_repertory_smartphone_reset_completed(self, deleted_files: int, deleted_dirs: int) -> None:
+        self._repertory_reset_in_progress = False
+        self._update_repertory_android_buttons_state()
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        if deleted_files == 0 and deleted_dirs == 0:
+            messagebox.showinfo(
+                "Reset cartella Smartphone/Tablet",
+                "La cartella Smartphone/Tablet e gia vuota.",
+                parent=parent,
+            )
+            return
+
+        messagebox.showinfo(
+            "Reset cartella Smartphone/Tablet",
+            "Cartella Smartphone/Tablet svuotata con successo.\n\n"
+            f"File eliminati: {deleted_files}\n"
+            f"Sottocartelle eliminate: {deleted_dirs}\n\n"
+            "La cartella e pronta per ricevere i prossimi aggiornamenti.",
+            parent=parent,
+        )
+
+    @staticmethod
+    def _compute_repertory_window_geometry(screen_width: int, screen_height: int) -> tuple[int, int, int, int]:
+        safe_screen_width = max(920, int(screen_width))
+        safe_screen_height = max(720, int(screen_height))
+        horizontal_margin = 64
+        vertical_margin = 96
+        desired_width = 1300
+        desired_height = 880
+        window_width = min(desired_width, max(900, safe_screen_width - horizontal_margin))
+        window_height = min(desired_height, max(640, safe_screen_height - vertical_margin))
+        return window_width, window_height, horizontal_margin, vertical_margin
+
+    def _compute_rep003_window_geometry(self, screen_width: int, screen_height: int) -> tuple[int, int]:
+        safe_screen_width = max(980, int(screen_width))
+        safe_screen_height = max(760, int(screen_height))
+        width = min(1540, max(1020, safe_screen_width - 64))
+        height = min(920, max(720, safe_screen_height - 88))
+        return width, height
+
+    def _select_rep003_folder(self, entry_widget, title: str) -> None:
+        if entry_widget is None:
+            return
+        selected = filedialog.askdirectory(title=title, parent=self._rep003_window)
+        if selected:
+            self._replace_entry(entry_widget, selected)
+
+    def _close_rep003_window(self) -> None:
+        if self.rep003_worker.is_running and not self._is_destroying:
+            confirm = messagebox.askyesno(
+                "Inserimento nuovi brani",
+                "Elaborazione in corso. Vuoi interrompere l'aggiornamento?",
+                parent=self._rep003_window,
+            )
+            if not confirm:
+                return
+            self.rep003_worker.cancel()
+            return
+
+        self._close_rep003_decision_dialog()
+        self._close_rep003_create_folder_dialog()
+        self._reset_rep003_operational_session(
+            preserve_results=False,
+            preserve_android_destination=False,
+            clear_paths=True,
+        )
+        if self._rep003_window is not None:
+            self._cleanup_tooltips(owner=self._rep003_window)
+            try:
+                self._rep003_window.destroy()
+            except Exception:
+                pass
+        self._rep003_window = None
+        self._rep003_tracks_tree = None
+        self._rep003_folders_tree = None
+        self._rep003_new_tracks_entry = None
+        self._rep003_split_entry = None
+        self._rep003_general_entry = None
+        self._rep003_smartphone_entry = None
+        self._rep003_status_label = None
+        self._rep003_load_button = None
+        self._rep003_create_folder_button = None
+        self._rep003_refresh_folders_button = None
+        self._rep003_assign_button = None
+        self._rep003_remove_button = None
+        self._rep003_show_managed_switch = None
+        self._rep003_browse_buttons = []
+        self._rep003_track_row_by_iid = {}
+        self._rep003_folder_iid_by_relative = {}
+        self._rep003_tracks_h_scroll = None
+        self._rep003_folders_h_scroll = None
+        self._rep003_folder_sort_key = REP003_SORT_FOLDER_RELATIVE
+        self._rep003_folder_sort_reverse = False
+        self._rep003_pending_decision_request_id = None
+        self._rep003_create_folder_dialog = None
+        self._rep003_create_folder_entry = None
+        self._rep003_create_folder_focus_after_id = None
+        self._rep003_create_folder_preview_var.set("")
+        self._rep003_session_policy = "ASK"
+        self._rep003_session_state = REP003_SESSION_NOT_LOADED
+        self._rep003_last_processed_sources = set()
+
+    def _build_rep003_panel(self, parent: Any) -> None:
+        self._rep003_panel_frame = parent
+        self._rep003_window = self._repertory_dialog
+        self._configure_rep003_treeview_style()
+
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+        self._rep003_browse_buttons = []
+        self._rep003_path_widgets = []
+
+        paths_frame = ctk.CTkFrame(parent)
+        paths_frame.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+        paths_frame.grid_columnconfigure(1, weight=1)
+
+        def _add_path_row(row: int, label: str, title: str):
+            ctk.CTkLabel(paths_frame, text=label, anchor="w").grid(row=row, column=0, sticky="w", padx=10, pady=4)
+            entry = ctk.CTkEntry(paths_frame)
+            entry.grid(row=row, column=1, sticky="ew", padx=10, pady=4)
+            browse_btn = ctk.CTkButton(
+                paths_frame,
+                text="Sfoglia",
+                width=90,
+                command=lambda e=entry, t=title: self._select_rep003_folder(e, t),
+            )
+            browse_btn.grid(row=row, column=2, sticky="e", padx=(0, 10), pady=4)
+            self._rep003_browse_buttons.append(browse_btn)
+            self._rep003_path_widgets.extend([entry, browse_btn])
+            return entry
+
+        self._rep003_new_tracks_entry = _add_path_row(0, "Cartella Nuovi Brani", "Seleziona Cartella Nuovi Brani")
+        self._rep003_split_entry = _add_path_row(1, "Cartella Repertorio Suddiviso", "Seleziona Cartella Repertorio Suddiviso")
+        self._rep003_general_entry = _add_path_row(2, "Cartella Repertorio Generale", "Seleziona Cartella Repertorio Generale")
+        self._rep003_smartphone_entry = _add_path_row(3, "Cartella Smartphone/Tablet", "Seleziona Cartella Smartphone/Tablet")
+
+        content = ctk.CTkFrame(parent)
+        content.grid(row=1, column=0, sticky="nsew", padx=12, pady=8)
+        content.grid_columnconfigure(0, weight=7)
+        content.grid_columnconfigure(1, weight=4, minsize=340)
+        content.grid_columnconfigure(2, weight=7)
+        content.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkFrame(content)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        left.grid_columnconfigure(0, weight=1)
+        left.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(left, text="Lista Nuovi Brani", anchor="w").grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        self._rep003_tracks_tree = ttk.Treeview(
+            left,
+            columns=("name", "status", "folders"),
+            show="headings",
+            selectmode="extended",
+            style="Rep003.Treeview",
+        )
+        self._rep003_tracks_tree.heading("name", text="Nome File", command=lambda: self._rep003_sort_tracks_by(REP003_SORT_NAME))
+        self._rep003_tracks_tree.heading("status", text="Stato", command=lambda: self._rep003_sort_tracks_by(REP003_SORT_STATUS))
+        self._rep003_tracks_tree.heading("folders", text="Cartelle Abbinate", command=lambda: self._rep003_sort_tracks_by(REP003_SORT_FOLDERS))
+        self._rep003_tracks_tree.column("name", width=460, minwidth=320, anchor="w", stretch=True)
+        self._rep003_tracks_tree.column("status", width=180, minwidth=150, anchor="center", stretch=False)
+        self._rep003_tracks_tree.column("folders", width=560, minwidth=300, anchor="w", stretch=True)
+
+        tracks_v_scroll = ttk.Scrollbar(left, orient="vertical", command=self._rep003_tracks_tree.yview)
+        tracks_h_scroll = ttk.Scrollbar(left, orient="horizontal", command=self._rep003_tracks_tree.xview)
+        self._rep003_tracks_tree.configure(yscrollcommand=tracks_v_scroll.set, xscrollcommand=tracks_h_scroll.set)
+        self._rep003_tracks_tree.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=(0, 0))
+        tracks_v_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=(0, 0))
+        tracks_h_scroll.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._rep003_tracks_tree.bind("<<TreeviewSelect>>", self._rep003_on_tracks_selection_changed)
+        self._rep003_tracks_tree.bind("<Configure>", lambda _event: self._rep003_update_horizontal_scrollbars_visibility())
+
+        center = ctk.CTkFrame(content)
+        center.grid(row=0, column=1, sticky="nsew", padx=8)
+        center.grid_columnconfigure(0, weight=1, minsize=300)
+
+        rep003_center_button_font = ctk.CTkFont("Segoe UI Semibold", 14)
+        rep003_center_switch_font = ctk.CTkFont("Segoe UI", 13)
+        rep003_button_height = 44
+
+        self._rep003_load_button = ctk.CTkButton(
+            center,
+            text="Carica cartelle e brani",
+            width=300,
+            height=rep003_button_height,
+            font=rep003_center_button_font,
+            command=self._rep003_load_sources,
+        )
+        self._rep003_load_button.grid(row=0, column=0, sticky="ew", padx=10, pady=(12, 8))
+        self._rep003_path_widgets.append(self._rep003_load_button)
+
+        self._rep003_show_managed_switch = ctk.CTkSwitch(
+            center,
+            text="Mostra brani gestiti",
+            width=300,
+            height=38,
+            font=rep003_center_switch_font,
+            variable=self._rep003_show_managed_var,
+            command=self._rep003_on_show_managed_toggle,
+        )
+        self._rep003_show_managed_switch.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        self._rep003_create_folder_button = ctk.CTkButton(
+            center,
+            text="Crea nuova cartella",
+            width=300,
+            height=rep003_button_height,
+            font=rep003_center_button_font,
+            command=self._rep003_create_folder,
+        )
+        self._rep003_create_folder_button.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        self._rep003_refresh_folders_button = ctk.CTkButton(
+            center,
+            text="Aggiorna elenco cartelle",
+            width=300,
+            height=rep003_button_height,
+            font=rep003_center_button_font,
+            command=self._rep003_refresh_folders_only,
+        )
+        self._rep003_refresh_folders_button.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        self._rep003_assign_button = ctk.CTkButton(
+            center,
+            text="Conferma abbinamento",
+            width=300,
+            height=rep003_button_height,
+            font=rep003_center_button_font,
+            command=self._rep003_assign_selected,
+        )
+        self._rep003_assign_button.grid(row=4, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self._rep003_remove_button = ctk.CTkButton(
+            center,
+            text="Elimina abbinamento",
+            width=300,
+            height=rep003_button_height,
+            font=rep003_center_button_font,
+            command=self._rep003_remove_assignment,
+        )
+        self._rep003_remove_button.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        right = ctk.CTkFrame(content)
+        right.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(right, text="Lista Cartelle Repertorio", anchor="w").grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        self._rep003_folders_tree = ttk.Treeview(
+            right,
+            columns=("folder", "relative", "count", "size"),
+            show="headings",
+            selectmode="extended",
+            style="Rep003.Treeview",
+        )
+        self._rep003_folders_tree.heading("folder", text="Nome Cartella", command=lambda: self._rep003_sort_folders_by(REP003_SORT_FOLDER_NAME))
+        self._rep003_folders_tree.heading("relative", text="Percorso Relativo", command=lambda: self._rep003_sort_folders_by(REP003_SORT_FOLDER_RELATIVE))
+        self._rep003_folders_tree.heading("count", text="Numero MP3 diretti", command=lambda: self._rep003_sort_folders_by(REP003_SORT_FOLDER_COUNT))
+        self._rep003_folders_tree.heading("size", text="Dimensione MP3 diretti", command=lambda: self._rep003_sort_folders_by(REP003_SORT_FOLDER_SIZE))
+        self._rep003_folders_tree.column("folder", width=280, minwidth=220, anchor="w", stretch=True)
+        self._rep003_folders_tree.column("relative", width=430, minwidth=300, anchor="w", stretch=True)
+        self._rep003_folders_tree.column("count", width=170, minwidth=160, anchor="center", stretch=False)
+        self._rep003_folders_tree.column("size", width=220, minwidth=190, anchor="e", stretch=False)
+
+        folders_v_scroll = ttk.Scrollbar(right, orient="vertical", command=self._rep003_folders_tree.yview)
+        folders_h_scroll = ttk.Scrollbar(right, orient="horizontal", command=self._rep003_folders_tree.xview)
+        self._rep003_folders_tree.configure(yscrollcommand=folders_v_scroll.set, xscrollcommand=folders_h_scroll.set)
+        self._rep003_folders_tree.grid(row=1, column=0, sticky="nsew", padx=(8, 0), pady=(0, 0))
+        folders_v_scroll.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=(0, 0))
+        folders_h_scroll.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        self._rep003_folders_tree.bind("<<TreeviewSelect>>", self._rep003_on_folders_selection_changed)
+        self._rep003_folders_tree.bind("<Configure>", lambda _event: self._rep003_update_horizontal_scrollbars_visibility())
+
+        self._rep003_tracks_h_scroll = tracks_h_scroll
+        self._rep003_folders_h_scroll = folders_h_scroll
+
+        footer = ctk.CTkFrame(parent, fg_color="transparent")
+        footer.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        footer.grid_columnconfigure(0, weight=1)
+
+        self._rep003_status_label = ctk.CTkLabel(footer, text="Brani caricati: 0 | Gestiti: 0 | Da gestire: 0", anchor="w")
+        self._rep003_status_label.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+
+        self._rep003_path_widgets.extend([
+            self._rep003_create_folder_button,
+            self._rep003_refresh_folders_button,
+            self._rep003_assign_button,
+            self._rep003_remove_button,
+            self._rep003_show_managed_switch,
+            self._rep003_tracks_tree,
+            self._rep003_folders_tree,
+        ])
+
+        self._replace_entry(self._rep003_new_tracks_entry, str(self.settings.get("rep003_new_tracks_folder", "") or ""))
+        self._replace_entry(self._rep003_split_entry, str(self.settings.get("rep003_split_folder", "") or self.settings.get("repertory_library_folder", "") or ""))
+        self._replace_entry(
+            self._rep003_general_entry,
+            str(self.settings.get("rep003_general_folder", "") or self.settings.get("repertory_general_folder", "") or self.settings.get("repertory_library_folder", "") or ""),
+        )
+        self._replace_entry(self._rep003_smartphone_entry, str(self.settings.get("rep003_smartphone_folder", "") or self._repertory_smartphone_root or ""))
+
+        self._rep003_show_managed_var.set(True)
+        self._rep003_sort_key = REP003_SORT_NAME
+        self._rep003_sort_reverse = False
+        self._rep003_folder_sort_key = REP003_SORT_FOLDER_RELATIVE
+        self._rep003_folder_sort_reverse = False
+        self._rep003_refresh_folders_tree(clear_selection=True)
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        self._rep003_update_status()
+        self._rep003_update_horizontal_scrollbars_visibility()
+
+        self._rep003_new_tracks_entry_tooltip = self._add_tooltip(
+            self._rep003_new_tracks_entry,
+            "Seleziona la cartella contenente i nuovi MP3 da inserire. Le sottocartelle non vengono lette.",
+        )
+        self._rep003_split_entry_tooltip = self._add_tooltip(
+            self._rep003_split_entry,
+            "Seleziona la root del repertorio in cui assegnare i nuovi brani.",
+        )
+        self._rep003_general_entry_tooltip = self._add_tooltip(
+            self._rep003_general_entry,
+            "Seleziona la cartella piatta che conterra una copia di ogni nuovo brano.",
+        )
+        self._rep003_smartphone_entry_tooltip = self._add_tooltip(
+            self._rep003_smartphone_entry,
+            "Seleziona la cartella di appoggio destinata alla futura sincronizzazione Android.",
+        )
+        self._rep003_load_button_tooltip = self._add_tooltip(
+            self._rep003_load_button,
+            "Carica i nuovi MP3 e l'elenco delle cartelle disponibili.",
+        )
+        self._rep003_show_managed_tooltip = self._add_tooltip(
+            self._rep003_show_managed_switch,
+            "Attivo: mostra anche i brani gia abbinati. Disattivo: mostra soltanto quelli da gestire.",
+        )
+        self._rep003_create_folder_tooltip = self._add_tooltip(
+            self._rep003_create_folder_button,
+            "Crea una nuova cartella nella destinazione selezionata del Repertorio suddiviso.",
+        )
+        self._rep003_refresh_folders_tooltip = self._add_tooltip(
+            self._rep003_refresh_folders_button,
+            "Rilegge le cartelle senza cancellare brani e abbinamenti gia memorizzati.",
+        )
+        self._rep003_assign_button_tooltip = self._add_tooltip(
+            self._rep003_assign_button,
+            "Memorizza le cartelle selezionate per i brani scelti.",
+        )
+        self._rep003_remove_button_tooltip = self._add_tooltip(
+            self._rep003_remove_button,
+            "Cancella gli abbinamenti memorizzati per i brani selezionati.",
+        )
+
+    def _configure_rep003_treeview_style(self) -> None:
+        if self._rep003_ttk_style_configured:
+            return
+        style = ttk.Style(self)
+        style.configure(
+            "Rep003.Treeview",
+            font=("Segoe UI", 14),
+            rowheight=34,
+            padding=2,
+        )
+        style.configure(
+            "Rep003.Treeview.Heading",
+            font=("Segoe UI Semibold", 14),
+            padding=(8, 6),
+        )
+        style.map(
+            "Rep003.Treeview",
+            background=[("selected", "#275d9a")],
+            foreground=[("selected", "#ffffff")],
+        )
+        self._rep003_ttk_style_configured = True
+
+    def _rep003_update_horizontal_scrollbars_visibility(self) -> None:
+        pairs = (
+            (self._rep003_tracks_tree, self._rep003_tracks_h_scroll),
+            (self._rep003_folders_tree, self._rep003_folders_h_scroll),
+        )
+        for tree, scroll in pairs:
+            if tree is None or scroll is None:
+                continue
+            try:
+                start, end = tree.xview()
+            except Exception:
+                continue
+            if float(start) <= 0.0 and float(end) >= 1.0:
+                scroll.grid_remove()
+            else:
+                scroll.grid()
+
+    def _close_rep003_decision_dialog(self) -> None:
+        if self._rep003_decision_dialog is not None:
+            try:
+                self._rep003_decision_dialog.destroy()
+            except Exception:
+                pass
+        self._rep003_decision_dialog = None
+
+    def _close_rep003_create_folder_dialog(self) -> None:
+        dialog = self._rep003_create_folder_dialog
+        focus_after_id = self._rep003_create_folder_focus_after_id
+        self._rep003_create_folder_dialog = None
+        self._rep003_create_folder_entry = None
+        self._rep003_create_folder_focus_after_id = None
+        self._rep003_create_folder_preview_var.set("")
+
+        if dialog is not None:
+            try:
+                if focus_after_id is not None:
+                    dialog.after_cancel(focus_after_id)
+            except Exception:
+                pass
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        if self._rep003_window is not None:
+            try:
+                self._rep003_window.focus_set()
+            except Exception:
+                pass
+
+    def _rep003_set_ui_running_state(self, running: bool) -> None:
+        widgets: list[Any] = [
+            self._rep003_new_tracks_entry,
+            self._rep003_split_entry,
+            self._rep003_general_entry,
+            self._rep003_smartphone_entry,
+            self._rep003_load_button,
+            self._rep003_create_folder_button,
+            self._rep003_refresh_folders_button,
+            self._rep003_assign_button,
+            self._rep003_remove_button,
+            self._rep003_show_managed_switch,
+            self._rep003_tracks_tree,
+            self._rep003_folders_tree,
+        ]
+        widgets.extend(self._rep003_browse_buttons)
+        state = "disabled" if running else "normal"
+        for widget in widgets:
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=state)
+            except Exception:
+                continue
+        if not running:
+            self._rep003_update_assignment_buttons_state()
+
+    def _rep003_status_display(self, item) -> str:
+        if item.status != STATUS_GESTITO:
+            return STATUS_DA_GESTIRE
+        unavailable_count = self._rep003_count_unavailable_destinations(item.destinations)
+        if unavailable_count > 0:
+            return f"{STATUS_GESTITO} ({len(item.destinations)}, non disponibili: {unavailable_count})"
+        return f"{STATUS_GESTITO} ({len(item.destinations)})"
+
+    @staticmethod
+    def _rep003_normalize_relative_path(value: str | None) -> str:
+        return str(value or "").strip().replace("\\", "/").strip("/")
+
+    @staticmethod
+    def _rep003_destination_key(value: str | None) -> str:
+        normalized = str(value or "").strip().replace("\\", "/").strip("/")
+        if normalized == ".":
+            return ""
+        return normalized
+
+    def _rep003_folder_relatives_set(self) -> set[str]:
+        return {
+            self._rep003_normalize_relative_path(folder.relative_path)
+            for folder in self._rep003_model.folders
+        }
+
+    def _rep003_count_unavailable_destinations(self, destinations: tuple[str, ...]) -> int:
+        if not destinations:
+            return 0
+        available = self._rep003_folder_relatives_set()
+        missing = 0
+        for destination in destinations:
+            if self._rep003_destination_key(destination) not in available:
+                missing += 1
+        return missing
+
+    def _rep003_destination_labels_with_availability(self, source_path: str) -> str:
+        item = self._rep003_model.get_track(source_path)
+        if item is None or not item.destinations:
+            return ""
+
+        available = self._rep003_folder_relatives_set()
+        labels: list[str] = []
+        for destination in item.destinations:
+            normalized = self._rep003_destination_key(destination)
+            label = self._rep003_model._display_label_for_destination(normalized)
+            if normalized not in available:
+                label = f"{label} [NON DISPONIBILE]"
+            labels.append(label)
+        return ", ".join(labels)
+
+    def _rep003_folders_display_value(self, source_path: str) -> str:
+        rendered = self._rep003_destination_labels_with_availability(source_path).strip()
+        return rendered if rendered else "-"
+
+    @staticmethod
+    def _rep003_sortable_folders_value(rendered_value: str) -> str:
+        normalized = str(rendered_value or "").strip()
+        if not normalized or normalized == "-":
+            return ""
+        return normalized.casefold()
+
+    def _rep003_restore_folder_selection(self, selected_relative_paths: list[str]) -> None:
+        if self._rep003_folders_tree is None:
+            return
+        if not selected_relative_paths:
+            return
+        selected_iids: list[str] = []
+        for relative in selected_relative_paths:
+            normalized = self._rep003_normalize_relative_path(relative)
+            iid = "__ROOT__" if normalized in {"", "."} else normalized
+            if iid in self._rep003_folder_iid_by_relative:
+                selected_iids.append(iid)
+        if selected_iids:
+            self._rep003_folders_tree.selection_set(selected_iids)
+
+    @staticmethod
+    def _rep003_folder_sort_token(folder, key: str):
+        relative = str(folder.relative_path or "")
+        if key == REP003_SORT_FOLDER_NAME:
+            return str(folder.folder_name or "").casefold()
+        if key == REP003_SORT_FOLDER_COUNT:
+            return int(folder.direct_mp3_count)
+        if key == REP003_SORT_FOLDER_SIZE:
+            return int(folder.direct_mp3_size_bytes)
+        return relative.casefold()
+
+    def _rep003_selected_track_paths(self) -> list[str]:
+        if self._rep003_tracks_tree is None:
+            return []
+        selected_paths: list[str] = []
+        for iid in self._rep003_tracks_tree.selection():
+            source_path = self._rep003_track_row_by_iid.get(str(iid))
+            if source_path:
+                selected_paths.append(source_path)
+        return selected_paths
+
+    def _rep003_selected_folder_relative_paths(self) -> list[str]:
+        if self._rep003_folders_tree is None:
+            return []
+        selected: list[str] = []
+        for iid in self._rep003_folders_tree.selection():
+            relative = self._rep003_folder_iid_by_relative.get(str(iid), None)
+            if relative is None:
+                continue
+            selected.append(relative if relative else ".")
+        return selected
+
+    def _rep003_update_status(self) -> None:
+        if self._rep003_status_label is None:
+            return
+        if not self._widget_exists(self._rep003_status_label):
+            return
+        total = len(self._rep003_model.tracks)
+        managed = sum(1 for item in self._rep003_model.tracks if item.status == STATUS_GESTITO)
+        try:
+            self._rep003_status_label.configure(text=f"Brani caricati: {total} | Gestiti: {managed} | Da gestire: {max(0, total - managed)}")
+        except (tk.TclError, RuntimeError):
+            return
+
+    def _rep003_update_assignment_buttons_state(self) -> None:
+        has_tracks = bool(self._rep003_model.tracks)
+        selected_tracks = self._rep003_selected_track_paths()
+        selected_folders = self._rep003_selected_folder_relative_paths()
+        running = self.rep003_worker.is_running
+
+        can_assign = bool(has_tracks and selected_tracks and selected_folders and not running)
+        can_remove = False
+        if has_tracks and selected_tracks and not running:
+            for source_path in selected_tracks:
+                item = self._rep003_model.get_track(source_path)
+                if item is not None and item.status == STATUS_GESTITO and bool(item.destinations):
+                    can_remove = True
+                    break
+
+        if self._rep003_assign_button is not None:
+            try:
+                self._rep003_assign_button.configure(state="normal" if can_assign else "disabled")
+            except Exception:
+                pass
+        if self._rep003_remove_button is not None:
+            try:
+                self._rep003_remove_button.configure(state="normal" if can_remove else "disabled")
+            except Exception:
+                pass
+
+    def _rep003_update_finalize_button_state(self) -> None:
+        self._update_repertory_primary_action_state()
+
+    @staticmethod
+    def _rep003_format_binary_size(size_bytes: int) -> str:
+        value = float(max(0, int(size_bytes)))
+        units = ["B", "KB", "MB", "GB"]
+        index = 0
+        while value >= 1024.0 and index < len(units) - 1:
+            value /= 1024.0
+            index += 1
+        if index == 0:
+            return f"{int(value)} {units[index]}"
+        return f"{value:.2f} {units[index]}"
+
+    def _rep003_refresh_folders_tree(self, *, clear_selection: bool = True) -> None:
+        if self._rep003_folders_tree is None:
+            return
+
+        self._rep003_folders_tree.delete(*self._rep003_folders_tree.get_children())
+        self._rep003_folder_iid_by_relative = {}
+        folders = sorted(
+            self._rep003_model.folders,
+            key=lambda row: self._rep003_folder_sort_token(row, self._rep003_folder_sort_key),
+            reverse=self._rep003_folder_sort_reverse,
+        )
+
+        for folder in folders:
+            relative = str(folder.relative_path or "")
+            iid = "__ROOT__" if not relative else relative
+            relative_display = "." if not relative else relative
+            self._rep003_folders_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    folder.folder_name,
+                    relative_display,
+                    str(folder.direct_mp3_count),
+                    self._rep003_format_binary_size(folder.direct_mp3_size_bytes),
+                ),
+            )
+            self._rep003_folder_iid_by_relative[iid] = relative
+
+        if clear_selection:
+            self._rep003_folders_tree.selection_remove(self._rep003_folders_tree.selection())
+        self._rep003_update_horizontal_scrollbars_visibility()
+        self._rep003_update_assignment_buttons_state()
+
+    def _rep003_refresh_tracks_tree(self, *, clear_selection: bool = True) -> None:
+        if self._rep003_tracks_tree is None:
+            return
+
+        show_managed = bool(self._rep003_show_managed_var.get())
+        rows = self._rep003_model.get_visible_tracks(show_managed=show_managed)
+        if self._rep003_sort_key == REP003_SORT_STATUS:
+            rows = sorted(
+                rows,
+                key=lambda row: (
+                    0 if row.status != STATUS_GESTITO else 1,
+                    len(row.destinations),
+                    row.file_name.casefold(),
+                ),
+                reverse=self._rep003_sort_reverse,
+            )
+        elif self._rep003_sort_key == REP003_SORT_FOLDERS:
+            rows = sorted(
+                rows,
+                key=lambda row: (
+                    self._rep003_sortable_folders_value(self._rep003_folders_display_value(row.source_path)),
+                    row.file_name.casefold(),
+                ),
+                reverse=self._rep003_sort_reverse,
+            )
+        else:
+            rows = self._rep003_model.sort_tracks(rows, self._rep003_sort_key, self._rep003_sort_reverse)
+
+        self._rep003_tracks_tree.delete(*self._rep003_tracks_tree.get_children())
+        self._rep003_track_row_by_iid = {}
+        for index, row in enumerate(rows):
+            iid = f"track-{index}"
+            self._rep003_tracks_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    row.file_name,
+                    self._rep003_status_display(row),
+                    self._rep003_folders_display_value(row.source_path),
+                ),
+            )
+            self._rep003_track_row_by_iid[iid] = row.source_path
+
+        if clear_selection:
+            self._rep003_tracks_tree.selection_remove(self._rep003_tracks_tree.selection())
+        self._rep003_update_horizontal_scrollbars_visibility()
+        self._rep003_update_assignment_buttons_state()
+
+    def _rep003_sort_tracks_by(self, key: str) -> None:
+        selected_tracks = self._rep003_selected_track_paths()
+        selected_folders = self._rep003_selected_folder_relative_paths()
+        if key == self._rep003_sort_key:
+            self._rep003_sort_reverse = not self._rep003_sort_reverse
+        else:
+            self._rep003_sort_key = key
+            self._rep003_sort_reverse = False
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        self._rep003_restore_track_selection(selected_tracks)
+        self._rep003_restore_folder_selection(selected_folders)
+
+    def _rep003_sort_folders_by(self, key: str) -> None:
+        if key == self._rep003_folder_sort_key:
+            self._rep003_folder_sort_reverse = not self._rep003_folder_sort_reverse
+        else:
+            self._rep003_folder_sort_key = key
+            self._rep003_folder_sort_reverse = False
+        self._rep003_refresh_folders_tree(clear_selection=True)
+        if self._rep003_tracks_tree is not None:
+            self._rep003_tracks_tree.selection_remove(self._rep003_tracks_tree.selection())
+
+    def _rep003_on_show_managed_toggle(self) -> None:
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        if self._rep003_folders_tree is not None:
+            self._rep003_folders_tree.selection_remove(self._rep003_folders_tree.selection())
+        self._rep003_update_assignment_buttons_state()
+        self._rep003_update_finalize_button_state()
+
+    def _rep003_on_tracks_selection_changed(self, _event=None) -> None:
+        if self._rep003_folders_tree is None:
+            return
+        selected_tracks = self._rep003_selected_track_paths()
+        self._rep003_folders_tree.selection_remove(self._rep003_folders_tree.selection())
+        if len(selected_tracks) != 1:
+            return
+        item = self._rep003_model.get_track(selected_tracks[0])
+        if item is None or item.status != STATUS_GESTITO:
+            return
+        for destination in item.destinations:
+            relative = "" if destination == "." else destination
+            iid = "__ROOT__" if not relative else relative
+            if iid in self._rep003_folder_iid_by_relative:
+                self._rep003_folders_tree.selection_add(iid)
+                try:
+                    self._rep003_folders_tree.see(iid)
+                except Exception:
+                    pass
+        self._rep003_update_assignment_buttons_state()
+
+    def _rep003_on_folders_selection_changed(self, _event=None) -> None:
+        self._rep003_update_assignment_buttons_state()
+
+    def _rep003_assign_selected(self) -> None:
+        selected_tracks = self._rep003_selected_track_paths()
+        if not selected_tracks:
+            messagebox.showerror("Inserimento nuovi brani", "Selezionare almeno un brano.", parent=self._rep003_window)
+            return
+        selected_folders = self._rep003_selected_folder_relative_paths()
+        if not selected_folders:
+            messagebox.showerror("Inserimento nuovi brani", "Selezionare almeno una cartella repertorio.", parent=self._rep003_window)
+            return
+
+        try:
+            self._rep003_model.assign_tracks(selected_tracks, selected_folders)
+        except ValueError as error:
+            messagebox.showerror("Inserimento nuovi brani", str(error), parent=self._rep003_window)
+            return
+
+        self._rep003_refresh_folders_tree(clear_selection=True)
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        if self._rep003_folders_tree is not None:
+            self._rep003_folders_tree.selection_remove(self._rep003_folders_tree.selection())
+        self._rep003_update_status()
+        self._rep003_update_session_state_from_model()
+        self._rep003_update_assignment_buttons_state()
+        self._rep003_update_finalize_button_state()
+
+    def _rep003_remove_assignment(self) -> None:
+        selected_tracks = self._rep003_selected_track_paths()
+        if not selected_tracks:
+            messagebox.showerror("Inserimento nuovi brani", "Selezionare almeno un brano da aggiornare.", parent=self._rep003_window)
+            return
+        self._rep003_model.remove_assignments(selected_tracks)
+        self._rep003_refresh_folders_tree(clear_selection=True)
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        if self._rep003_folders_tree is not None:
+            self._rep003_folders_tree.selection_remove(self._rep003_folders_tree.selection())
+        self._rep003_update_status()
+        self._rep003_update_session_state_from_model()
+        self._rep003_update_assignment_buttons_state()
+        self._rep003_update_finalize_button_state()
+
+    def _rep003_load_sources(self) -> None:
+        if self._rep003_new_tracks_entry is None or self._rep003_split_entry is None or self._rep003_general_entry is None or self._rep003_smartphone_entry is None:
+            return
+
+        new_tracks_folder = self._rep003_new_tracks_entry.get().strip()
+        split_folder = self._rep003_split_entry.get().strip()
+        general_folder = self._rep003_general_entry.get().strip()
+        smartphone_folder = self._rep003_smartphone_entry.get().strip()
+
+        if not new_tracks_folder or not Path(new_tracks_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Nuovi Brani non valida.", parent=self._rep003_window)
+            return
+        if not split_folder or not Path(split_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Suddiviso non valida.", parent=self._rep003_window)
+            return
+        if not general_folder or not Path(general_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Generale non valida.", parent=self._rep003_window)
+            return
+
+        try:
+            ensure_folder_available(smartphone_folder)
+        except Exception as error:
+            messagebox.showerror("Inserimento nuovi brani", f"Cartella Smartphone/Tablet non disponibile:\n{error}", parent=self._rep003_window)
+            return
+
+        split_root = Path(split_folder).expanduser().resolve()
+        general_root = Path(general_folder).expanduser().resolve()
+        if self._repertory_paths_collide(split_folder, general_folder):
+            messagebox.showerror(
+                "Inserimento nuovi brani",
+                "La Cartella Repertorio Generale non puo coincidere con il Repertorio Suddiviso.",
+                parent=self._rep003_window,
+            )
+            return
+
+        self._rep003_update_session_state_from_model()
+        if self._rep003_has_pending_assignments():
+            pending_count = self._rep003_count_assigned_tracks()
+            proceed = self._show_rep003_confirmation_dialog(
+                title="Attenzione: abbinamenti in corso",
+                body=(
+                    "Sono presenti abbinamenti non ancora elaborati.\n"
+                    "Se ricarichi ora, verranno persi.\n\n"
+                    f"Abbinamenti correnti: {pending_count}\n\n"
+                    "Vuoi continuare e ricaricare comunque?"
+                ),
+                confirm_label="Ricarica e annulla abbinamenti",
+                cancel_label="Annulla",
+            )
+            if not proceed:
+                return
+            self._rep003_discard_pending_assignments_state()
+
+        previous_state = self._rep003_session_state
+        if previous_state in {
+            REP003_SESSION_COMPLETED,
+            REP003_SESSION_COMPLETED_WITH_ERRORS,
+            REP003_SESSION_READY_FOR_NEW_SESSION,
+        }:
+            self._rep003_model.reset()
+            self._rep003_last_processed_sources = set()
+
+        self._repertory_session_folder = None
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_INSERT_TRACKS, "")
+        self._rep003_session_state = REP003_SESSION_NOT_LOADED
+        try:
+            loaded_tracks = list_new_tracks_non_recursive(new_tracks_folder)
+            loaded_folders = self._rep003_scan_repertory_folders(split_folder, split_root, general_root)
+        except Exception as error:
+            self._append_log(f"[REP003][ERRORE] Caricamento sorgenti fallito: {error}")
+            messagebox.showerror(
+                "Inserimento nuovi brani",
+                f"Errore durante il caricamento di brani/cartelle:\n{error}",
+                parent=self._rep003_window,
+            )
+            return
+        self._rep003_model.load_tracks(loaded_tracks)
+        self._rep003_model.load_folders(loaded_folders)
+        self._rep003_session_policy = "ASK"
+        self._rep003_pending_decision_request_id = None
+        self._close_rep003_decision_dialog()
+        self._repertory_selected_smartphone_folder = str(Path(smartphone_folder).expanduser().resolve())
+        self._repertory_last_completed_smartphone_folder = None
+
+        self.settings["rep003_new_tracks_folder"] = new_tracks_folder
+        self.settings["rep003_split_folder"] = split_folder
+        self.settings["rep003_general_folder"] = general_folder
+        self.settings["rep003_smartphone_folder"] = smartphone_folder
+        self.save_settings()
+
+        self._rep003_last_processed_sources = set()
+        if loaded_tracks:
+            self._rep003_session_state = REP003_SESSION_LOADED_UNASSIGNED
+        else:
+            self._rep003_session_state = REP003_SESSION_NOT_LOADED
+
+        try:
+            self._rep003_refresh_folders_tree(clear_selection=True)
+            self._rep003_refresh_tracks_tree(clear_selection=True)
+            self._rep003_update_status()
+            self._rep003_update_finalize_button_state()
+        except Exception as error:
+            self._append_log(f"[REP003][ERRORE] Popolamento liste fallito: {error}")
+            messagebox.showerror(
+                "Inserimento nuovi brani",
+                f"Errore durante il popolamento delle liste:\n{error}",
+                parent=self._rep003_window,
+            )
+            return
+        if not loaded_tracks:
+            self._append_log("[REP003] Nessun MP3 trovato direttamente nella Cartella Nuovi Brani.")
+            messagebox.showinfo(
+                "Inserimento nuovi brani",
+                "NESSUN NUOVO BRANO TROVATO nella cartella selezionata.",
+                parent=self._rep003_window,
+            )
+        if not loaded_folders:
+            messagebox.showinfo(
+                "Inserimento nuovi brani",
+                "Nessuna cartella valida trovata nel repertorio suddiviso.",
+                parent=self._rep003_window,
+            )
+        if self.rep003_worker.is_running:
+            self._rep003_set_ui_running_state(True)
+
+    def _rep003_collect_excluded_relative_roots(self, split_root: Path, general_root: Path) -> tuple[str, ...]:
+        excluded_relative_roots: set[str] = {
+            "File Non trovati in Repertorio",
+            "Report",
+            "Log",
+            "Diagnosi",
+            "REPERTORIO_GENERALE_DA_MIXCREATOR",
+        }
+        try:
+            general_relative = general_root.relative_to(split_root).as_posix().strip("/")
+            if general_relative:
+                excluded_relative_roots.add(general_relative)
+        except Exception:
+            pass
+
+        try:
+            for child in split_root.iterdir():
+                if not child.is_dir():
+                    continue
+                folded = child.name.casefold()
+                if folded == "diagnosi" or folded.startswith("diagnosi_repertorio_"):
+                    excluded_relative_roots.add(child.name)
+        except OSError as error:
+            raise RuntimeError(f"Lettura cartelle repertorio fallita: {error}") from error
+
+        return tuple(sorted(excluded_relative_roots))
+
+    def _rep003_scan_repertory_folders(self, split_folder: str, split_root: Path, general_root: Path) -> list[RepertoryFolderItem]:
+        excluded_relative_roots = self._rep003_collect_excluded_relative_roots(split_root, general_root)
+        return scan_repertory_folders_non_recursive_stats(
+            split_folder,
+            excluded_relative_roots=excluded_relative_roots,
+        )
+
+    def _rep003_restore_track_selection(self, source_paths: list[str]) -> None:
+        if self._rep003_tracks_tree is None:
+            return
+        if not source_paths:
+            return
+        selected_iids = [
+            iid
+            for iid, source_path in self._rep003_track_row_by_iid.items()
+            if source_path in source_paths
+        ]
+        if not selected_iids:
+            return
+        self._rep003_tracks_tree.selection_set(selected_iids)
+
+    def _rep003_refresh_folders_only(self, *, select_relative: str | None = None) -> None:
+        if self._rep003_split_entry is None or self._rep003_general_entry is None:
+            return
+
+        split_folder = self._rep003_split_entry.get().strip()
+        general_folder = self._rep003_general_entry.get().strip()
+
+        if not split_folder or not Path(split_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Suddiviso non valida.", parent=self._rep003_window)
+            return
+        if not general_folder or not Path(general_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Generale non valida.", parent=self._rep003_window)
+            return
+        if self._repertory_paths_collide(split_folder, general_folder):
+            messagebox.showerror(
+                "Inserimento nuovi brani",
+                "La Cartella Repertorio Generale non puo coincidere con il Repertorio Suddiviso.",
+                parent=self._rep003_window,
+            )
+            return
+
+        split_root = Path(split_folder).expanduser().resolve()
+        general_root = Path(general_folder).expanduser().resolve()
+        selected_tracks = self._rep003_selected_track_paths()
+
+        current_relative = ""
+        if self._rep003_folders_tree is not None:
+            current_selection = self._rep003_selected_folder_relative_paths()
+            if current_selection:
+                current_relative = self._rep003_normalize_relative_path(current_selection[0])
+
+        target_relative = self._rep003_normalize_relative_path(select_relative) if select_relative is not None else current_relative
+
+        try:
+            folders = self._rep003_scan_repertory_folders(split_folder, split_root, general_root)
+        except Exception as error:
+            self._append_log(f"[REP003][ERRORE] Aggiornamento cartelle fallito: {error}")
+            messagebox.showerror(
+                "Inserimento nuovi brani",
+                f"Errore durante l'aggiornamento delle cartelle:\n{error}",
+                parent=self._rep003_window,
+            )
+            return
+
+        self._rep003_model.load_folders(folders)
+        self._rep003_refresh_folders_tree(clear_selection=True)
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        self._rep003_restore_track_selection(selected_tracks)
+        self._rep003_update_status()
+        self._rep003_update_session_state_from_model()
+        self._rep003_update_finalize_button_state()
+
+        if self._rep003_folders_tree is None:
+            return
+
+        available_relatives = {
+            self._rep003_normalize_relative_path(folder.relative_path)
+            for folder in self._rep003_model.folders
+        }
+        if target_relative not in available_relatives:
+            return
+
+        target_iid = "__ROOT__" if target_relative == "" else target_relative
+        if target_iid in self._rep003_folder_iid_by_relative:
+            self._rep003_folders_tree.selection_set(target_iid)
+            try:
+                self._rep003_folders_tree.see(target_iid)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _rep003_validate_new_folder_name(raw_name: str) -> str:
+        name = str(raw_name or "").strip()
+        if not name:
+            raise ValueError("Nome cartella non valido: valore vuoto.")
+        if name in {".", ".."}:
+            raise ValueError("Nome cartella non valido.")
+        if Path(name).is_absolute() or "/" in name or "\\" in name:
+            raise ValueError("Inserire solo il nome della cartella, senza percorso.")
+        if name.endswith(".") or name.endswith(" "):
+            raise ValueError("Il nome cartella non puo terminare con punto o spazio.")
+        if any(char in REP003_INVALID_FOLDER_CHARS for char in name):
+            raise ValueError("Nome cartella non valido: contiene caratteri non consentiti.")
+        reserved_key = name.rstrip(" .").split(".", 1)[0].upper()
+        if reserved_key in REP003_RESERVED_FOLDER_NAMES:
+            raise ValueError("Nome cartella riservato dal sistema.")
+        folded = name.casefold()
+        if folded in REP003_BLOCKED_TECHNICAL_FOLDER_NAMES or folded.startswith("diagnosi_repertorio_"):
+            raise ValueError("Nome cartella riservato a uso tecnico.")
+        return name
+
+    def _rep003_create_folder(self) -> None:
+        if self._rep003_split_entry is None or self._rep003_general_entry is None:
+            return
+
+        split_folder = self._rep003_split_entry.get().strip()
+        general_folder = self._rep003_general_entry.get().strip()
+        if not split_folder or not Path(split_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Suddiviso non valida.", parent=self._rep003_window)
+            return
+        if not general_folder or not Path(general_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Generale non valida.", parent=self._rep003_window)
+            return
+
+        selected_relatives = self._rep003_selected_folder_relative_paths()
+        parent_relative = self._rep003_normalize_relative_path(selected_relatives[0] if selected_relatives else "")
+        parent_label = "ROOT" if not parent_relative else parent_relative.replace("/", "\\")
+        split_root = Path(split_folder).expanduser().resolve()
+
+        def _submit_folder_name(raw_folder_name: str) -> bool:
+            try:
+                valid_name = self._rep003_validate_new_folder_name(raw_folder_name)
+            except ValueError as error:
+                messagebox.showerror("Inserimento nuovi brani", str(error), parent=self._rep003_window)
+                return False
+
+            parent_path = split_root if not parent_relative else (split_root / parent_relative)
+            if not parent_path.exists() or not parent_path.is_dir():
+                messagebox.showerror(
+                    "Inserimento nuovi brani",
+                    "Cartella padre non disponibile. Aggiornare l'elenco cartelle.",
+                    parent=self._rep003_window,
+                )
+                return False
+
+            try:
+                resolved_parent = parent_path.resolve()
+                resolved_parent.relative_to(split_root)
+            except Exception:
+                messagebox.showerror("Inserimento nuovi brani", "Percorso padre non valido.", parent=self._rep003_window)
+                return False
+
+            for child in parent_path.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name.rstrip(" .").casefold() == valid_name.rstrip(" .").casefold():
+                    messagebox.showerror(
+                        "Inserimento nuovi brani",
+                        "Esiste gia una cartella con lo stesso nome (confronto case-insensitive).",
+                        parent=self._rep003_window,
+                    )
+                    return False
+
+            target_folder = parent_path / valid_name
+            try:
+                target_folder.mkdir(parents=False, exist_ok=False)
+            except Exception as error:
+                messagebox.showerror(
+                    "Inserimento nuovi brani",
+                    f"Creazione cartella non riuscita:\n{error}",
+                    parent=self._rep003_window,
+                )
+                return False
+
+            if not target_folder.exists() or not target_folder.is_dir():
+                messagebox.showerror(
+                    "Inserimento nuovi brani",
+                    "Creazione cartella non verificata su filesystem.",
+                    parent=self._rep003_window,
+                )
+                return False
+
+            relative_target = "" if target_folder == split_root else target_folder.relative_to(split_root).as_posix().strip("/")
+            self._append_log(f"[REP003] Cartella creata: {target_folder}")
+            self._rep003_refresh_folders_only(select_relative=relative_target)
+            return True
+
+        self._open_rep003_create_folder_dialog(parent_label=parent_label, on_submit=_submit_folder_name)
+
+    def _open_rep003_create_folder_dialog(self, *, parent_label: str, on_submit) -> None:
+        self._close_rep003_create_folder_dialog()
+        parent = self._rep003_window if self._rep003_window is not None else self
+
+        dialog = ManagedCTkToplevel(parent)
+        self._rep003_create_folder_dialog = dialog
+        dialog.title("Crea nuova cartella")
+        dialog.resizable(False, False)
+        dialog.transient(parent)
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
+
+        width = 560
+        height = 290
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(520, 260)
+
+        try:
+            parent.update_idletasks()
+            parent_x = int(parent.winfo_x())
+            parent_y = int(parent.winfo_y())
+            parent_w = int(parent.winfo_width())
+            parent_h = int(parent.winfo_height())
+            pos_x = max(0, parent_x + (parent_w - width) // 2)
+            pos_y = max(0, parent_y + (parent_h - height) // 2)
+            dialog.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+        except Exception:
+            pass
+
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(0, weight=1)
+
+        frame = ctk.CTkFrame(dialog)
+        frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(4, weight=1)
+
+        info_text = f"Nuova cartella da creare in: {parent_label}"
+        ctk.CTkLabel(frame, text=info_text, anchor="w", justify="left", wraplength=500).grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(10, 8),
+        )
+
+        ctk.CTkLabel(frame, text="Nome nuova cartella", anchor="w", font=ctk.CTkFont("Segoe UI Semibold", 13)).grid(
+            row=1,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=(4, 4),
+        )
+
+        name_var = tk.StringVar(value="")
+        preview_prefix = "ROOT" if parent_label == "ROOT" else parent_label
+        self._rep003_create_folder_preview_var.set(f"Percorso risultante: {preview_prefix}\\")
+
+        entry = ctk.CTkEntry(frame, textvariable=name_var, height=38, font=ctk.CTkFont("Segoe UI", 13))
+        entry.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self._rep003_create_folder_entry = entry
+
+        ctk.CTkLabel(
+            frame,
+            textvariable=self._rep003_create_folder_preview_var,
+            anchor="w",
+            justify="left",
+            wraplength=500,
+            text_color=("#4b5563", "#9ca3af"),
+        ).grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+
+        def _update_preview(*_args) -> None:
+            raw_name = str(name_var.get() or "").strip()
+            self._rep003_create_folder_preview_var.set(f"Percorso risultante: {preview_prefix}\\{raw_name}")
+
+        name_var.trace_add("write", _update_preview)
+
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 10))
+        buttons.grid_columnconfigure(0, weight=1)
+        buttons.grid_columnconfigure(1, weight=1)
+
+        def _on_cancel(_event=None) -> str:
+            self._close_rep003_create_folder_dialog()
+            return "break"
+
+        def _on_create(_event=None) -> str:
+            if on_submit(name_var.get()):
+                self._close_rep003_create_folder_dialog()
+            return "break"
+
+        ctk.CTkButton(
+            buttons,
+            text="Crea",
+            height=44,
+            font=ctk.CTkFont("Segoe UI Semibold", 14),
+            command=_on_create,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        ctk.CTkButton(
+            buttons,
+            text="Annulla",
+            height=44,
+            font=ctk.CTkFont("Segoe UI Semibold", 14),
+            command=_on_cancel,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        dialog.bind("<Escape>", _on_cancel)
+        dialog.bind("<Return>", _on_create)
+        dialog.bind("<KP_Enter>", _on_create)
+        entry.bind("<Escape>", _on_cancel)
+        entry.bind("<Return>", _on_create)
+        entry.bind("<KP_Enter>", _on_create)
+        raw_entry = getattr(entry, "_entry", None)
+        if raw_entry is not None:
+            try:
+                raw_entry.bind("<Escape>", _on_cancel)
+                raw_entry.bind("<Return>", _on_create)
+                raw_entry.bind("<KP_Enter>", _on_create)
+            except Exception:
+                pass
+        dialog.protocol("WM_DELETE_WINDOW", self._close_rep003_create_folder_dialog)
+
+        def _focus_entry() -> None:
+            self._rep003_create_folder_focus_after_id = None
+            try:
+                if self._rep003_create_folder_entry is not None and self._rep003_create_folder_entry.winfo_exists():
+                    self._rep003_create_folder_entry.focus_force()
+            except Exception:
+                pass
+
+        self._rep003_create_folder_focus_after_id = dialog.after(0, _focus_entry)
+
+    def _rep003_finalize_placeholder(self) -> None:
+        if self.rep003_worker.is_running:
+            return
+        if self._rep003_new_tracks_entry is None or self._rep003_split_entry is None or self._rep003_general_entry is None or self._rep003_smartphone_entry is None:
+            return
+
+        new_tracks_folder = self._rep003_new_tracks_entry.get().strip()
+        split_folder = self._rep003_split_entry.get().strip()
+        general_folder = self._rep003_general_entry.get().strip()
+        smartphone_folder = self._rep003_smartphone_entry.get().strip()
+
+        if not new_tracks_folder or not Path(new_tracks_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Nuovi Brani non valida.", parent=self._rep003_window)
+            return
+        if not split_folder or not Path(split_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Suddiviso non valida.", parent=self._rep003_window)
+            return
+        if not general_folder or not Path(general_folder).is_dir():
+            messagebox.showerror("Inserimento nuovi brani", "Cartella Repertorio Generale non valida.", parent=self._rep003_window)
+            return
+
+        try:
+            ensure_folder_available(smartphone_folder)
+        except Exception as error:
+            messagebox.showerror("Inserimento nuovi brani", f"Cartella Smartphone/Tablet non disponibile:\n{error}", parent=self._rep003_window)
+            return
+
+        if not self._rep003_model.tracks:
+            messagebox.showerror("Inserimento nuovi brani", "Nessun brano da elaborare.", parent=self._rep003_window)
+            return
+
+        if not self._rep003_model.all_managed:
+            messagebox.showerror(
+                "Inserimento nuovi brani",
+                "Completare gli abbinamenti: tutti i brani devono risultare gestiti.",
+                parent=self._rep003_window,
+            )
+            return
+
+        assignments_snapshot = self._rep003_model.assignments_snapshot()
+        if not assignments_snapshot:
+            messagebox.showerror("Inserimento nuovi brani", "Nessun brano da elaborare.", parent=self._rep003_window)
+            return
+
+        self._rep003_session_state = REP003_SESSION_PROCESSING
+        self._rep003_last_processed_sources = set(assignments_snapshot.keys())
+
+        self._repertory_session_folder = None
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_INSERT_TRACKS, "")
+        self._repertory_allow_session_log_updates = False
+        self._repertory_expected_output_root = ""
+        self._repertory_min_session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._repertory_selected_smartphone_folder = str(Path(smartphone_folder).expanduser().resolve())
+        self._repertory_last_completed_smartphone_folder = None
+
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+        self._update_repertory_primary_action_state()
+
+        self._reset_repertory_runtime_counters()
+        self._repertory_started_at = time.monotonic()
+        self._start_repertory_timer()
+        self._set_repertory_ui_running_state(True)
+        self._update_controls_state()
+
+        if self._rep003_status_label is not None:
+            self._rep003_status_label.configure(text="Inserimento nuovi brani in corso...")
+
+        self._append_log("[REP003] Avvio elaborazione completa inserimento nuovi brani.")
+
+        try:
+            self.rep003_worker.start(
+                new_tracks_dir=new_tracks_folder,
+                split_repertory_dir=split_folder,
+                general_repertory_dir=general_folder,
+                smartphone_tablet_dir=smartphone_folder,
+                assignments_snapshot=assignments_snapshot,
+            )
+        except Exception as error:
+            self._stop_repertory_timer()
+            self._set_repertory_ui_running_state(False)
+            self._update_controls_state()
+            self._update_repertory_primary_action_state()
+            self._update_repertory_open_results_button_state()
+            self._update_repertory_android_buttons_state()
+            messagebox.showerror("Inserimento nuovi brani", str(error), parent=self._rep003_window)
+
+    def _rep003_worker_progress(self, current: int, total: int, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_rep003_worker_progress, current, total, message)
+
+    def _handle_rep003_worker_progress(self, current: int, total: int, message: str) -> None:
+        if self._rep003_status_label is not None:
+            self._rep003_status_label.configure(text=message)
+
+    def _rep003_worker_log(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._append_log, message)
+
+    def _rep003_worker_decision_required(self, payload: dict[str, Any]) -> None:
+        self._schedule_tracked_after(0, self._handle_rep003_worker_decision_required, payload)
+
+    def _handle_rep003_worker_decision_required(self, payload: dict[str, Any]) -> None:
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            return
+
+        if self._rep003_session_policy == "UPDATE_ALL":
+            self.rep003_worker.submit_decision(request_id, REP003_DECISION_UPDATE_AND_BYPASS_SESSION)
+            return
+        if self._rep003_session_policy == "SKIP_ALL":
+            self.rep003_worker.submit_decision(request_id, REP003_DECISION_SKIP_AND_BYPASS_SESSION)
+            return
+
+        self._rep003_pending_decision_request_id = request_id
+        self._open_rep003_decision_dialog(payload)
+
+    def _submit_rep003_decision(self, decision: str) -> None:
+        request_id = str(self._rep003_pending_decision_request_id or "").strip()
+        if request_id:
+            self.rep003_worker.submit_decision(request_id, decision)
+
+        if decision == REP003_DECISION_UPDATE_AND_BYPASS_SESSION:
+            self._rep003_session_policy = "UPDATE_ALL"
+        elif decision == REP003_DECISION_SKIP_AND_BYPASS_SESSION:
+            self._rep003_session_policy = "SKIP_ALL"
+
+        self._rep003_pending_decision_request_id = None
+        self._close_rep003_decision_dialog()
+
+    def _open_rep003_decision_dialog(self, payload: dict[str, Any]) -> None:
+        self._close_rep003_decision_dialog()
+        parent = self._rep003_window if self._rep003_window is not None else self
+
+        dialog = ManagedCTkToplevel(parent)
+        dialog.title("Aggiorna o salta")
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.geometry("900x520")
+        dialog.minsize(820, 460)
+        dialog.resizable(True, True)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(0, weight=1)
+
+        self._rep003_decision_dialog = dialog
+
+        def _on_close() -> None:
+            self._submit_rep003_decision(REP003_DECISION_SKIP_CURRENT)
+
+        dialog.protocol("WM_DELETE_WINDOW", _on_close)
+
+        body = ctk.CTkFrame(dialog)
+        body.grid(row=0, column=0, sticky="nsew", padx=12, pady=(12, 8))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_rowconfigure(3, weight=1)
+
+        ctk.CTkLabel(
+            body,
+            text="Il file e gia presente nel repertorio.",
+            anchor="w",
+            font=ctk.CTkFont(weight="bold"),
+        ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        source_path = str(payload.get("source_path", "") or "")
+        ctk.CTkLabel(body, text="Nuovo file", anchor="w").grid(row=1, column=0, sticky="ew", padx=8, pady=(2, 2))
+        ctk.CTkLabel(body, text=source_path, anchor="w", justify="left", wraplength=840).grid(
+            row=2,
+            column=0,
+            sticky="ew",
+            padx=8,
+            pady=(0, 8),
+        )
+
+        ctk.CTkLabel(body, text="Copie esistenti", anchor="w").grid(row=3, column=0, sticky="nw", padx=8, pady=(0, 4))
+        text = ManagedCTkTextbox(body, height=230, wrap="none")
+        text.grid(row=4, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        text.configure(state="normal")
+        existing_paths = payload.get("existing_paths", [])
+        if not isinstance(existing_paths, list):
+            existing_paths = []
+        text.insert("1.0", "\n".join(str(item) for item in existing_paths))
+        text.configure(state="disabled")
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
+        buttons.grid_columnconfigure((0, 1), weight=1)
+
+        ctk.CTkButton(
+            buttons,
+            text="Aggiorna",
+            command=lambda: self._submit_rep003_decision(REP003_DECISION_UPDATE_CURRENT),
+            height=38,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        ctk.CTkButton(
+            buttons,
+            text="Salta aggiornamento",
+            command=lambda: self._submit_rep003_decision(REP003_DECISION_SKIP_CURRENT),
+            height=38,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 6))
+        ctk.CTkButton(
+            buttons,
+            text="Aggiorna questo e tutti i successivi",
+            command=lambda: self._submit_rep003_decision(REP003_DECISION_UPDATE_AND_BYPASS_SESSION),
+            height=38,
+        ).grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            buttons,
+            text="Mantieni questo e tutti i successivi",
+            command=lambda: self._submit_rep003_decision(REP003_DECISION_SKIP_AND_BYPASS_SESSION),
+            height=38,
+        ).grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+    def _rep003_worker_completed(self, result: Rep003UpdateResult) -> None:
+        self._schedule_tracked_after(0, self._handle_rep003_worker_completed, result)
+
+    def _handle_rep003_worker_completed(self, result: Rep003UpdateResult) -> None:
+        self._close_rep003_decision_dialog()
+        self._rep003_pending_decision_request_id = None
+        errors_count = int((getattr(result, "counters", {}) or {}).get("errors", getattr(result, "error_tracks", 0)) or 0)
+        completion_state = (
+            REP003_SESSION_COMPLETED_WITH_ERRORS if errors_count > 0 or not bool(getattr(result, "success", False)) else REP003_SESSION_COMPLETED
+        )
+        self._rep003_session_state = completion_state
+        raw_session_folder = str(getattr(result, "session_folder", "") or "").strip()
+        valid_session_folder = ""
+        if self._is_existing_directory(raw_session_folder):
+            valid_session_folder = str(Path(raw_session_folder).expanduser().resolve())
+        self._repertory_session_folder = valid_session_folder or None
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_INSERT_TRACKS, self._repertory_session_folder)
+        self._set_repertory_mode(REPERTORY_MODE_INSERT_TRACKS)
+        if self._rep003_smartphone_entry is not None:
+            selected_smartphone = str(self._rep003_smartphone_entry.get() or "").strip()
+            if selected_smartphone:
+                self._repertory_selected_smartphone_folder = selected_smartphone
+                self._repertory_last_completed_smartphone_folder = selected_smartphone
+        self._reset_rep003_operational_session(
+            preserve_results=True,
+            preserve_android_destination=True,
+            clear_paths=False,
+        )
+        self._update_repertory_open_results_button_state()
+
+        if self._rep003_status_label is not None:
+            completion_hint = "Elaborazione completata con errori." if completion_state == REP003_SESSION_COMPLETED_WITH_ERRORS else "Elaborazione completata."
+            self._rep003_status_label.configure(
+                text=(
+                    "Brani caricati: 0 | Gestiti: 0 | Da gestire: 0"
+                    f" | {completion_hint} Premere \"Carica cartelle e brani\" per iniziare una nuova sessione."
+                )
+            )
+
+        self._show_rep003_completion_summary(result)
+        self._update_repertory_open_results_button_state()
+
+    def _rep003_worker_error(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_rep003_worker_error, message)
+
+    def _handle_rep003_worker_error(self, message: str) -> None:
+        self._close_rep003_decision_dialog()
+        self._rep003_pending_decision_request_id = None
+        self._rep003_session_state = REP003_SESSION_LOADED_UNASSIGNED
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._update_repertory_primary_action_state()
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+        if self._rep003_status_label is not None:
+            self._rep003_status_label.configure(text="Errore durante l'aggiornamento")
+        messagebox.showerror("Inserimento nuovi brani", message, parent=self._rep003_window)
+
+    def _rep003_worker_cancelled(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_rep003_worker_cancelled, message)
+
+    def _handle_rep003_worker_cancelled(self, message: str) -> None:
+        self._close_rep003_decision_dialog()
+        self._rep003_pending_decision_request_id = None
+        self._rep003_session_state = REP003_SESSION_LOADED_UNASSIGNED
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._update_repertory_primary_action_state()
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+        if self._rep003_status_label is not None:
+            self._rep003_status_label.configure(text="Aggiornamento interrotto")
+        messagebox.showinfo("Inserimento nuovi brani", message, parent=self._rep003_window)
+
+    def _show_rep003_completion_summary(self, result: Rep003UpdateResult) -> None:
+        parent = self._rep003_window if self._rep003_window is not None else self
+        dialog = ManagedCTkToplevel(parent)
+        dialog.title("Inserimento nuovi brani completato")
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.geometry("760x420")
+        dialog.minsize(720, 400)
+
+        def _close() -> None:
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+            try:
+                parent.focus_force()
+            except Exception:
+                pass
+
+        dialog.protocol("WM_DELETE_WINDOW", _close)
+        dialog.grid_columnconfigure(0, weight=1)
+
+        body = ctk.CTkFrame(dialog)
+        body.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        body.grid_columnconfigure(0, weight=1)
+
+        counters = getattr(result, "counters", {}) or {}
+        rows = [
+            ("INSERIMENTO NUOVI BRANI COMPLETATO", True),
+            (f"Brani elaborati .......... {result.processed_tracks}", False),
+            (f"Brani inseriti ........... {int(counters.get('tracks_inserted', result.copied_tracks))}", False),
+            (f"Brani aggiornati ......... {int(counters.get('tracks_updated', result.updated_tracks))}", False),
+            (f"Copie create nel repertorio .... {int(counters.get('split_copied', 0))}", False),
+            (f"Copie aggiornate repertorio .... {int(counters.get('split_updated', 0))}", False),
+            (f"Copie create repertorio generale .... {int(counters.get('general_copied', 0))}", False),
+            (f"Copie aggiornate repertorio generale .... {int(counters.get('general_updated', 0))}", False),
+            (f"Copie create Android .... {int(counters.get('android_copied', 0))}", False),
+            (f"Copie aggiornate Android .... {int(counters.get('android_updated', 0))}", False),
+            (f"Backup creati ............ {int(counters.get('backups_created', 0))}", False),
+            (f"Errori ................... {int(counters.get('errors', result.error_tracks))}", False),
+        ]
+
+        for text, emphasized in rows:
+            ctk.CTkLabel(
+                body,
+                text=text,
+                anchor="w",
+                justify="left",
+                font=ctk.CTkFont(weight="bold") if emphasized else None,
+            ).pack(anchor="w", fill="x", padx=10, pady=1)
+
+        button_row = ctk.CTkFrame(body, fg_color="transparent")
+        button_row.pack(fill="x", padx=10, pady=(14, 4))
+        button_row.grid_columnconfigure(0, weight=1)
+
+        close_button = ctk.CTkButton(
+            button_row,
+            text="Chiudi",
+            command=_close,
+            height=38,
+        )
+        close_button.grid(row=0, column=0, sticky="ew")
+        try:
+            close_button.focus_force()
+        except Exception:
+            pass
+
+        try:
+            parent.wait_window(dialog)
+        except Exception:
+            _close()
+
+    def open_repertory_new_tracks_window(self) -> None:
+        self.open_repertory_organizer_window()
+        if self._repertory_dialog is None:
+            return
+        self._set_repertory_mode(REPERTORY_MODE_INSERT_TRACKS)
+        self._apply_repertory_mode_layout()
+        try:
+            self._repertory_dialog.deiconify()
+            self._repertory_dialog.lift()
+            self._repertory_dialog.focus_force()
+        except Exception:
+            pass
+
+    def open_repertory_organizer_window(self) -> None:
+        if self.repertory_worker.is_running:
+            messagebox.showwarning(
+                "Organizza repertorio",
+                "Una organizzazione repertorio e gia in corso.",
+                parent=self,
+            )
+            return
+
+        if self._repertory_dialog is not None and self._repertory_dialog.winfo_exists():
+            self._repertory_dialog.deiconify()
+            self._repertory_dialog.lift()
+            self._repertory_dialog.focus_force()
+            return
+
+        window = ManagedCTkToplevel(self)
+        window.title("Organizza repertorio")
+        screen_width = max(920, int(window.winfo_screenwidth()))
+        screen_height = max(720, int(window.winfo_screenheight()))
+        window_width, window_height, _horizontal_margin, _vertical_margin = self._compute_repertory_window_geometry(
+            screen_width,
+            screen_height,
+        )
+        x_position = max(0, (screen_width - window_width) // 2)
+        y_position = max(0, (screen_height - window_height) // 2)
+        window.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
+        window.minsize(900, 640)
+        window.resizable(True, True)
+        window.transient(self)
+        window.protocol("WM_DELETE_WINDOW", self._close_repertory_window)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=0)
+        window.grid_rowconfigure(1, weight=1)
+        window.grid_rowconfigure(2, weight=0)
+        self._repertory_dialog = window
+
+        mode_bar = ctk.CTkFrame(window, fg_color="transparent")
+        mode_bar.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 0))
+        mode_bar.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(mode_bar, text="Operazione", anchor="w").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        radios_frame = ctk.CTkFrame(mode_bar, fg_color="transparent")
+        radios_frame.grid(row=0, column=1, sticky="w")
+        self._repertory_mode_selector = radios_frame
+        self._repertory_mode_radios = []
+        for idx, mode in enumerate((REPERTORY_MODE_UPDATE, REPERTORY_MODE_DIAGNOSTICS, REPERTORY_MODE_INSERT_TRACKS)):
+            radio = ctk.CTkRadioButton(
+                radios_frame,
+                text=REPERTORY_MODE_LABELS[mode],
+                variable=self._repertory_mode_var,
+                value=mode,
+                command=self._on_repertory_mode_selected,
+            )
+            radio.grid(row=0, column=idx, sticky="w", padx=(0, 14) if idx < 2 else 0)
+            self._repertory_mode_radios.append(radio)
+
+        frame = ctk.CTkFrame(window)
+        frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        frame.grid_columnconfigure(0, weight=0)
+        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_columnconfigure(2, weight=0)
+        for fixed_row in (0, 1, 2, 3, 4, 5, 6, 7, 8):
+            frame.grid_rowconfigure(fixed_row, weight=0)
+        frame.grid_rowconfigure(10, weight=1)
+        self._repertory_mode_frame = frame
+
+        rep003_frame = ctk.CTkFrame(window)
+        rep003_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=12)
+        rep003_frame.grid_columnconfigure(0, weight=1)
+        rep003_frame.grid_rowconfigure(1, weight=1)
+        rep003_frame.grid_remove()
+        self._build_rep003_panel(rep003_frame)
+
+        self._repertory_updates_label = ctk.CTkLabel(frame, text="Cartella aggiornamenti", anchor="w")
+        self._repertory_updates_label.grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+        self._repertory_updates_entry = ctk.CTkEntry(frame)
+        self._repertory_updates_entry.grid(row=0, column=1, sticky="ew", padx=10, pady=(10, 4))
+        self._repertory_updates_entry.bind("<FocusOut>", self._on_repertory_diagnostics_paths_changed)
+        self._repertory_updates_entry.bind("<Return>", self._on_repertory_diagnostics_paths_changed)
+        updates_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_repertory_updates_folder)
+        updates_browse.grid(row=0, column=2, padx=(0, 10), pady=(10, 4))
+
+        self._repertory_library_label = ctk.CTkLabel(frame, text="Cartella repertorio", anchor="w")
+        self._repertory_library_label.grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        self._repertory_library_entry = ctk.CTkEntry(frame)
+        self._repertory_library_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=4)
+        self._repertory_library_entry.bind("<FocusOut>", self._on_repertory_diagnostics_paths_changed)
+        self._repertory_library_entry.bind("<Return>", self._on_repertory_diagnostics_paths_changed)
+        library_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_repertory_library_folder)
+        library_browse.grid(row=1, column=2, padx=(0, 10), pady=4)
+
+        self._repertory_general_label = ctk.CTkLabel(frame, text="Cartella repertorio generale", anchor="w")
+        self._repertory_general_label.grid(row=2, column=0, sticky="w", padx=10, pady=4)
+        self._repertory_general_entry = ctk.CTkEntry(frame)
+        self._repertory_general_entry.grid(row=2, column=1, sticky="ew", padx=10, pady=4)
+        general_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_repertory_general_folder)
+        general_browse.grid(row=2, column=2, padx=(0, 10), pady=4)
+
+        self._repertory_results_label = ctk.CTkLabel(frame, text="Cartella risultati", anchor="w")
+        self._repertory_results_label.grid(row=3, column=0, sticky="w", padx=10, pady=4)
+        self._repertory_results_entry = ctk.CTkEntry(frame)
+        self._repertory_results_entry.grid(row=3, column=1, sticky="ew", padx=10, pady=4)
+        results_browse = ctk.CTkButton(frame, text="Sfoglia", width=84, command=self._select_repertory_results_folder)
+        results_browse.grid(row=3, column=2, padx=(0, 10), pady=4)
+
+        self._repertory_smartphone_label = ctk.CTkLabel(frame, text="Cartella Smartphone/Tablet", anchor="w")
+        self._repertory_smartphone_label.grid(row=4, column=0, sticky="w", padx=10, pady=4)
+        self._repertory_smartphone_entry = ctk.CTkEntry(frame)
+        self._repertory_smartphone_entry.grid(row=4, column=1, sticky="ew", padx=10, pady=4)
+        self._repertory_smartphone_entry.bind("<FocusOut>", self._on_repertory_diagnostics_paths_changed)
+        self._repertory_smartphone_entry.bind("<Return>", self._on_repertory_diagnostics_paths_changed)
+        smartphone_browse = ctk.CTkButton(
+            frame,
+            text="Sfoglia",
+            width=84,
+            command=self._select_repertory_smartphone_folder,
+        )
+        smartphone_browse.grid(row=4, column=2, padx=(0, 10), pady=4)
+        self._repertory_smartphone_browse_button = smartphone_browse
+
+        self._repertory_updates_entry_tooltip = self._add_tooltip(
+            self._repertory_updates_entry,
+            "Seleziona la cartella contenente i file MP3 da confrontare e aggiornare.",
+        )
+        self._repertory_library_entry_tooltip = self._add_tooltip(
+            self._repertory_library_entry,
+            "Seleziona la root del repertorio organizzato in cartelle e sottocartelle.",
+        )
+        self._repertory_general_entry_tooltip = self._add_tooltip(
+            self._repertory_general_entry,
+            "Seleziona la cartella piatta contenente una sola copia di ogni brano.",
+        )
+        self._repertory_results_entry_tooltip = self._add_tooltip(
+            self._repertory_results_entry,
+            "Seleziona la cartella dei risultati, se applicabile.",
+        )
+        self._repertory_smartphone_entry_tooltip = self._add_tooltip(
+            self._repertory_smartphone_entry,
+            "Seleziona la cartella di appoggio che conterra i file da trasferire al dispositivo Android.",
+        )
+        self._add_tooltip(updates_browse, "Seleziona la cartella contenente i file MP3 da confrontare e aggiornare.")
+        self._add_tooltip(library_browse, "Seleziona la root del repertorio organizzato in cartelle e sottocartelle.")
+        self._add_tooltip(general_browse, "Seleziona la cartella piatta contenente una sola copia di ogni brano.")
+        self._add_tooltip(results_browse, "Seleziona la cartella dei risultati, se applicabile.")
+        self._add_tooltip(
+            smartphone_browse,
+            "Seleziona la cartella di appoggio che conterra i file da trasferire al dispositivo Android.",
+        )
+
+        backup_check = ctk.CTkCheckBox(
+            frame,
+            text="Crea copia di sicurezza dei file sostituiti",
+            variable=self._repertory_backup_var,
+        )
+        backup_check.grid(row=5, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 4))
+        self._repertory_backup_check = backup_check
+        self._repertory_general_browse_button = general_browse
+        self._repertory_results_browse_button = results_browse
+
+        diagnostics_tree_container = ctk.CTkFrame(frame)
+        diagnostics_tree_container.grid(row=6, column=0, columnspan=3, sticky="nsew", padx=10, pady=(2, 6))
+        diagnostics_tree_container.grid_columnconfigure(0, weight=1)
+        diagnostics_tree_container.grid_rowconfigure(1, weight=1)
+
+        diagnostics_tools_row = ctk.CTkFrame(diagnostics_tree_container, fg_color="transparent")
+        diagnostics_tools_row.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        diagnostics_tools_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(
+            diagnostics_tools_row,
+            text="Sottocartelle da includere nella diagnosi",
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        diagnostics_refresh_button = ctk.CTkButton(
+            diagnostics_tools_row,
+            text="Aggiorna elenco",
+            width=110,
+            command=self._refresh_repertory_diagnostics_folder_tree,
+        )
+        diagnostics_refresh_button.grid(row=0, column=1, padx=(8, 4), sticky="e")
+        diagnostics_select_all_button = ctk.CTkButton(
+            diagnostics_tools_row,
+            text="Seleziona tutte",
+            width=110,
+            command=self._select_all_repertory_diagnostics_nodes,
+        )
+        diagnostics_select_all_button.grid(row=0, column=2, padx=4, sticky="e")
+        diagnostics_deselect_all_button = ctk.CTkButton(
+            diagnostics_tools_row,
+            text="Deseleziona tutte",
+            width=120,
+            command=self._deselect_all_repertory_diagnostics_nodes,
+        )
+        diagnostics_deselect_all_button.grid(row=0, column=3, padx=(4, 0), sticky="e")
+
+        diagnostics_tree_scrollable = ctk.CTkScrollableFrame(diagnostics_tree_container, height=150)
+        diagnostics_tree_scrollable.grid(row=1, column=0, sticky="nsew", padx=6, pady=(2, 6))
+
+        self._repertory_diagnostics_tree_container = diagnostics_tree_container
+        self._repertory_diagnostics_tree_scrollable = diagnostics_tree_scrollable
+        self._repertory_diagnostics_refresh_button = diagnostics_refresh_button
+        self._repertory_diagnostics_select_all_button = diagnostics_select_all_button
+        self._repertory_diagnostics_deselect_all_button = diagnostics_deselect_all_button
+
+        self._repertory_status_label = ctk.CTkLabel(frame, text="Pronto", anchor="w")
+        self._repertory_status_label.grid(row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=(4, 2))
+
+        counter_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        counter_frame.grid(row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 6))
+        counter_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self._repertory_file_counter_label = ctk.CTkLabel(counter_frame, text="File elaborati: 0 / 0", anchor="w")
+        self._repertory_file_counter_label.grid(row=0, column=0, sticky="w", padx=(0, 12), pady=1)
+        self._repertory_matches_label = ctk.CTkLabel(counter_frame, text="Corrispondenze trovate: 0", anchor="w")
+        self._repertory_matches_label.grid(row=0, column=1, sticky="w", pady=1)
+        self._repertory_updated_label = ctk.CTkLabel(counter_frame, text="File aggiornati: 0", anchor="w")
+        self._repertory_updated_label.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=1)
+        self._repertory_not_found_label = ctk.CTkLabel(counter_frame, text="File non trovati: 0", anchor="w")
+        self._repertory_not_found_label.grid(row=1, column=1, sticky="w", pady=1)
+        self._repertory_errors_label = ctk.CTkLabel(counter_frame, text="Errori: 0", anchor="w")
+        self._repertory_errors_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=1)
+        self._repertory_elapsed_label = ctk.CTkLabel(counter_frame, text="Tempo trascorso: 00:00:00", anchor="w")
+        self._repertory_elapsed_label.grid(row=2, column=1, sticky="w", pady=1)
+        self._repertory_eta_label = ctk.CTkLabel(counter_frame, text="Tempo restante stimato: --", anchor="w")
+        self._repertory_eta_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        self._repertory_progress_bar = ctk.CTkProgressBar(frame)
+        self._repertory_progress_bar.grid(row=9, column=0, columnspan=3, sticky="ew", padx=10, pady=(0, 6))
+        self._repertory_progress_bar.set(0)
+
+        self._repertory_log_box = ManagedCTkTextbox(frame, height=260)
+        self._repertory_log_box.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=10, pady=(0, 8))
+        self._repertory_log_box.configure(state="disabled")
+        frame.grid_rowconfigure(10, weight=1)
+
+        button_row = ctk.CTkFrame(window, fg_color="transparent")
+        button_row.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 12))
+        button_row.grid_columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
+
+        self._repertory_start_button = ctk.CTkButton(
+            button_row,
+            text="Avvia aggiornamento",
+            height=42,
+            command=self._start_repertory_organization,
+        )
+        self._repertory_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        self._repertory_stop_button = ctk.CTkButton(
+            button_row,
+            text="Interrompi",
+            height=42,
+            command=self._request_stop_repertory_organization,
+            state="disabled",
+        )
+        self._repertory_stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 6))
+
+        self._repertory_open_results_button = ctk.CTkButton(
+            button_row,
+            text="Apri cartella risultati",
+            height=42,
+            state="disabled",
+            command=self._open_repertory_results_folder,
+        )
+        self._repertory_open_results_button.grid(row=0, column=2, sticky="ew", padx=(6, 6))
+
+        self._repertory_open_smartphone_button = ctk.CTkButton(
+            button_row,
+            text="Apri cartella Smartphone/Tablet",
+            height=42,
+            state="disabled",
+            command=self._open_repertory_smartphone_folder,
+        )
+        self._repertory_open_smartphone_button.grid(row=0, column=3, sticky="ew", padx=(6, 6))
+
+        self._repertory_reset_smartphone_button = ctk.CTkButton(
+            button_row,
+            text="Reset cartella Smartphone/Tablet",
+            height=42,
+            state="disabled",
+            command=self._reset_repertory_smartphone_folder,
+        )
+        self._repertory_reset_smartphone_button.grid(row=0, column=4, sticky="ew", padx=(6, 6))
+
+        self._repertory_close_button = ctk.CTkButton(
+            button_row,
+            text="Chiudi",
+            height=42,
+            command=self._close_repertory_window,
+        )
+        self._repertory_close_button.grid(row=0, column=5, sticky="ew", padx=(6, 0))
+
+        self._repertory_start_button_tooltip = self._add_tooltip(
+            self._repertory_start_button,
+            "Avvia il confronto e l'aggiornamento dei file selezionati.",
+        )
+        self._repertory_stop_button_tooltip = self._add_tooltip(
+            self._repertory_stop_button,
+            "Richiede l'interruzione sicura dell'elaborazione in corso.",
+        )
+        self._repertory_open_results_button_tooltip = self._add_tooltip(
+            self._repertory_open_results_button,
+            "Apre la cartella della sessione contenente report, log e backup.",
+        )
+        self._repertory_open_smartphone_button_tooltip = self._add_tooltip(
+            self._repertory_open_smartphone_button,
+            "Apre la cartella di appoggio Android usata nell'ultima elaborazione completata.",
+        )
+        self._repertory_reset_smartphone_button_tooltip = self._add_tooltip(
+            self._repertory_reset_smartphone_button,
+            "Elimina il contenuto della cartella Android selezionata, mantenendo la cartella principale.",
+        )
+        self._repertory_backup_check_tooltip = self._add_tooltip(
+            backup_check,
+            "Salva le versioni precedenti dei file che verranno effettivamente modificati.",
+        )
+        self._repertory_diagnostics_refresh_tooltip = self._add_tooltip(
+            diagnostics_refresh_button,
+            "Rilegge l'alberatura senza avviare la diagnosi.",
+        )
+        self._repertory_diagnostics_select_all_tooltip = self._add_tooltip(
+            diagnostics_select_all_button,
+            "Seleziona tutte le cartelle disponibili per la diagnosi.",
+        )
+        self._repertory_diagnostics_deselect_all_tooltip = self._add_tooltip(
+            diagnostics_deselect_all_button,
+            "Rimuove tutte le selezioni dall'alberatura.",
+        )
+
+        self._repertory_path_widgets = [
+            self._repertory_updates_entry,
+            self._repertory_library_entry,
+            self._repertory_general_entry,
+            self._repertory_results_entry,
+            self._repertory_smartphone_entry,
+            updates_browse,
+            library_browse,
+            general_browse,
+            results_browse,
+            smartphone_browse,
+            backup_check,
+            diagnostics_refresh_button,
+            diagnostics_select_all_button,
+            diagnostics_deselect_all_button,
+        ]
+
+        self._clear_repertory_mode_path_fields()
+        self._validate_repertory_diagnostics_paths(show_message=False)
+
+        self._append_log("Apertura finestra Organizza repertorio.")
+        self._reset_repertory_runtime_counters()
+        self._repertory_close_requested = False
+        self._clear_repertory_diagnostics_tree_widgets()
+        self._set_repertory_mode(REPERTORY_MODE_UPDATE)
+        self._apply_repertory_mode_layout()
+
+    def _close_repertory_window(self) -> None:
+        if self.repertory_diagnostics_worker.is_running:
+            should_interrupt = messagebox.askyesno(
+                "Organizza repertorio",
+                "E in corso una diagnosi repertorio. Vuoi interromperla?",
+                parent=self._repertory_dialog,
+            )
+            if should_interrupt:
+                self.repertory_diagnostics_worker.cancel()
+                self._append_repertory_log("Richiesta interruzione diagnosi inviata.")
+                self._repertory_close_requested = True
+            return
+
+        if self.repertory_worker.is_running:
+            should_interrupt = messagebox.askyesno(
+                "Organizza repertorio",
+                "E in corso una organizzazione repertorio. Vuoi interromperla?",
+                parent=self._repertory_dialog,
+            )
+            if should_interrupt:
+                self.repertory_worker.cancel()
+                self._append_repertory_log("Richiesta interruzione inviata.")
+                if self._repertory_pending_decision_request_id:
+                    self.repertory_worker.submit_decision(
+                        self._repertory_pending_decision_request_id,
+                        "SKIP_CURRENT",
+                    )
+                    self._repertory_pending_decision_request_id = None
+                self._close_repertory_decision_dialog()
+                self._repertory_close_requested = True
+            return
+
+        if self.rep003_worker.is_running:
+            should_interrupt = messagebox.askyesno(
+                "Organizza repertorio",
+                "E in corso l'inserimento nuovi brani. Vuoi interromperlo?",
+                parent=self._repertory_dialog,
+            )
+            if should_interrupt:
+                self.rep003_worker.cancel()
+                self._append_repertory_log("Richiesta di interruzione inserimento nuovi brani inviata.")
+                self._repertory_close_requested = True
+            return
+
+        self._rep003_update_session_state_from_model()
+        if self._rep003_has_pending_assignments():
+            should_close = self._rep003_confirm_discard_pending_assignments(for_mode_switch=False)
+            if not should_close:
+                return
+            self._rep003_discard_pending_assignments_state()
+
+        self._finalize_repertory_window_close()
+
+    def _show_rep003_confirmation_dialog(
+        self,
+        *,
+        title: str,
+        body: str,
+        confirm_label: str,
+        cancel_label: str,
+    ) -> bool:
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+        dialog = ManagedCTkToplevel(parent)
+        dialog.title(title)
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        dialog.geometry("760x360")
+        dialog.minsize(700, 320)
+
+        accepted = {"value": False}
+
+        def _close(value: bool) -> None:
+            accepted["value"] = bool(value)
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _close(False))
+        dialog.bind("<Escape>", lambda _event: _close(False))
+        dialog.grid_columnconfigure(0, weight=1)
+
+        body_frame = ctk.CTkFrame(dialog)
+        body_frame.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        body_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            body_frame,
+            text=body,
+            justify="left",
+            anchor="w",
+            wraplength=700,
+        ).grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 12))
+
+        buttons = ctk.CTkFrame(body_frame, fg_color="transparent")
+        buttons.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 10))
+        buttons.grid_columnconfigure((0, 1), weight=1)
+
+        confirm_button = ctk.CTkButton(
+            buttons,
+            text=confirm_label,
+            command=lambda: _close(True),
+            height=40,
+        )
+        confirm_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+
+        cancel_button = ctk.CTkButton(
+            buttons,
+            text=cancel_label,
+            command=lambda: _close(False),
+            height=40,
+        )
+        cancel_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+        try:
+            cancel_button.focus_set()
+        except Exception:
+            pass
+
+        parent.wait_window(dialog)
+        return bool(accepted["value"])
+
+    def _widget_exists(self, widget: Any) -> bool:
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except (tk.TclError, RuntimeError, AttributeError):
+            return False
+
+    def _schedule_tracked_after(self, delay_ms: int, callback, *args):
+        if self._is_destroying or not self._widget_exists(self):
+            return None
+
+        job_id = None
+
+        def _runner() -> None:
+            nonlocal job_id
+            if job_id is not None:
+                self._tracked_after_jobs.discard(job_id)
+                job_id = None
+            if self._is_destroying or not self._widget_exists(self):
+                return
+            callback(*args)
+
+        try:
+            job_id = self.after(delay_ms, _runner)
+        except (tk.TclError, RuntimeError):
+            return None
+
+        self._tracked_after_jobs.add(job_id)
+        return job_id
+
+    def _cancel_tracked_after_job(self, job_id: Any) -> None:
+        if not job_id:
+            return
+        self._tracked_after_jobs.discard(job_id)
+        try:
+            self.after_cancel(job_id)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _cancel_tracked_after_jobs(self) -> None:
+        pending_jobs = list(self._tracked_after_jobs)
+        self._tracked_after_jobs.clear()
+        for job_id in pending_jobs:
+            try:
+                self.after_cancel(job_id)
+            except (tk.TclError, RuntimeError):
+                pass
+
+    def _cancel_matching_after_scripts(self, *fragments: str) -> None:
+        try:
+            pending_jobs = self.tk.splitlist(self.tk.call("after", "info"))
+        except (tk.TclError, RuntimeError):
+            return
+
+        for job_id in pending_jobs:
+            try:
+                callback_info = self.tk.splitlist(self.tk.call("after", "info", job_id))
+            except (tk.TclError, RuntimeError):
+                continue
+            callback_text = " ".join(str(item) for item in callback_info)
+            if any(fragment in callback_text for fragment in fragments):
+                try:
+                    self.tk.call("after", "cancel", job_id)
+                except (tk.TclError, RuntimeError):
+                    pass
+
+    def _cleanup_tooltips(self, owner: Any | None = None, tooltips: list[Tooltip] | None = None) -> None:
+        if tooltips is not None:
+            targets = list(tooltips)
+        elif owner is None:
+            targets = list(self.tooltips)
+        else:
+            owner_path = str(owner)
+            targets = []
+            for tooltip in self.tooltips:
+                try:
+                    widget_path = str(tooltip.widget)
+                except Exception:
+                    widget_path = ""
+                if widget_path == owner_path or widget_path.startswith(owner_path + "."):
+                    targets.append(tooltip)
+
+        if not targets:
+            return
+
+        for tooltip in targets:
+            try:
+                tooltip.destroy()
+            except Exception:
+                pass
+        self.tooltips = [tooltip for tooltip in self.tooltips if tooltip not in targets]
+
+    @staticmethod
+    def _normalize_repertory_mode(value: Any) -> str:
+        text = str(value or "").strip()
+        lowered = text.casefold()
+        if lowered in (REPERTORY_MODE_UPDATE, REPERTORY_MODE_DIAGNOSTICS, REPERTORY_MODE_INSERT_TRACKS):
+            return lowered
+        return REPERTORY_MODE_BY_LABEL.get(lowered, REPERTORY_MODE_UPDATE)
+
+    def _set_repertory_mode(self, mode: Any) -> str:
+        normalized = self._normalize_repertory_mode(mode)
+        self._repertory_mode_var.set(normalized)
+        self._repertory_mode_label_var.set(REPERTORY_MODE_LABELS[normalized])
+        return normalized
+
+    def _is_any_repertory_worker_running(self) -> bool:
+        return bool(
+            self.repertory_worker.is_running
+            or self.repertory_diagnostics_worker.is_running
+            or self.rep003_worker.is_running
+        )
+
+    def _can_start_repertory_update_mode(self) -> bool:
+        updates_dir = self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else ""
+        repertory_dir = self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else ""
+        general_dir = self._repertory_general_entry.get().strip() if self._repertory_general_entry is not None else ""
+        results_dir = self._repertory_results_entry.get().strip() if self._repertory_results_entry is not None else ""
+        smartphone_dir = self._repertory_smartphone_entry.get().strip() if self._repertory_smartphone_entry is not None else str(self._repertory_smartphone_root)
+
+        if not updates_dir or not Path(updates_dir).is_dir():
+            return False
+        if not repertory_dir or not Path(repertory_dir).is_dir():
+            return False
+        if not general_dir or not Path(general_dir).is_dir():
+            return False
+        if not results_dir:
+            return False
+        if not smartphone_dir:
+            return False
+
+        try:
+            if self._is_filesystem_root(Path(smartphone_dir).expanduser().resolve()):
+                return False
+        except Exception:
+            return False
+
+        return True
+
+    def _can_start_repertory_diagnostics_mode(self) -> bool:
+        split_dir = self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else ""
+        general_dir = self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else ""
+        if not split_dir or not Path(split_dir).is_dir():
+            return False
+        if not general_dir or not Path(general_dir).is_dir():
+            return False
+        if self._repertory_paths_collide(split_dir, general_dir):
+            return False
+
+        selected_relative_roots, _excluded_relative_roots, include_root_files = self._build_repertory_diagnostics_selection_payload()
+        selected_folder_count = self._count_selected_repertory_folders_with_mp3(split_dir, selected_relative_roots)
+        root_mp3_count = self._count_root_mp3_direct(split_dir)
+        return bool(selected_folder_count > 0 or (bool(include_root_files) and root_mp3_count > 0))
+
+    def _can_start_rep003_mode(self) -> bool:
+        return bool(self._rep003_model.tracks) and bool(self._rep003_model.all_managed)
+
+    def _update_repertory_primary_action_state(self) -> None:
+        if self._repertory_start_button is None:
+            return
+
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode == REPERTORY_MODE_INSERT_TRACKS:
+            text = "Conferma e avvia aggiornamento"
+            can_start = self._can_start_rep003_mode()
+        elif mode == REPERTORY_MODE_DIAGNOSTICS:
+            text = "Avvia diagnosi"
+            can_start = self._can_start_repertory_diagnostics_mode()
+        else:
+            text = "Avvia aggiornamento"
+            can_start = self._can_start_repertory_update_mode()
+
+        running = self._is_any_repertory_worker_running()
+        self._repertory_start_button.configure(
+            text=text,
+            command=self._start_repertory_organization,
+            state="disabled" if running or not can_start else "normal",
+        )
+
+    def _rep003_has_pending_assignments(self) -> bool:
+        if self.rep003_worker.is_running:
+            return False
+        if self._rep003_session_state != REP003_SESSION_ASSIGNMENTS_PENDING:
+            return False
+        return self._rep003_count_assigned_tracks() > 0
+
+    def _rep003_count_assigned_tracks(self) -> int:
+        assigned = 0
+        for item in self._rep003_model.tracks:
+            if item.status == STATUS_GESTITO and bool(item.destinations):
+                assigned += 1
+        return assigned
+
+    def _rep003_update_session_state_from_model(self) -> None:
+        if self.rep003_worker.is_running:
+            self._rep003_session_state = REP003_SESSION_PROCESSING
+            return
+        if self._rep003_session_state in {
+            REP003_SESSION_COMPLETED,
+            REP003_SESSION_COMPLETED_WITH_ERRORS,
+            REP003_SESSION_READY_FOR_NEW_SESSION,
+        }:
+            return
+        if not self._rep003_model.tracks:
+            self._rep003_session_state = REP003_SESSION_NOT_LOADED
+            return
+        if self._rep003_count_assigned_tracks() > 0:
+            self._rep003_session_state = REP003_SESSION_ASSIGNMENTS_PENDING
+            return
+        self._rep003_session_state = REP003_SESSION_LOADED_UNASSIGNED
+
+    def _reset_rep003_operational_session(
+        self,
+        *,
+        preserve_results: bool,
+        preserve_android_destination: bool,
+        clear_paths: bool,
+    ) -> None:
+        self._close_rep003_decision_dialog()
+        self._close_rep003_create_folder_dialog()
+        self._rep003_pending_decision_request_id = None
+        self._rep003_session_policy = "ASK"
+        self._rep003_last_processed_sources = set()
+        self._rep003_show_managed_var.set(True)
+        self._rep003_sort_key = REP003_SORT_NAME
+        self._rep003_sort_reverse = False
+        self._rep003_folder_sort_key = REP003_SORT_FOLDER_RELATIVE
+        self._rep003_folder_sort_reverse = False
+        self._rep003_track_row_by_iid = {}
+        self._rep003_folder_iid_by_relative = {}
+        self._rep003_model = NewTracksAssignmentModel()
+
+        if not preserve_results:
+            self._repertory_session_folder = None
+            self._set_repertory_results_folder_for_mode(REPERTORY_MODE_INSERT_TRACKS, "")
+        if not preserve_android_destination:
+            self._repertory_selected_smartphone_folder = None
+            self._repertory_last_completed_smartphone_folder = None
+
+        if clear_paths:
+            self._clear_repertory_mode_path_fields()
+
+        self._rep003_refresh_folders_tree(clear_selection=True)
+        self._rep003_refresh_tracks_tree(clear_selection=True)
+        if self._rep003_tracks_tree is not None:
+            try:
+                self._rep003_tracks_tree.selection_remove(self._rep003_tracks_tree.selection())
+            except Exception:
+                pass
+        if self._rep003_folders_tree is not None:
+            try:
+                self._rep003_folders_tree.selection_remove(self._rep003_folders_tree.selection())
+            except Exception:
+                pass
+
+        self._rep003_session_state = (
+            REP003_SESSION_READY_FOR_NEW_SESSION
+            if preserve_results
+            else REP003_SESSION_NOT_LOADED
+        )
+
+        self._rep003_update_status()
+        self._reset_repertory_runtime_counters()
+        if clear_paths:
+            return
+
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._update_repertory_primary_action_state()
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+        self._rep003_update_assignment_buttons_state()
+
+    def _rep003_discard_pending_assignments_state(self) -> None:
+        self._reset_rep003_operational_session(
+            preserve_results=bool(self._active_repertory_results_folder()),
+            preserve_android_destination=bool(str(self._active_repertory_smartphone_folder() or "").strip()),
+            clear_paths=False,
+        )
+
+    def _rep003_confirm_discard_pending_assignments(self, *, for_mode_switch: bool) -> bool:
+        pending_count = self._rep003_count_assigned_tracks()
+        if pending_count <= 0:
+            return True
+
+        title = "Abbinamenti non ancora elaborati"
+        if for_mode_switch:
+            confirm_label = "Cambia modalita e annulla gli abbinamenti"
+        else:
+            confirm_label = "Chiudi e annulla gli abbinamenti"
+
+        return self._show_rep003_confirmation_dialog(
+            title=title,
+            body=(
+                "Sono presenti abbinamenti di nuovi brani che non sono ancora stati\n"
+                "elaborati.\n\n"
+                "Chiudendo la finestra, gli abbinamenti memorizzati nella sessione corrente\n"
+                "andranno persi.\n\n"
+                "Vuoi continuare?"
+            ),
+            confirm_label=confirm_label,
+            cancel_label="Torna alla finestra",
+        )
+
+    def _on_repertory_mode_selected(self, selected_value: str | None = None) -> None:
+        requested = self._normalize_repertory_mode(selected_value if selected_value is not None else self._repertory_mode_var.get())
+        current_mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if current_mode == REPERTORY_MODE_INSERT_TRACKS and requested != REPERTORY_MODE_INSERT_TRACKS:
+            self._rep003_update_session_state_from_model()
+            if self._rep003_has_pending_assignments():
+                proceed = self._rep003_confirm_discard_pending_assignments(for_mode_switch=True)
+                if not proceed:
+                    self._set_repertory_mode(current_mode)
+                    return
+                self._rep003_discard_pending_assignments_state()
+        self._repertory_selected_smartphone_folder = None
+        self._repertory_last_completed_smartphone_folder = None
+        self._set_repertory_mode(requested)
+        self._clear_repertory_mode_path_fields()
+        self._apply_repertory_mode_layout()
+
+    def _clear_repertory_mode_path_fields(self) -> None:
+        entries = [
+            self._repertory_updates_entry,
+            self._repertory_library_entry,
+            self._repertory_general_entry,
+            self._repertory_results_entry,
+            self._repertory_smartphone_entry,
+            self._rep003_new_tracks_entry,
+            self._rep003_split_entry,
+            self._rep003_general_entry,
+            self._rep003_smartphone_entry,
+        ]
+        for entry in entries:
+            if entry is None:
+                continue
+            self._replace_entry(entry, "")
+
+    def _apply_repertory_mode_layout(self) -> None:
+        mode = self._set_repertory_mode(self._repertory_mode_var.get())
+        diagnostics_mode = mode == REPERTORY_MODE_DIAGNOSTICS
+        insert_tracks_mode = mode == REPERTORY_MODE_INSERT_TRACKS
+
+        self._update_repertory_mode_tooltips(mode)
+
+        if self._repertory_mode_frame is not None:
+            try:
+                if insert_tracks_mode:
+                    self._repertory_mode_frame.grid_remove()
+                else:
+                    self._repertory_mode_frame.grid()
+            except Exception:
+                pass
+
+        if self._rep003_panel_frame is not None:
+            try:
+                if insert_tracks_mode:
+                    self._rep003_panel_frame.grid()
+                else:
+                    self._rep003_panel_frame.grid_remove()
+            except Exception:
+                pass
+
+        if hasattr(self, "_repertory_updates_label") and self._repertory_updates_label is not None:
+            self._repertory_updates_label.configure(
+                text="Cartella Repertorio suddiviso" if diagnostics_mode else "Cartella aggiornamenti"
+            )
+        if hasattr(self, "_repertory_library_label") and self._repertory_library_label is not None:
+            self._repertory_library_label.configure(
+                text="Cartella Repertorio Generale" if diagnostics_mode else "Cartella repertorio suddiviso"
+            )
+        if hasattr(self, "_repertory_general_label") and self._repertory_general_label is not None:
+            self._repertory_general_label.configure(text="Cartella repertorio generale")
+        if hasattr(self, "_repertory_results_label") and self._repertory_results_label is not None:
+            self._repertory_results_label.configure(text="Cartella Diagnosi" if diagnostics_mode else "Cartella risultati")
+        if self._repertory_start_button is not None:
+            if insert_tracks_mode:
+                self._repertory_start_button.configure(text="Conferma e avvia aggiornamento")
+            else:
+                self._repertory_start_button.configure(text="Avvia diagnosi" if diagnostics_mode else "Avvia aggiornamento")
+        if self._repertory_open_results_button is not None:
+            self._update_repertory_open_results_button_state()
+
+        widgets_to_hide = []
+        if hasattr(self, "_repertory_smartphone_label") and self._repertory_smartphone_label is not None:
+            widgets_to_hide.extend([
+                self._repertory_smartphone_label,
+                self._repertory_smartphone_entry,
+                self._repertory_smartphone_browse_button,
+            ])
+        if hasattr(self, "_repertory_general_label") and self._repertory_general_label is not None:
+            widgets_to_hide.extend([self._repertory_general_label, self._repertory_general_entry, self._repertory_general_browse_button])
+        if hasattr(self, "_repertory_results_label") and self._repertory_results_label is not None:
+            widgets_to_hide.extend([self._repertory_results_label, self._repertory_results_entry, self._repertory_results_browse_button])
+        if hasattr(self, "_repertory_backup_check") and self._repertory_backup_check is not None:
+            widgets_to_hide.append(self._repertory_backup_check)
+        if self._repertory_open_smartphone_button is not None:
+            widgets_to_hide.append(self._repertory_open_smartphone_button)
+        if self._repertory_reset_smartphone_button is not None:
+            widgets_to_hide.append(self._repertory_reset_smartphone_button)
+        for widget in widgets_to_hide:
+            try:
+                if diagnostics_mode or insert_tracks_mode:
+                    widget.grid_remove()
+                else:
+                    widget.grid()
+            except Exception:
+                pass
+
+        if self._repertory_diagnostics_tree_container is not None:
+            try:
+                if diagnostics_mode:
+                    self._repertory_diagnostics_tree_container.grid()
+                else:
+                    self._repertory_diagnostics_tree_container.grid_remove()
+            except Exception:
+                pass
+
+        rep003_widgets = [
+            self._rep003_new_tracks_entry,
+            self._rep003_split_entry,
+            self._rep003_general_entry,
+            self._rep003_smartphone_entry,
+            self._rep003_load_button,
+            self._rep003_assign_button,
+            self._rep003_remove_button,
+            self._rep003_show_managed_switch,
+            self._rep003_tracks_tree,
+            self._rep003_folders_tree,
+            self._rep003_status_label,
+        ]
+        for widget in rep003_widgets:
+            try:
+                if insert_tracks_mode:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+            except Exception:
+                pass
+
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(
+                text=(
+                    "Pronto - modalità Inserimento nuovi brani"
+                    if insert_tracks_mode
+                    else "Pronto - modalità Diagnosi Repertorio"
+                    if diagnostics_mode
+                    else "Pronto"
+                )
+            )
+
+        if diagnostics_mode:
+            self._refresh_repertory_diagnostics_folder_tree()
+        elif insert_tracks_mode:
+            self._rep003_refresh_folders_tree(clear_selection=False)
+            self._rep003_refresh_tracks_tree(clear_selection=False)
+            self._rep003_update_status()
+            self._rep003_update_session_state_from_model()
+            self._rep003_update_assignment_buttons_state()
+            self._rep003_update_finalize_button_state()
+        self._update_repertory_primary_action_state()
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+
+    def _update_repertory_mode_tooltips(self, mode: str) -> None:
+        if self._repertory_start_button_tooltip is not None:
+            if mode == REPERTORY_MODE_DIAGNOSTICS:
+                self._repertory_start_button_tooltip.text = "Confronta i due repertori e genera report e cartelle di esito."
+            elif mode == REPERTORY_MODE_INSERT_TRACKS:
+                self._repertory_start_button_tooltip.text = (
+                    "In Fase 1 verifica soltanto che tutti gli abbinamenti siano completi. "
+                    "L'elaborazione reale sara implementata nella Fase 2."
+                )
+            else:
+                self._repertory_start_button_tooltip.text = "Avvia il confronto e l'aggiornamento dei file selezionati."
+        if self._repertory_stop_button_tooltip is not None:
+            self._repertory_stop_button_tooltip.text = (
+                "Richiede l'interruzione sicura della diagnosi in corso."
+                if mode == REPERTORY_MODE_DIAGNOSTICS
+                else "Richiede l'interruzione sicura dell'elaborazione in corso."
+            )
+        if self._repertory_open_results_button_tooltip is not None:
+            if mode == REPERTORY_MODE_DIAGNOSTICS:
+                self._repertory_open_results_button_tooltip.text = "Apre la cartella della sessione diagnostica completata."
+            elif mode == REPERTORY_MODE_INSERT_TRACKS:
+                self._repertory_open_results_button_tooltip.text = (
+                    "Apre la cartella della sessione di inserimento nuovi brani completata, quando disponibile."
+                )
+            else:
+                self._repertory_open_results_button_tooltip.text = "Apre la cartella della sessione contenente report, log e backup."
+        if self._repertory_updates_entry_tooltip is not None:
+            self._repertory_updates_entry_tooltip.text = (
+                "Seleziona il repertorio organizzato da confrontare."
+                if mode == REPERTORY_MODE_DIAGNOSTICS
+                else "Seleziona la cartella contenente i file MP3 da confrontare e aggiornare."
+            )
+        if self._repertory_library_entry_tooltip is not None:
+            self._repertory_library_entry_tooltip.text = (
+                "Seleziona il repertorio generale piatto da confrontare."
+                if mode == REPERTORY_MODE_DIAGNOSTICS
+                else "Seleziona la root del repertorio organizzato in cartelle e sottocartelle."
+            )
+
+    def _clear_repertory_diagnostics_tree_widgets(self) -> None:
+        for widget in list(self._repertory_diagnostics_tree_widgets):
+            try:
+                widget.destroy()
+            except Exception:
+                pass
+        self._repertory_diagnostics_tree_widgets = []
+        self._repertory_diagnostics_tree_items = {}
+        self._repertory_diagnostics_tree_order = []
+
+    def _refresh_repertory_diagnostics_folder_tree(self) -> None:
+        if self._repertory_diagnostics_tree_scrollable is None:
+            return
+
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode != REPERTORY_MODE_DIAGNOSTICS:
+            return
+
+        split_dir = self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else ""
+        general_dir = self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else ""
+
+        if split_dir and general_dir and self._repertory_paths_collide(split_dir, general_dir):
+            self._clear_repertory_diagnostics_tree_widgets()
+            placeholder = ctk.CTkLabel(
+                self._repertory_diagnostics_tree_scrollable,
+                text="Percorsi non validi: Repertorio suddiviso e Cartella Repertorio Generale coincidono.",
+                anchor="w",
+                justify="left",
+                wraplength=700,
+            )
+            placeholder.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+            self._repertory_diagnostics_tree_widgets.append(placeholder)
+            self._update_repertory_primary_action_state()
+            return
+
+        previous_states: dict[str, bool] = {}
+        for key, item in self._repertory_diagnostics_tree_items.items():
+            try:
+                previous_states[key] = bool(item["var"].get())
+            except Exception:
+                previous_states[key] = True
+
+        self._clear_repertory_diagnostics_tree_widgets()
+        parent = self._repertory_diagnostics_tree_scrollable
+        if not split_dir or not Path(split_dir).is_dir() or not general_dir or not Path(general_dir).is_dir():
+            placeholder = ctk.CTkLabel(
+                parent,
+                text="Seleziona Cartella Repertorio suddiviso e Cartella Repertorio Generale per mostrare le sottocartelle.",
+                anchor="w",
+                justify="left",
+                wraplength=700,
+            )
+            placeholder.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+            self._repertory_diagnostics_tree_widgets.append(placeholder)
+            self._update_repertory_primary_action_state()
+            return
+
+        try:
+            nodes = enumerate_split_repertory_nodes(
+                split_dir,
+                general_dir,
+                general_dir,
+            )
+        except Exception as error:
+            placeholder = ctk.CTkLabel(
+                parent,
+                text=f"Impossibile leggere le sottocartelle: {error}",
+                anchor="w",
+                justify="left",
+                wraplength=700,
+            )
+            placeholder.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+            self._repertory_diagnostics_tree_widgets.append(placeholder)
+            self._update_repertory_primary_action_state()
+            return
+
+        if not nodes:
+            placeholder = ctk.CTkLabel(
+                parent,
+                text="Nessuna sottocartella trovata.",
+                anchor="w",
+            )
+            placeholder.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+            self._repertory_diagnostics_tree_widgets.append(placeholder)
+            self._update_repertory_primary_action_state()
+            return
+
+        for row_index, node in enumerate(nodes):
+            relative_path = str(getattr(node, "relative_path", "") or "")
+            full_path = str(getattr(node, "full_path", "") or "")
+            level = int(getattr(node, "level", 0) or 0)
+            auto_excluded = bool(getattr(node, "auto_excluded", False))
+            reason = str(getattr(node, "auto_exclusion_reason", "") or "")
+            selectable = bool(getattr(node, "selectable", True))
+            is_root_files = bool(getattr(node, "is_virtual_root_files", False))
+            mp3_detected = int(getattr(node, "mp3_detected", 0) or 0)
+
+            if is_root_files:
+                label = f"File presenti direttamente nella cartella principale ({mp3_detected} MP3)"
+            else:
+                label = relative_path or "."
+            text = label if not reason else f"{label} ({reason})"
+            default_value = previous_states.get(relative_path)
+            if default_value is None:
+                default_value = False if auto_excluded else True
+            var = tk.BooleanVar(value=bool(default_value))
+
+            checkbox = ctk.CTkCheckBox(
+                parent,
+                text=text,
+                variable=var,
+                command=lambda key=relative_path: self._on_repertory_diagnostics_tree_node_toggled(key),
+            )
+            checkbox.grid(row=row_index, column=0, sticky="w", padx=(10 + max(0, level) * 18, 8), pady=2)
+            if auto_excluded or not selectable:
+                checkbox.configure(state="disabled")
+
+            parent_path = ""
+            if not is_root_files and relative_path:
+                parent_path = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
+
+            self._repertory_diagnostics_tree_widgets.append(checkbox)
+            self._repertory_diagnostics_tree_order.append(relative_path)
+            self._repertory_diagnostics_tree_items[relative_path] = {
+                "var": var,
+                "widget": checkbox,
+                "selectable": bool(selectable and not auto_excluded),
+                "auto_excluded": auto_excluded,
+                "full_path": full_path,
+                "level": level,
+                "parent": parent_path,
+                "is_root_files": is_root_files,
+                "mp3_detected": mp3_detected,
+            }
+            self._update_repertory_primary_action_state()
+
+    def _on_repertory_diagnostics_tree_node_toggled(self, relative_path: str) -> None:
+        item = self._repertory_diagnostics_tree_items.get(relative_path)
+        if not item or not bool(item.get("selectable", False)):
+            return
+        target_state = bool(item["var"].get())
+
+        if target_state:
+            parent_key = str(item.get("parent", "") or "")
+            while parent_key:
+                parent_item = self._repertory_diagnostics_tree_items.get(parent_key)
+                if parent_item and bool(parent_item.get("selectable", False)):
+                    parent_item["var"].set(True)
+                if "/" not in parent_key:
+                    break
+                parent_key = parent_key.rsplit("/", 1)[0]
+
+        for key, child in self._repertory_diagnostics_tree_items.items():
+            if key == relative_path:
+                continue
+            if not bool(child.get("selectable", False)):
+                continue
+            if not key:
+                continue
+            if key == relative_path or key.startswith(relative_path + "/"):
+                child["var"].set(target_state)
+        self._update_repertory_primary_action_state()
+
+    def _select_all_repertory_diagnostics_nodes(self) -> None:
+        for item in self._repertory_diagnostics_tree_items.values():
+            if bool(item.get("selectable", False)):
+                item["var"].set(True)
+        self._update_repertory_primary_action_state()
+
+    def _deselect_all_repertory_diagnostics_nodes(self) -> None:
+        for key, item in self._repertory_diagnostics_tree_items.items():
+            if not bool(item.get("selectable", False)):
+                continue
+            if bool(item.get("is_root_files", False)):
+                item["var"].set(False)
+                continue
+            item["var"].set(False)
+        self._update_repertory_primary_action_state()
+
+    def _build_repertory_diagnostics_selection_payload(self) -> tuple[tuple[str, ...], tuple[str, ...], bool]:
+        selected: list[str] = []
+        excluded: list[str] = []
+        include_root_files = False
+
+        for key in self._repertory_diagnostics_tree_order:
+            item = self._repertory_diagnostics_tree_items.get(key)
+            if not item:
+                continue
+            if bool(item.get("auto_excluded", False)):
+                continue
+            if not bool(item.get("selectable", False)):
+                continue
+
+            is_selected = bool(item["var"].get())
+            is_root_files = bool(item.get("is_root_files", False)) or key == ROOT_FILES_TOKEN
+            if is_root_files:
+                include_root_files = is_selected
+                continue
+
+            if is_selected:
+                selected.append(key)
+            else:
+                excluded.append(key)
+
+        return tuple(selected), tuple(excluded), include_root_files
+
+    @staticmethod
+    def _canonical_path_for_compare(raw_path: str) -> str:
+        normalized = str(raw_path or "").strip()
+        if not normalized:
+            return ""
+        try:
+            expanded = Path(normalized).expanduser().resolve(strict=False)
+            normalized = str(expanded)
+        except Exception:
+            normalized = os.path.abspath(os.path.expanduser(normalized))
+        return os.path.normcase(os.path.normpath(normalized))
+
+    def _repertory_paths_collide(self, split_dir: str, general_dir: str) -> bool:
+        left = self._canonical_path_for_compare(split_dir)
+        right = self._canonical_path_for_compare(general_dir)
+        if not left or not right:
+            return False
+        return left == right
+
+    def _show_invalid_repertory_paths_message(self) -> None:
+        messagebox.showerror(
+            "Organizza repertorio",
+            "PERCORSI NON VALIDI\n\n"
+            "La Cartella Repertorio Generale e il Repertorio Suddiviso\n"
+            "non possono coincidere.\n\n"
+            "Selezionare due cartelle differenti.",
+            parent=self._repertory_dialog,
+        )
+
+    def _validate_repertory_diagnostics_paths(self, *, show_message: bool) -> bool:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode != REPERTORY_MODE_DIAGNOSTICS:
+            return True
+        split_dir = self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else ""
+        general_dir = self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else ""
+        if not split_dir or not general_dir:
+            return True
+        if not self._repertory_paths_collide(split_dir, general_dir):
+            return True
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Percorsi non validi: selezionare due cartelle differenti")
+        if show_message:
+            self._show_invalid_repertory_paths_message()
+        return False
+
+    def _on_repertory_diagnostics_paths_changed(self, _event=None) -> None:
+        if self._repertory_smartphone_entry is not None:
+            raw = str(self._repertory_smartphone_entry.get() or "").strip()
+            selected_path: str | None = None
+            if raw:
+                try:
+                    selected_path = str(Path(raw).expanduser().resolve())
+                except Exception:
+                    selected_path = None
+            self._repertory_selected_smartphone_folder = selected_path
+            if not selected_path:
+                self._repertory_last_completed_smartphone_folder = None
+            elif self._repertory_last_completed_smartphone_folder and (
+                self._canonical_path_for_compare(selected_path)
+                != self._canonical_path_for_compare(self._repertory_last_completed_smartphone_folder)
+            ):
+                self._repertory_last_completed_smartphone_folder = None
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode == REPERTORY_MODE_DIAGNOSTICS:
+            self._validate_repertory_diagnostics_paths(show_message=True)
+            self._refresh_repertory_diagnostics_folder_tree()
+        self._update_repertory_android_buttons_state()
+        self._update_repertory_primary_action_state()
+
+    @staticmethod
+    def _folder_contains_direct_or_nested_mp3(folder_path: Path) -> bool:
+        for current_root, dirs, files in os.walk(folder_path, topdown=True, followlinks=False):
+            current = Path(current_root)
+            pruned: list[str] = []
+            for directory in dirs:
+                candidate = current / directory
+                try:
+                    if candidate.is_symlink():
+                        continue
+                except Exception:
+                    continue
+                pruned.append(directory)
+            dirs[:] = pruned
+            for file_name in files:
+                candidate = current / file_name
+                if candidate.suffix.lower() == ".mp3":
+                    return True
+        return False
+
+    def _count_selected_repertory_folders_with_mp3(self, split_dir: str, selected_relative_roots: tuple[str, ...]) -> int:
+        split_root = Path(split_dir)
+        unique_roots: list[str] = []
+        for rel in sorted({str(item or "").strip().replace("\\", "/").strip("/") for item in selected_relative_roots if str(item or "").strip()}):
+            is_nested = False
+            for kept in unique_roots:
+                if rel == kept or rel.startswith(kept + "/"):
+                    is_nested = True
+                    break
+            if not is_nested:
+                unique_roots.append(rel)
+
+        elaborable = 0
+        for rel in unique_roots:
+            folder = split_root / Path(rel)
+            if not folder.is_dir():
+                continue
+            if self._folder_contains_direct_or_nested_mp3(folder):
+                elaborable += 1
+        return elaborable
+
+    def _count_root_mp3_direct(self, split_dir: str) -> int:
+        split_root = Path(split_dir)
+        if not split_root.is_dir():
+            return 0
+        count = 0
+        try:
+            for item in split_root.iterdir():
+                if item.is_file() and item.suffix.lower() == ".mp3":
+                    count += 1
+        except OSError:
+            return 0
+        return count
+
+    def _finalize_repertory_window_close(self) -> None:
+        self._stop_repertory_timer()
+        self._close_repertory_decision_dialog()
+        self._reset_rep003_operational_session(
+            preserve_results=False,
+            preserve_android_destination=False,
+            clear_paths=True,
+        )
+        self._clear_repertory_diagnostics_tree_widgets()
+        if self._repertory_dialog is not None:
+            self._cleanup_tooltips(owner=self._repertory_dialog)
+            try:
+                self._repertory_dialog.destroy()
+            except Exception:
+                pass
+
+        self._repertory_dialog = None
+        self._repertory_general_label = None
+        self._repertory_updates_entry = None
+        self._repertory_library_entry = None
+        self._repertory_general_entry = None
+        self._repertory_results_entry = None
+        self._repertory_smartphone_label = None
+        self._repertory_smartphone_entry = None
+        self._repertory_smartphone_browse_button = None
+        self._repertory_status_label = None
+        self._repertory_log_box = None
+        self._repertory_progress_bar = None
+        self._repertory_start_button = None
+        self._repertory_stop_button = None
+        self._repertory_close_button = None
+        self._repertory_open_results_button = None
+        self._repertory_open_smartphone_button = None
+        self._repertory_reset_smartphone_button = None
+        self._repertory_general_browse_button = None
+        self._repertory_diagnostics_tree_container = None
+        self._repertory_diagnostics_tree_scrollable = None
+        self._repertory_diagnostics_refresh_button = None
+        self._repertory_diagnostics_select_all_button = None
+        self._repertory_diagnostics_deselect_all_button = None
+        self._repertory_diagnostics_tree_items = {}
+        self._repertory_diagnostics_tree_order = []
+        self._repertory_diagnostics_tree_widgets = []
+        self._repertory_path_widgets = []
+        self._repertory_mode_selector = None
+        self._repertory_mode_radios = []
+        self._repertory_mode_frame = None
+        self._repertory_session_folder = None
+        self._repertory_result_folder_update = None
+        self._repertory_result_folder_diagnostics = None
+        self._repertory_result_folder_insert_tracks = None
+        self._repertory_selected_smartphone_folder = None
+        self._repertory_last_completed_smartphone_folder = None
+        self._repertory_allow_session_log_updates = False
+        self._repertory_expected_output_root = ""
+        self._repertory_min_session_timestamp = ""
+        self._repertory_started_at = None
+        self._repertory_total_files = 0
+        self._repertory_processed_files = 0
+        self._repertory_mtime_bypass_active = False
+        self._repertory_mtime_session_choice = "ASK"
+        self._repertory_reset_in_progress = False
+        self._repertory_pending_decision_request_id = None
+        self._repertory_close_requested = False
+        self._rep003_panel_frame = None
+        self._rep003_path_widgets = []
+        self._rep003_tracks_tree = None
+        self._rep003_folders_tree = None
+        self._rep003_new_tracks_entry = None
+        self._rep003_split_entry = None
+        self._rep003_general_entry = None
+        self._rep003_smartphone_entry = None
+        self._rep003_status_label = None
+        self._rep003_load_button = None
+        self._rep003_create_folder_button = None
+        self._rep003_refresh_folders_button = None
+        self._rep003_assign_button = None
+        self._rep003_remove_button = None
+        self._rep003_show_managed_switch = None
+        self._rep003_browse_buttons = []
+        self._rep003_track_row_by_iid = {}
+        self._rep003_folder_iid_by_relative = {}
+        self._rep003_folder_sort_key = REP003_SORT_FOLDER_RELATIVE
+        self._rep003_folder_sort_reverse = False
+        self._rep003_pending_decision_request_id = None
+        self._rep003_create_folder_dialog = None
+        self._rep003_create_folder_entry = None
+        self._rep003_create_folder_preview_var.set("")
+        self._rep003_session_policy = "ASK"
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+
+    def _repertory_worker_decision_required(self, payload: dict[str, Any]) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_worker_decision_required, payload)
+
+    def _handle_repertory_worker_decision_required(self, payload: dict[str, Any]) -> None:
+        request_id = str(payload.get("request_id") or "").strip()
+        if not request_id:
+            return
+
+        if self._repertory_mtime_session_choice == "UPDATE_ALL":
+            accepted = self.repertory_worker.submit_decision(request_id, "UPDATE_AND_BYPASS_SESSION")
+            if accepted:
+                self._append_repertory_log(
+                    "[MTIME] Decisione globale sessione riutilizzata automaticamente: UPDATE_ALL"
+                )
+            return
+        if self._repertory_mtime_session_choice == "SKIP_ALL":
+            accepted = self.repertory_worker.submit_decision(request_id, "SKIP_AND_BYPASS_SESSION")
+            if accepted:
+                self._append_repertory_log(
+                    "[MTIME] Decisione globale sessione riutilizzata automaticamente: SKIP_ALL"
+                )
+            return
+
+        self._repertory_pending_decision_request_id = request_id
+        self._open_repertory_mtime_decision_dialog(payload)
+
+    def _close_repertory_decision_dialog(self) -> None:
+        self._cleanup_tooltips(tooltips=self._repertory_decision_tooltips)
+        self._repertory_decision_tooltips = []
+        if self._repertory_decision_dialog is not None:
+            try:
+                self._repertory_decision_dialog.destroy()
+            except Exception:
+                pass
+        self._repertory_decision_dialog = None
+
+    def _add_repertory_decision_tooltip(self, widget, text: str) -> None:
+        tip = self._add_tooltip(widget, text)
+        self._repertory_decision_tooltips.append(tip)
+
+    def _submit_repertory_decision(self, decision: str) -> None:
+        request_id = (self._repertory_pending_decision_request_id or "").strip()
+        if not request_id:
+            self._close_repertory_decision_dialog()
+            return
+        accepted = self.repertory_worker.submit_decision(request_id, decision)
+        if accepted:
+            self._append_repertory_log(f"[MTIME] Decisione utente inviata: {decision}")
+        self._repertory_pending_decision_request_id = None
+        if decision == "UPDATE_AND_BYPASS_SESSION":
+            self._repertory_mtime_bypass_active = True
+            self._repertory_mtime_session_choice = "UPDATE_ALL"
+        elif decision == "SKIP_AND_BYPASS_SESSION":
+            self._repertory_mtime_bypass_active = True
+            self._repertory_mtime_session_choice = "SKIP_ALL"
+        self._close_repertory_decision_dialog()
+
+    def _open_repertory_mtime_decision_dialog(self, payload: dict[str, Any]) -> None:
+        self._close_repertory_decision_dialog()
+        parent = self._repertory_dialog if self._repertory_dialog is not None else self
+
+        screen_width = int(parent.winfo_screenwidth())
+        screen_height = int(parent.winfo_screenheight())
+        horizontal_margin_per_side = 48
+        vertical_margin_total = 80
+        desired_width = 1040
+        min_width = 640
+        min_height = 500
+        max_width_pixels = max(520, screen_width - (horizontal_margin_per_side * 2))
+        usable_width = max_width_pixels
+        initial_width = min(desired_width, usable_width)
+        content_wrap = max(260, initial_width - 140)
+        value_wrap = max(180, int((initial_width - 220) / 2))
+        wrapped_value_labels: list[Any] = []
+
+        dialog = ManagedCTkToplevel(parent)
+        self._repertory_decision_dialog = dialog
+        dialog.title("Confronto data e ora file")
+        dialog.resizable(False, False)
+        dialog.transient(parent)
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            pass
+        dialog.geometry(f"{initial_width}x560")
+        dialog.minsize(min(min_width, usable_width), min_height)
+
+        def _on_close() -> None:
+            self._submit_repertory_decision("SKIP_CURRENT")
+
+        dialog.protocol("WM_DELETE_WINDOW", _on_close)
+        dialog.grid_columnconfigure(0, weight=1)
+        dialog.grid_rowconfigure(0, weight=0)
+        dialog.grid_rowconfigure(1, weight=0)
+
+        body = ctk.CTkFrame(dialog)
+        body.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 6))
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(2, weight=0)
+        body.grid_rowconfigure(3, weight=0)
+
+        warning_text = (
+            "Confronta i due blocchi file e scegli come procedere per questo singolo caso. "
+            "Nel caso di stessa data e ora non viene applicato alcun aggiornamento automatico."
+        )
+        warning_label = ctk.CTkLabel(body, text=warning_text, justify="left", anchor="w", wraplength=content_wrap)
+        warning_label.grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(8, 6)
+        )
+
+        def _file_info_block(container, title: str, data: dict[str, Any]) -> None:
+            frame = ctk.CTkFrame(container)
+            frame.grid_columnconfigure(0, weight=0)
+            frame.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(frame, text=title, anchor="w", font=ctk.CTkFont(weight="bold")).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8)
+            )
+
+            entries = [
+                ("Nome file:", str(data.get("name", ""))),
+                ("Percorso:", str(data.get("path", ""))),
+                ("Dimensione:", self._format_repertory_size_text(data.get("size", 0))),
+                ("Data e ora di modifica:", str(data.get("mtime_human", ""))),
+            ]
+            for row_index, (label_text, value_text) in enumerate(entries, start=1):
+                ctk.CTkLabel(frame, text=label_text, anchor="nw", font=ctk.CTkFont(weight="bold")).grid(
+                    row=row_index,
+                    column=0,
+                    sticky="nw",
+                    padx=(10, 8),
+                    pady=(0, 4),
+                )
+                value_label = ctk.CTkLabel(
+                    frame,
+                    text=value_text,
+                    anchor="nw",
+                    justify="left",
+                    wraplength=value_wrap,
+                    width=value_wrap,
+                )
+                value_label.grid(
+                    row=row_index,
+                    column=1,
+                    sticky="ew",
+                    padx=(0, 10),
+                    pady=(0, 4),
+                )
+                wrapped_value_labels.append(value_label)
+            return frame
+
+        source_data = {
+            "name": payload.get("source_name", ""),
+            "path": payload.get("source_path", ""),
+            "mtime_human": payload.get("source_mtime_human", ""),
+            "size": payload.get("source_size", 0),
+        }
+        dest_data = {
+            "name": payload.get("destination_name", ""),
+            "path": payload.get("destination_path", ""),
+            "mtime_human": payload.get("destination_mtime_human", ""),
+            "size": payload.get("destination_size", 0),
+        }
+
+        source_frame = _file_info_block(body, "BLOCCO FILE AGGIORNAMENTI", source_data)
+        source_frame.grid(row=1, column=0, sticky="new", padx=(10, 6), pady=(0, 6))
+        dest_frame = _file_info_block(body, "BLOCCO FILE REPERTORIO", dest_data)
+        dest_frame.grid(row=1, column=1, sticky="new", padx=(6, 10), pady=(0, 6))
+
+        summary_text = str(payload.get("comparison_summary") or "").strip()
+        if not summary_text:
+            summary_text = self._build_repertory_mtime_summary(payload)
+        delta_compact = str(payload.get("mtime_delta_compact") or payload.get("mtime_delta_human") or "").strip()
+        if not delta_compact:
+            delta_compact = "Stessa data e ora"
+        comparison_reason = str(payload.get("comparison_reason") or "").strip()
+        if not comparison_reason:
+            comparison_reason = "Motivo confronto non disponibile"
+
+        summary_frame = ctk.CTkFrame(body)
+        summary_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6))
+        summary_frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(summary_frame, text="SINTESI DEL CONFRONTO", anchor="w", font=ctk.CTkFont(weight="bold")).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=10,
+            pady=(8, 4),
+        )
+        delta_label = ctk.CTkLabel(
+            summary_frame,
+            text=summary_text,
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(weight="bold"),
+            wraplength=content_wrap,
+        )
+        delta_label.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        delta_compact_label = ctk.CTkLabel(
+            summary_frame,
+            text=f"Differenza temporale: {delta_compact}",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(weight="bold"),
+            wraplength=content_wrap,
+        )
+        delta_compact_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 3))
+        reason_label = ctk.CTkLabel(
+            summary_frame,
+            text=f"Motivo confronto: {comparison_reason}",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(weight="bold"),
+            wraplength=content_wrap,
+        )
+        reason_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self._add_repertory_decision_tooltip(
+            delta_label,
+            "Riassume quale dei due file e piu recente e la relativa differenza temporale.",
+        )
+
+        button_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        button_row.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
+        button_row.grid_columnconfigure((0, 1), weight=1)
+        button_row.grid_columnconfigure((2, 3), weight=1)
+
+        button_update_current = ctk.CTkButton(
+            button_row,
+            text="Aggiorna comunque",
+            command=lambda: self._submit_repertory_decision("UPDATE_CURRENT"),
+            height=40,
+        )
+        button_update_current.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+        self._add_repertory_decision_tooltip(
+            button_update_current,
+            "Sostituisce solo il file visualizzato.\n\nIl controllo data e ora restera attivo per i file successivi.",
+        )
+
+        button_skip_current = ctk.CTkButton(
+            button_row,
+            text="Non aggiornare",
+            command=lambda: self._submit_repertory_decision("SKIP_CURRENT"),
+            height=40,
+        )
+        button_skip_current.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 6))
+        self._add_repertory_decision_tooltip(
+            button_skip_current,
+            "Mantiene il file attualmente presente nel Repertorio.\n\nIl controllo data e ora restera attivo per i file successivi.",
+        )
+
+        button_update_all = ctk.CTkButton(
+            button_row,
+            text="Aggiorna questo e tutti i successivi",
+            command=lambda: self._submit_repertory_decision("UPDATE_AND_BYPASS_SESSION"),
+            height=40,
+        )
+        button_update_all.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        self._add_repertory_decision_tooltip(
+            button_update_all,
+            "Sostituisce il file visualizzato e aggiorna automaticamente tutti i successivi casi soggetti al controllo data e ora.\n\nLa scelta vale solo per questa sessione.",
+        )
+
+        button_skip_all = ctk.CTkButton(
+            button_row,
+            text="Mantieni questo e tutti i successivi",
+            command=lambda: self._submit_repertory_decision("SKIP_AND_BYPASS_SESSION"),
+            height=40,
+        )
+        button_skip_all.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+        self._add_repertory_decision_tooltip(
+            button_skip_all,
+            "Mantiene il file visualizzato e conserva automaticamente tutti i successivi casi soggetti al controllo data e ora.\n\nLa scelta vale solo per questa sessione.",
+        )
+
+        dialog.update_idletasks()
+        req_h = max(min_height, int(dialog.winfo_reqheight()))
+        max_h = max(min_height, screen_height - vertical_margin_total)
+        final_w = min(desired_width, usable_width)
+        final_h = min(req_h, max_h)
+
+        for _ in range(3):
+            dynamic_content_wrap = max(260, final_w - 140)
+            dynamic_value_wrap = max(180, int((final_w - 220) / 2))
+            warning_label.configure(wraplength=dynamic_content_wrap)
+            delta_label.configure(wraplength=dynamic_content_wrap)
+            delta_compact_label.configure(wraplength=dynamic_content_wrap)
+            reason_label.configure(wraplength=dynamic_content_wrap)
+            for value_label in wrapped_value_labels:
+                value_label.configure(wraplength=dynamic_value_wrap, width=dynamic_value_wrap)
+
+            x_pos = max(0, (screen_width - final_w) // 2)
+            y_pos = max(0, (screen_height - final_h) // 2)
+            dialog.geometry(f"{final_w}x{final_h}+{x_pos}+{y_pos}")
+            dialog.update_idletasks()
+
+            realized_width = int(dialog.winfo_width())
+            if realized_width <= max_width_pixels:
+                break
+
+            shrink_ratio = max_width_pixels / float(max(1, realized_width))
+            final_w = max(520, int(final_w * shrink_ratio))
+
+    def _set_repertory_ui_running_state(self, running: bool) -> None:
+        widget_state = "disabled" if running else "normal"
+        for widget in self._repertory_path_widgets:
+            try:
+                widget.configure(state=widget_state)
+            except Exception:
+                pass
+        for widget in self._rep003_path_widgets:
+            try:
+                widget.configure(state=widget_state)
+            except Exception:
+                pass
+        if self._repertory_start_button is not None:
+            if running:
+                self._repertory_start_button.configure(state="disabled")
+            else:
+                self._update_repertory_primary_action_state()
+        if self._repertory_stop_button is not None:
+            self._repertory_stop_button.configure(state="normal" if running else "disabled")
+        for radio in self._repertory_mode_radios:
+            try:
+                radio.configure(state="disabled" if running else "normal")
+            except Exception:
+                pass
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+
+    def _reset_repertory_runtime_counters(self) -> None:
+        self._repertory_total_files = 0
+        self._repertory_processed_files = 0
+        self._repertory_matches_found = 0
+        self._repertory_files_updated = 0
+        self._repertory_files_not_found = 0
+        self._repertory_errors = 0
+        self._repertory_mtime_bypass_active = False
+        self._repertory_mtime_session_choice = "ASK"
+        self._render_repertory_runtime_counters()
+
+    @staticmethod
+    def _format_human_delta_seconds(total_seconds: int) -> str:
+        seconds = max(0, int(total_seconds))
+        if seconds <= 0:
+            return "Stessa data e ora"
+
+        units = [
+            (365 * 24 * 3600, "anno", "anni"),
+            (30 * 24 * 3600, "mese", "mesi"),
+            (24 * 3600, "giorno", "giorni"),
+            (3600, "ora", "ore"),
+            (60, "minuto", "minuti"),
+            (1, "secondo", "secondi"),
+        ]
+        parts: list[str] = []
+        remaining = seconds
+        for unit_seconds, singular, plural in units:
+            if remaining < unit_seconds:
+                continue
+            qty, remaining = divmod(remaining, unit_seconds)
+            parts.append(f"{qty} {singular if qty == 1 else plural}")
+        if not parts:
+            return "Stessa data e ora"
+        if len(parts) == 1:
+            return parts[0]
+        if len(parts) == 2:
+            return f"{parts[0]} e {parts[1]}"
+        return ", ".join(parts[:-1]) + f" e {parts[-1]}"
+
+    @staticmethod
+    def _format_repertory_size_text(size_value: Any) -> str:
+        try:
+            size_bytes = max(0, int(size_value))
+        except Exception:
+            size_bytes = 0
+        size_mb = float(size_bytes) / (1024.0 * 1024.0)
+        return f"{size_mb:.2f}".replace(".", ",") + " MB"
+
+    def _build_repertory_mtime_summary(self, payload: dict[str, Any]) -> str:
+        reason = str(payload.get("comparison_reason") or "").strip()
+        delta_human = str(payload.get("mtime_delta_compact") or payload.get("mtime_delta_human") or "").strip()
+        if not delta_human:
+            try:
+                src_mtime = float(payload.get("source_mtime", 0.0))
+                dst_mtime = float(payload.get("destination_mtime", 0.0))
+                delta_human = self._format_human_delta_seconds(int(abs(dst_mtime - src_mtime)))
+            except Exception:
+                delta_human = "Stessa data e ora"
+
+        if reason == "Stessa data e ora di modifica":
+            return (
+                "Il file nella cartella Aggiornamenti e il file presente nel Repertorio "
+                "hanno la stessa data e ora di modifica."
+            )
+        if reason in {"File della cartella Aggiornamenti più recente", "File della cartella Aggiornamenti piu recente"}:
+            return (
+                "Il file nella cartella Aggiornamenti e piu recente di quello "
+                f"presente nel Repertorio di {delta_human}."
+            )
+        if reason in {"File del repertorio più recente", "File del repertorio piu recente"}:
+            return (
+                "Il file nella cartella Aggiornamenti e piu vecchio di quello "
+                f"presente nel Repertorio di {delta_human}."
+            )
+        return f"Differenza temporale: {delta_human}."
+
+    def _render_repertory_runtime_counters(self) -> None:
+        if self._widget_exists(self._repertory_file_counter_label):
+            try:
+                self._repertory_file_counter_label.configure(
+                    text=f"File elaborati: {self._repertory_processed_files} / {self._repertory_total_files}"
+                )
+            except (tk.TclError, RuntimeError):
+                pass
+        if self._widget_exists(self._repertory_matches_label):
+            try:
+                self._repertory_matches_label.configure(text=f"Corrispondenze trovate: {self._repertory_matches_found}")
+            except (tk.TclError, RuntimeError):
+                pass
+        if self._widget_exists(self._repertory_updated_label):
+            try:
+                self._repertory_updated_label.configure(text=f"File aggiornati: {self._repertory_files_updated}")
+            except (tk.TclError, RuntimeError):
+                pass
+        if self._widget_exists(self._repertory_not_found_label):
+            try:
+                self._repertory_not_found_label.configure(text=f"File non trovati: {self._repertory_files_not_found}")
+            except (tk.TclError, RuntimeError):
+                pass
+        if self._widget_exists(self._repertory_errors_label):
+            try:
+                self._repertory_errors_label.configure(text=f"Errori: {self._repertory_errors}")
+            except (tk.TclError, RuntimeError):
+                pass
+
+    def _start_repertory_timer(self) -> None:
+        if self._repertory_timer_job is not None:
+            self._cancel_tracked_after_job(self._repertory_timer_job)
+        self._tick_repertory_timer()
+
+    def _stop_repertory_timer(self) -> None:
+        if self._repertory_timer_job is not None:
+            self._cancel_tracked_after_job(self._repertory_timer_job)
+            self._repertory_timer_job = None
+
+    def _tick_repertory_timer(self) -> None:
+        if (
+            self._repertory_started_at is None
+            or self._repertory_close_requested
+            or not self._widget_exists(self)
+            or not self._widget_exists(self._repertory_dialog)
+        ):
+            self._repertory_timer_job = None
+            return
+        elapsed = max(0.0, time.monotonic() - self._repertory_started_at)
+        if self._repertory_elapsed_label is not None:
+            self._repertory_elapsed_label.configure(text=f"Tempo trascorso: {self._format_duration(elapsed)}")
+
+        if self._repertory_total_files > 0 and self._repertory_processed_files > 0:
+            average = elapsed / float(self._repertory_processed_files)
+            remaining = max(0, self._repertory_total_files - self._repertory_processed_files)
+            eta = self._format_duration(max(0.0, average * remaining))
+        else:
+            eta = "--"
+        if self._repertory_eta_label is not None:
+            self._repertory_eta_label.configure(text=f"Tempo restante stimato: {eta}")
+
+        self._repertory_timer_job = self._schedule_tracked_after(1000, self._tick_repertory_timer)
+
+    def _parse_repertory_progress(self, message: str) -> None:
+        try:
+            prefix, _, tail = message.partition(" - ")
+            progress = prefix.replace("Elaborazione", "").strip()
+            current_text, _, total_text = progress.partition("/")
+            current = int(current_text.strip())
+            total = int(total_text.strip())
+            self._repertory_processed_files = max(0, current)
+            self._repertory_total_files = max(0, total)
+        except Exception:
+            return
+
+        if "|" not in message:
+            return
+        metrics = message.split("|", 1)[1].strip().split()
+        for token in metrics:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            try:
+                parsed = int(value)
+            except ValueError:
+                continue
+            if key == "match":
+                self._repertory_matches_found = max(0, parsed)
+            elif key == "aggiornati":
+                self._repertory_files_updated = max(0, parsed)
+            elif key == "non_trovati":
+                self._repertory_files_not_found = max(0, parsed)
+            elif key == "errori":
+                self._repertory_errors = max(0, parsed)
+
+        self._render_repertory_runtime_counters()
+
+        if "CONTROLLO_BYPASS_SESSIONE" in message:
+            self._repertory_mtime_bypass_active = True
+
+    def _process_repertory_tech_message(self, message: str) -> None:
+        if message.startswith("[TECH] Sessione esiti creata | path="):
+            if not self._repertory_allow_session_log_updates:
+                return
+            candidate = message.split("path=", 1)[1].strip()
+            if not candidate:
+                return
+            try:
+                candidate_path = Path(candidate).resolve()
+            except Exception:
+                return
+
+            if self._repertory_expected_output_root:
+                expected_root = Path(self._repertory_expected_output_root).resolve()
+                expected_prefix = str(expected_root).casefold()
+                if not str(candidate_path).casefold().startswith(expected_prefix):
+                    return
+
+            if self._repertory_min_session_timestamp:
+                name = candidate_path.name
+                prefix = "Organizzazione_Repertorio_"
+                if name.startswith(prefix):
+                    stamp = name[len(prefix):]
+                    if stamp < self._repertory_min_session_timestamp:
+                        return
+
+            self._repertory_session_folder = str(candidate_path)
+            current_mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+            if current_mode in (REPERTORY_MODE_UPDATE, REPERTORY_MODE_DIAGNOSTICS):
+                self._set_repertory_results_folder_for_mode(current_mode, self._repertory_session_folder)
+            self._update_repertory_open_results_button_state()
+
+    def _append_repertory_log(self, message: str) -> None:
+        if self._repertory_log_box is not None:
+            self._repertory_log_box.configure(state="normal")
+            self._repertory_log_box.insert("end", f"{message}\n")
+            self._repertory_log_box.see("end")
+            self._repertory_log_box.configure(state="disabled")
+        self._process_repertory_tech_message(message)
+        self._append_log(message)
+
+    def _start_repertory_organization(self) -> None:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode == REPERTORY_MODE_INSERT_TRACKS:
+            self._rep003_finalize_placeholder()
+            return
+        if mode == REPERTORY_MODE_DIAGNOSTICS:
+            self._start_repertory_diagnostics()
+            return
+
+        if self.repertory_worker.is_running:
+            messagebox.showwarning("Organizza repertorio", "Una organizzazione repertorio e gia in corso.", parent=self._repertory_dialog)
+            return
+
+        self._repertory_session_folder = None
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_UPDATE, "")
+        self._repertory_last_completed_smartphone_folder = None
+        self._repertory_allow_session_log_updates = False
+        self._repertory_expected_output_root = ""
+        self._repertory_min_session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+
+        updates_dir = self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else ""
+        repertory_dir = self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else ""
+        repertory_general_dir = self._repertory_general_entry.get().strip() if self._repertory_general_entry is not None else ""
+        results_dir = self._repertory_results_entry.get().strip() if self._repertory_results_entry is not None else ""
+        smartphone_dir = self._repertory_smartphone_entry.get().strip() if self._repertory_smartphone_entry is not None else ""
+        backup_enabled = bool(self._repertory_backup_var.get())
+
+        if not updates_dir or not Path(updates_dir).is_dir():
+            messagebox.showerror("Organizza repertorio", "Seleziona una cartella aggiornamenti valida.", parent=self._repertory_dialog)
+            return
+        if not repertory_dir or not Path(repertory_dir).is_dir():
+            messagebox.showerror("Organizza repertorio", "Seleziona una cartella repertorio suddiviso valida.", parent=self._repertory_dialog)
+            return
+        if not repertory_general_dir or not Path(repertory_general_dir).is_dir():
+            messagebox.showerror("Organizza repertorio", "Seleziona una cartella repertorio generale valida.", parent=self._repertory_dialog)
+            return
+        if not smartphone_dir:
+            messagebox.showerror(
+                "Organizza repertorio",
+                "Seleziona una cartella Smartphone/Tablet valida.",
+                parent=self._repertory_dialog,
+            )
+            return
+        try:
+            smartphone_path = Path(smartphone_dir).expanduser().resolve()
+        except Exception as error:
+            messagebox.showerror(
+                "Organizza repertorio",
+                f"Cartella Smartphone/Tablet non valida:\n{error}",
+                parent=self._repertory_dialog,
+            )
+            return
+        if self._is_filesystem_root(smartphone_path):
+            messagebox.showerror(
+                "Organizza repertorio",
+                "La cartella Smartphone/Tablet non puo coincidere con la root del disco.",
+                parent=self._repertory_dialog,
+            )
+            return
+        self._repertory_smartphone_root = str(smartphone_path)
+        self._repertory_selected_smartphone_folder = str(smartphone_path)
+        if not self._ensure_repertory_smartphone_folder_ready():
+            self._append_repertory_log("Avvio annullato: cartella Smartphone/Tablet non pronta.")
+            return
+        if not results_dir:
+            messagebox.showerror("Organizza repertorio", "Seleziona una cartella risultati valida.", parent=self._repertory_dialog)
+            return
+
+        try:
+            Path(results_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            messagebox.showerror("Organizza repertorio", f"Impossibile creare la cartella risultati:\n{error}", parent=self._repertory_dialog)
+            return
+
+        self._repertory_expected_output_root = str(Path(results_dir).resolve())
+        self._repertory_allow_session_log_updates = True
+        self._reset_repertory_runtime_counters()
+        self._repertory_started_at = time.monotonic()
+        self._start_repertory_timer()
+        self._set_repertory_ui_running_state(True)
+        self._update_controls_state()
+
+        if self._repertory_progress_bar is not None:
+            self._repertory_progress_bar.set(0)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Organizzazione repertorio in corso...")
+
+        self.settings["repertory_updates_folder"] = updates_dir
+        self.settings["repertory_library_folder"] = repertory_dir
+        self.settings["repertory_general_folder"] = repertory_general_dir
+        self.settings["repertory_results_folder"] = results_dir
+        self.settings["repertory_smartphone_folder"] = str(self._get_repertory_smartphone_root())
+        self.settings["repertory_backup_enabled"] = backup_enabled
+        self.save_settings()
+
+        self._append_repertory_log("Avvio organizzazione repertorio.")
+
+        try:
+            self.repertory_worker.start(
+                updates_dir=updates_dir,
+                repertory_dir=repertory_dir,
+                repertory_general_dir=repertory_general_dir,
+                results_dir=results_dir,
+                backup_enabled=backup_enabled,
+                smartphone_tablet_dir=str(self._get_repertory_smartphone_root()),
+            )
+        except Exception as error:
+            self._stop_repertory_timer()
+            self._repertory_allow_session_log_updates = False
+            self._set_repertory_ui_running_state(False)
+            self._update_controls_state()
+            messagebox.showerror("Organizza repertorio", str(error), parent=self._repertory_dialog)
+
+    def _start_repertory_diagnostics(self) -> None:
+        if self.repertory_diagnostics_worker.is_running:
+            messagebox.showwarning("Organizza repertorio", "Una diagnosi repertorio e gia in corso.", parent=self._repertory_dialog)
+            return
+
+        split_dir = self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else ""
+        general_dir = self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else ""
+
+        if not split_dir or not Path(split_dir).is_dir():
+            messagebox.showerror("Organizza repertorio", "Seleziona una cartella repertorio suddiviso valida.", parent=self._repertory_dialog)
+            return
+        if not general_dir or not Path(general_dir).is_dir():
+            messagebox.showerror("Organizza repertorio", "Seleziona una cartella repertorio generale valida.", parent=self._repertory_dialog)
+            return
+        if not self._validate_repertory_diagnostics_paths(show_message=True):
+            return
+        if not os.access(general_dir, os.W_OK):
+            messagebox.showerror("Organizza repertorio", "La Cartella Repertorio Generale deve essere scrivibile.", parent=self._repertory_dialog)
+            return
+
+        self._refresh_repertory_diagnostics_folder_tree()
+        selected_relative_roots, excluded_relative_roots, include_root_files = self._build_repertory_diagnostics_selection_payload()
+        selected_folder_count = self._count_selected_repertory_folders_with_mp3(split_dir, selected_relative_roots)
+        root_mp3_count = self._count_root_mp3_direct(split_dir)
+        can_start = selected_folder_count > 0 or (bool(include_root_files) and root_mp3_count > 0)
+        if not can_start:
+            messagebox.showerror(
+                "Organizza repertorio",
+                "NESSUNA CARTELLA SELEZIONATA\n\n"
+                "Selezionare almeno una cartella del repertorio\n"
+                "oppure i file presenti nella cartella principale.",
+                parent=self._repertory_dialog,
+            )
+            return
+
+        self._repertory_session_folder = None
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_DIAGNOSTICS, "")
+        self._repertory_allow_session_log_updates = False
+        self._repertory_expected_output_root = ""
+        self._repertory_min_session_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._update_repertory_open_results_button_state()
+
+        self._reset_repertory_runtime_counters()
+        self._repertory_started_at = time.monotonic()
+        self._start_repertory_timer()
+        self._set_repertory_ui_running_state(True)
+        self._update_controls_state()
+
+        if self._repertory_progress_bar is not None:
+            self._repertory_progress_bar.set(0)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Diagnosi repertorio in corso...")
+
+        self._append_repertory_log("Avvio diagnosi repertorio.")
+
+        try:
+            self.repertory_diagnostics_worker.start(
+                split_repertory_dir=split_dir,
+                general_repertory_dir=general_dir,
+                results_dir=general_dir,
+                selected_relative_roots=selected_relative_roots,
+                excluded_relative_roots=excluded_relative_roots,
+                include_root_files=include_root_files,
+            )
+        except Exception as error:
+            self._stop_repertory_timer()
+            self._set_repertory_ui_running_state(False)
+            self._update_controls_state()
+            messagebox.showerror("Organizza repertorio", str(error), parent=self._repertory_dialog)
+
+    def _request_stop_repertory_organization(self) -> None:
+        mode = self._normalize_repertory_mode(self._repertory_mode_var.get())
+        if mode == REPERTORY_MODE_INSERT_TRACKS:
+            if not self.rep003_worker.is_running:
+                return
+            should_stop = messagebox.askyesno(
+                "Organizza repertorio",
+                "Vuoi interrompere l'inserimento nuovi brani dopo il file attualmente in elaborazione?",
+                parent=self._repertory_dialog,
+            )
+            if not should_stop:
+                return
+            self.rep003_worker.cancel()
+            self._append_repertory_log("Richiesta di interruzione inserimento nuovi brani inviata.")
+            return
+        if mode == REPERTORY_MODE_DIAGNOSTICS:
+            if not self.repertory_diagnostics_worker.is_running:
+                return
+            should_stop = messagebox.askyesno(
+                "Organizza repertorio",
+                "Vuoi interrompere la diagnosi dopo il file attualmente in elaborazione?",
+                parent=self._repertory_dialog,
+            )
+            if not should_stop:
+                return
+            self.repertory_diagnostics_worker.cancel()
+            self._append_repertory_log("Richiesta di interruzione diagnosi inviata.")
+            return
+
+        if not self.repertory_worker.is_running:
+            return
+        should_stop = messagebox.askyesno(
+            "Organizza repertorio",
+            "Vuoi interrompere l'operazione dopo il file attualmente in elaborazione?",
+            parent=self._repertory_dialog,
+        )
+        if not should_stop:
+            return
+        self.repertory_worker.cancel()
+        self._append_repertory_log("Richiesta di interruzione inviata.")
+
+    def _repertory_worker_progress(self, current: int, total: int, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_worker_progress, current, total, message)
+
+    def _handle_repertory_worker_progress(self, current: int, total: int, message: str) -> None:
+        self._repertory_processed_files = max(0, int(current))
+        self._repertory_total_files = max(self._repertory_total_files, int(total))
+        self._parse_repertory_progress(message)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text=message)
+        if self._repertory_progress_bar is not None:
+            self._repertory_progress_bar.set(0 if total <= 0 else min(1.0, max(0.0, current / float(total))))
+        self._render_repertory_runtime_counters()
+
+    def _repertory_worker_log(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._append_repertory_log, message)
+
+    def _repertory_worker_completed(self, result) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_worker_completed, result)
+
+    def _handle_repertory_worker_completed(self, result) -> None:
+        self._stop_repertory_timer()
+        self._repertory_allow_session_log_updates = False
+        self._repertory_pending_decision_request_id = None
+        self._close_repertory_decision_dialog()
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._schedule_tracked_after(0, self._update_repertory_primary_action_state)
+
+        self._repertory_processed_files = max(self._repertory_processed_files, int(result.processed_source_files))
+        self._repertory_total_files = max(self._repertory_total_files, int(result.total_source_files))
+        self._repertory_session_folder = str(getattr(result, "session_folder", "") or "")
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_UPDATE, self._repertory_session_folder)
+        completed_ok = bool(getattr(result, "success", not bool(getattr(result, "interrupted", False))))
+        if completed_ok:
+            selected = str(self._repertory_selected_smartphone_folder or "").strip()
+            self._repertory_last_completed_smartphone_folder = selected or None
+        else:
+            self._repertory_last_completed_smartphone_folder = None
+
+        counters = getattr(result, "counters", {})
+        self._repertory_matches_found = max(self._repertory_matches_found, int(
+            counters.get(RepertoryStatus.AGGIORNATO.value, 0)
+            + counters.get(RepertoryStatus.AGGIORNATO_MULTIPLO.value, 0)
+            + counters.get(RepertoryStatus.ERRORE_BACKUP.value, 0)
+            + counters.get(RepertoryStatus.ERRORE_COPIA.value, 0)
+            + counters.get(RepertoryStatus.ERRORE_VERIFICA.value, 0)
+        ))
+        self._repertory_files_updated = max(self._repertory_files_updated, int(
+            counters.get(RepertoryStatus.AGGIORNATO.value, 0)
+            + counters.get(RepertoryStatus.AGGIORNATO_MULTIPLO.value, 0)
+        ))
+        self._repertory_files_not_found = max(
+            self._repertory_files_not_found,
+            int(counters.get(RepertoryStatus.NON_TROVATO.value, 0)),
+        )
+        self._repertory_errors = max(
+            self._repertory_errors,
+            int(counters.get(RepertoryStatus.ERRORE_SORGENTE.value, 0))
+            + int(counters.get(RepertoryStatus.ERRORE_BACKUP.value, 0))
+            + int(counters.get(RepertoryStatus.ERRORE_COPIA.value, 0))
+            + int(counters.get(RepertoryStatus.ERRORE_VERIFICA.value, 0))
+            + int(counters.get(RepertoryStatus.AMBIGUO.value, 0)),
+        )
+
+        self._render_repertory_runtime_counters()
+
+        if self._repertory_progress_bar is not None:
+            total = max(0, int(result.total_source_files))
+            done = max(0, int(result.processed_source_files))
+            self._repertory_progress_bar.set(0 if total <= 0 else min(1.0, done / float(total)))
+
+        self._update_repertory_open_results_button_state()
+        self._update_repertory_android_buttons_state()
+
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(
+                text="Operazione interrotta" if bool(getattr(result, "interrupted", False)) else "Operazione completata"
+            )
+
+        self._append_repertory_log(f"Report CSV: {result.report_paths.get('csv', '')}")
+        self._append_repertory_log(f"Report HTML: {result.report_paths.get('html', '')}")
+        self._append_repertory_log(f"Report XLSX: {result.report_paths.get('xlsx', '')}")
+        self._append_repertory_log(f"Log sessione: {result.log_path}")
+        self._append_repertory_log(f"Cartella sessione: {self._repertory_session_folder}")
+
+        if bool(getattr(result, "interrupted", False)):
+            message = (
+                "Operazione interrotta.\n"
+                f"File elaborati: {result.processed_source_files}/{result.total_source_files}\n"
+                f"Risultati parziali: {self._repertory_session_folder}"
+            )
+        else:
+            repertory_update_errors = (
+                int(counters.get(RepertoryStatus.ERRORE_SORGENTE.value, 0))
+                + int(counters.get(RepertoryStatus.ERRORE_BACKUP.value, 0))
+                + int(counters.get(RepertoryStatus.ERRORE_COPIA.value, 0))
+                + int(counters.get(RepertoryStatus.ERRORE_VERIFICA.value, 0))
+            )
+            smartphone_copied = int(counters.get(COUNTER_SMARTPHONE_TABLET_COPIATI, 0))
+            smartphone_errors = int(counters.get(COUNTER_SMARTPHONE_TABLET_ERRORI, 0))
+            repertory_updated_copies = int(counters.get(COUNTER_COPIE_AGGIORNATE_REPERTORIO, 0))
+            updated_tracks = int(counters.get(COUNTER_BRANI_AGGIORNATI, 0))
+            files_updated = int(
+                counters.get(RepertoryStatus.AGGIORNATO.value, 0)
+                + counters.get(RepertoryStatus.AGGIORNATO_MULTIPLO.value, 0)
+            )
+            if repertory_updated_copies <= 0:
+                repertory_updated_copies = files_updated
+            if updated_tracks <= 0 and files_updated > 0:
+                updated_tracks = min(int(result.processed_source_files), files_updated)
+            files_kept = int(counters.get(COUNTER_FILE_MANTENUTI, 0))
+            repertory_not_found_count = int(counters.get(COUNTER_FILE_NON_TROVATI_NEL_REPERTORIO, 0))
+            repertory_not_found_copy_errors = int(counters.get(COUNTER_FILE_NON_TROVATI_ERRORI_COPIA, 0))
+            repertory_to_insert_count = int(counters.get(COUNTER_BRANI_DA_INSERIRE, 0))
+            repertory_to_insert_errors = int(counters.get(COUNTER_BRANI_DA_INSERIRE_ERRORI, 0))
+            total_errors = (
+                repertory_update_errors
+                + smartphone_errors
+                + repertory_not_found_copy_errors
+                + repertory_to_insert_errors
+            )
+
+            summary_lines = [
+                "ORGANIZZAZIONE REPERTORIO COMPLETATA",
+                "",
+                f"Brani elaborati: {result.processed_source_files}",
+                f"Brani aggiornati: {updated_tracks}",
+                f"Copie aggiornate nel Repertorio: {repertory_updated_copies}",
+                f"Brani mantenuti: {files_kept}",
+                f"Brani non trovati nel Repertorio: {repertory_not_found_count}",
+                f"Brani non trovati da inserire: {repertory_to_insert_count}",
+                f"Copie in cartella per dispositivo Android: {smartphone_copied}",
+                f"Errori: {total_errors}",
+                "",
+            ]
+            if total_errors > 0:
+                summary_lines.append("Consultare i report per il dettaglio degli errori.")
+            summary_lines.extend(
+                [
+                    "I dettagli completi sono disponibili nei report.",
+                    "Risultati salvati nella cartella della sessione.",
+                ]
+            )
+            message = "\n".join(summary_lines)
+        messagebox.showinfo("Organizza repertorio", message, parent=self._repertory_dialog)
+        if self._repertory_close_requested:
+            self._finalize_repertory_window_close()
+
+    def _repertory_worker_error(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_worker_error, message)
+
+    def _handle_repertory_worker_error(self, message: str) -> None:
+        self._stop_repertory_timer()
+        self._repertory_allow_session_log_updates = False
+        self._repertory_pending_decision_request_id = None
+        self._close_repertory_decision_dialog()
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._schedule_tracked_after(0, self._update_repertory_primary_action_state)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Errore organizzazione repertorio")
+        self._append_repertory_log(f"ERRORE: {message}")
+        messagebox.showerror("Organizza repertorio", message, parent=self._repertory_dialog)
+        if self._repertory_close_requested:
+            self._finalize_repertory_window_close()
+
+    def _repertory_worker_cancelled(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_worker_cancelled, message)
+
+    def _handle_repertory_worker_cancelled(self, message: str) -> None:
+        self._stop_repertory_timer()
+        self._repertory_allow_session_log_updates = False
+        self._repertory_pending_decision_request_id = None
+        self._close_repertory_decision_dialog()
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._schedule_tracked_after(0, self._update_repertory_primary_action_state)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Organizzazione repertorio interrotta")
+        self._append_repertory_log(message)
+        if self._repertory_close_requested:
+            self._finalize_repertory_window_close()
+
+    def _repertory_diagnostics_worker_progress(self, current: int, total: int, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_diagnostics_worker_progress, current, total, message)
+
+    def _handle_repertory_diagnostics_worker_progress(self, current: int, total: int, message: str) -> None:
+        self._repertory_processed_files = max(0, int(current))
+        self._repertory_total_files = max(self._repertory_total_files, int(total))
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text=message)
+        if self._repertory_progress_bar is not None:
+            self._repertory_progress_bar.set(0 if total <= 0 else min(1.0, max(0.0, current / float(total))))
+        self._render_repertory_runtime_counters()
+
+    def _repertory_diagnostics_worker_log(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._append_repertory_log, message)
+
+    def _repertory_diagnostics_worker_completed(self, result) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_diagnostics_worker_completed, result)
+
+    def _handle_repertory_diagnostics_worker_completed(self, result) -> None:
+        self._stop_repertory_timer()
+        self._repertory_allow_session_log_updates = False
+        self._repertory_pending_decision_request_id = None
+        self._close_repertory_decision_dialog()
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._schedule_tracked_after(0, self._update_repertory_primary_action_state)
+
+        self._repertory_session_folder = str(getattr(result, "session_folder", "") or "")
+        self._set_repertory_results_folder_for_mode(REPERTORY_MODE_DIAGNOSTICS, self._repertory_session_folder)
+        self._repertory_processed_files = int(getattr(result, "analyzed_split_files", 0)) + int(getattr(result, "analyzed_general_files", 0))
+        self._repertory_total_files = max(self._repertory_processed_files, 1)
+        self._render_repertory_runtime_counters()
+
+        if self._repertory_progress_bar is not None:
+            self._repertory_progress_bar.set(1)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Diagnosi repertorio completata")
+        self._update_repertory_open_results_button_state()
+
+        missing_in_general = int(getattr(result, "only_split", 0))
+        missing_in_split = int(getattr(result, "only_general", 0))
+        total_errors = int(getattr(result, "read_errors", 0)) + int(getattr(result, "copy_errors", 0))
+        is_aligned = (missing_in_general == 0 and missing_in_split == 0 and total_errors == 0)
+
+        if is_aligned:
+            summary = (
+                "DIAGNOSI REPERTORIO COMPLETATA\n\n"
+                "ESITO: QUADRATURA COMPLETA\n\n"
+                f"Errori: {total_errors}\n\n"
+                "I dettagli completi sono disponibili nei report."
+            )
+        else:
+            summary = (
+                "DIAGNOSI REPERTORIO COMPLETATA\n\n"
+                "ESITO: REPERTORI NON ALLINEATI\n\n"
+                f"File presenti in entrambi i repertori: {getattr(result, 'matched_both', 0)}\n"
+                f"File mancanti nella Cartella Generale: {missing_in_general}\n"
+                f"File mancanti nel Repertorio suddiviso: {missing_in_split}\n\n"
+                f"Errori: {total_errors}\n"
+                + ("Consultare i report per il dettaglio degli errori.\n\n" if total_errors > 0 else "\n")
+                + "I dettagli completi sono disponibili nei report."
+            )
+        self._append_repertory_log("Diagnosi repertorio completata.")
+        self._append_repertory_log(f"Report CSV: {result.report_paths.get('csv', '')}")
+        self._append_repertory_log(f"Report cartelle CSV: {getattr(result, 'folder_report_paths', {}).get('csv', '')}")
+        self._append_repertory_log(f"Report XLSX: {result.report_paths.get('xlsx', '')}")
+        self._append_repertory_log(f"Report HTML: {result.report_paths.get('html', '')}")
+        messagebox.showinfo("Organizza repertorio", summary, parent=self._repertory_dialog)
+        if self._repertory_close_requested:
+            self._finalize_repertory_window_close()
+
+    def _repertory_diagnostics_worker_error(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_diagnostics_worker_error, message)
+
+    def _handle_repertory_diagnostics_worker_error(self, message: str) -> None:
+        self._stop_repertory_timer()
+        self._repertory_allow_session_log_updates = False
+        self._close_repertory_decision_dialog()
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._schedule_tracked_after(0, self._update_repertory_primary_action_state)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Errore diagnosi repertorio")
+        self._append_repertory_log(f"ERRORE: {message}")
+        messagebox.showerror("Organizza repertorio", message, parent=self._repertory_dialog)
+        if self._repertory_close_requested:
+            self._finalize_repertory_window_close()
+
+    def _repertory_diagnostics_worker_cancelled(self, message: str) -> None:
+        self._schedule_tracked_after(0, self._handle_repertory_diagnostics_worker_cancelled, message)
+
+    def _handle_repertory_diagnostics_worker_cancelled(self, message: str) -> None:
+        self._stop_repertory_timer()
+        self._repertory_allow_session_log_updates = False
+        self._close_repertory_decision_dialog()
+        self._set_repertory_ui_running_state(False)
+        self._update_controls_state()
+        self._schedule_tracked_after(0, self._update_repertory_primary_action_state)
+        if self._repertory_status_label is not None:
+            self._repertory_status_label.configure(text="Diagnosi repertorio interrotta")
+        self._append_repertory_log(message)
+        if self._repertory_close_requested:
+            self._finalize_repertory_window_close()
 
     def _select_recovery_problematic_file(self) -> None:
         selected = filedialog.askdirectory(
@@ -4244,7 +9261,20 @@ class MixCreatorApp(ctk.CTk):
         self._update_tracks_count()
         self._update_controls_state()
         self._refresh_reuse_previous_option(select_if_available=False)
-        self._update_selected_track_mix_details()
+
+    def _configure_main_window_geometry(self) -> None:
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+
+        window_width = min(1180, max(900, screen_width - 80))
+        window_height = min(790, max(650, screen_height - 120))
+
+        x_position = max(0, (screen_width - window_width) // 2)
+        y_position = max(0, (screen_height - window_height) // 2)
+
+        self.geometry(f"{window_width}x{window_height}+{x_position}+{y_position}")
+        self.minsize(900, 630)
+        self.resizable(True, True)
 
     def _on_track_filter_change(self, _value: str) -> None:
         self._refresh_track_list_box()
@@ -5480,13 +10510,32 @@ class MixCreatorApp(ctk.CTk):
                 "diagnostics_verify_mp3_integrity": bool(self.diagnostics_verify_mp3_integrity_var.get()),
                 "diagnostics_verify_winlive": bool(self.diagnostics_verify_winlive_var.get()),
                 "diagnostics_placement_mode": str(self.diagnostics_placement_mode_var.get() or "copy").strip().lower(),
-                "appearance_mode": self.appearance_combo.get()
+                "repertory_updates_folder": self._repertory_updates_entry.get().strip() if self._repertory_updates_entry is not None else str(self.settings.get("repertory_updates_folder", "")),
+                "repertory_library_folder": self._repertory_library_entry.get().strip() if self._repertory_library_entry is not None else str(self.settings.get("repertory_library_folder", "")),
+                "repertory_general_folder": self._repertory_general_entry.get().strip() if self._repertory_general_entry is not None else str(self.settings.get("repertory_general_folder", "")),
+                "repertory_results_folder": self._repertory_results_entry.get().strip() if self._repertory_results_entry is not None else str(self.settings.get("repertory_results_folder", "")),
+                "repertory_smartphone_folder": self._repertory_smartphone_entry.get().strip() if self._repertory_smartphone_entry is not None else str(self.settings.get("repertory_smartphone_folder", self._repertory_smartphone_root)),
+                "repertory_backup_enabled": bool(self._repertory_backup_var.get()),
+                "appearance_mode": self.appearance_combo.get() if hasattr(self, "appearance_combo") else str(self.settings.get("appearance_mode", "blue"))
             }
         )
         self.settings_manager.save(self.settings)
 
     def on_close(self, _shutdown_after_cancel: bool = False) -> None:
-        if self.worker.is_running:
+        if getattr(self, "_destroy_completed", False) or getattr(self, "_is_destroying", False):
+            return
+
+        def _is_running(attr_name: str) -> bool:
+            worker = getattr(self, attr_name, None)
+            return bool(getattr(worker, "is_running", False))
+
+        def _cancel_worker(attr_name: str) -> None:
+            worker = getattr(self, attr_name, None)
+            cancel = getattr(worker, "cancel", None)
+            if callable(cancel):
+                cancel()
+
+        if _is_running("worker"):
             if not _shutdown_after_cancel:
                 confirm = messagebox.askyesno(
                     "Operazione in corso",
@@ -5495,11 +10544,11 @@ class MixCreatorApp(ctk.CTk):
                 )
                 if not confirm:
                     return
-            self.worker.cancel()
-            self.after(150, lambda: self.on_close(True))
+            _cancel_worker("worker")
+            self._shutdown_after_job = self._schedule_tracked_after(150, self.on_close, True)
             return
 
-        if self.extract_worker.is_running:
+        if _is_running("extract_worker"):
             if not _shutdown_after_cancel:
                 confirm = messagebox.askyesno(
                     "Operazione in corso",
@@ -5508,11 +10557,11 @@ class MixCreatorApp(ctk.CTk):
                 )
                 if not confirm:
                     return
-            self.extract_worker.cancel()
-            self.after(150, lambda: self.on_close(True))
+            _cancel_worker("extract_worker")
+            self._shutdown_after_job = self._schedule_tracked_after(150, self.on_close, True)
             return
 
-        if self.diagnostics_worker.is_running:
+        if _is_running("diagnostics_worker"):
             if not _shutdown_after_cancel:
                 confirm = messagebox.askyesno(
                     "Operazione in corso",
@@ -5521,11 +10570,11 @@ class MixCreatorApp(ctk.CTk):
                 )
                 if not confirm:
                     return
-            self.diagnostics_worker.cancel()
-            self.after(150, lambda: self.on_close(True))
+            _cancel_worker("diagnostics_worker")
+            self._shutdown_after_job = self._schedule_tracked_after(150, self.on_close, True)
             return
 
-        if self.recovery_worker.is_running:
+        if _is_running("recovery_worker"):
             if not _shutdown_after_cancel:
                 confirm = messagebox.askyesno(
                     "Operazione in corso",
@@ -5534,8 +10583,34 @@ class MixCreatorApp(ctk.CTk):
                 )
                 if not confirm:
                     return
-            self.recovery_worker.cancel()
-            self.after(150, lambda: self.on_close(True))
+            _cancel_worker("recovery_worker")
+            self._shutdown_after_job = self._schedule_tracked_after(150, self.on_close, True)
+            return
+
+        if _is_running("repertory_worker"):
+            if not _shutdown_after_cancel:
+                confirm = messagebox.askyesno(
+                    "Operazione in corso",
+                    "L'organizzazione repertorio e ancora in corso.\n"
+                    "Vuoi interromperla e chiudere il programma?"
+                )
+                if not confirm:
+                    return
+            _cancel_worker("repertory_worker")
+            self._shutdown_after_job = self._schedule_tracked_after(150, self.on_close, True)
+            return
+
+        if _is_running("rep003_worker"):
+            if not _shutdown_after_cancel:
+                confirm = messagebox.askyesno(
+                    "Operazione in corso",
+                    "L'inserimento nuovi brani e ancora in corso.\n"
+                    "Vuoi interromperlo e chiudere il programma?"
+                )
+                if not confirm:
+                    return
+            _cancel_worker("rep003_worker")
+            self._shutdown_after_job = self._schedule_tracked_after(150, self.on_close, True)
             return
 
         if not self._confirm_save_if_dirty():
@@ -5543,3 +10618,152 @@ class MixCreatorApp(ctk.CTk):
 
         self.save_settings()
         self.destroy()
+
+    def destroy(self) -> None:
+        if getattr(self, "_destroy_completed", False):
+            return
+        if getattr(self, "_is_destroying", False):
+            return
+
+        def _safe_get(name: str, default=None):
+            return getattr(self, name, default)
+
+        def _safe_cleanup_tooltips(owner=None) -> None:
+            cleanup_tooltips = getattr(self, "_cleanup_tooltips", None)
+            if callable(cleanup_tooltips):
+                try:
+                    cleanup_tooltips(owner=owner)
+                except Exception:
+                    pass
+
+        self._is_destroying = True
+        try:
+            try:
+                self._cancel_matching_after_scripts(
+                    "check_dpi_scaling",
+                    "update",
+                    "_windows_set_titlebar_icon",
+                    "_revert_withdraw_after_windows_set_titlebar_color",
+                    "_check_if_scrollbars_needed",
+                    "focus_set",
+                    "<lambda>",
+                )
+            except Exception:
+                pass
+
+            shutdown_after_job = _safe_get("_shutdown_after_job")
+            if shutdown_after_job is not None:
+                try:
+                    self._cancel_tracked_after_job(shutdown_after_job)
+                except Exception:
+                    pass
+            self._shutdown_after_job = None
+
+            for stopper_name in ("_stop_repertory_timer", "_stop_recovery_timer", "_stop_diagnostics_timer"):
+                stopper = _safe_get(stopper_name)
+                if callable(stopper):
+                    try:
+                        stopper()
+                    except Exception:
+                        pass
+
+            timer_job = _safe_get("timer_job")
+            if timer_job is not None:
+                try:
+                    self._cancel_tracked_after_job(timer_job)
+                except Exception:
+                    pass
+            self.timer_job = None
+
+            try:
+                grab_widget = self.grab_current()
+            except Exception:
+                grab_widget = None
+            if grab_widget is not None:
+                try:
+                    grab_widget.grab_release()
+                except Exception:
+                    pass
+
+            close_repertory_decision_dialog = _safe_get("_close_repertory_decision_dialog")
+            if callable(close_repertory_decision_dialog):
+                try:
+                    close_repertory_decision_dialog()
+                except Exception:
+                    pass
+
+            repertory_dialog = _safe_get("_repertory_dialog")
+            if repertory_dialog is not None:
+                finalize_repertory_window_close = _safe_get("_finalize_repertory_window_close")
+                if callable(finalize_repertory_window_close):
+                    try:
+                        finalize_repertory_window_close()
+                    except Exception:
+                        pass
+
+            extract_progress_dialog = _safe_get("_extract_progress_dialog")
+            if extract_progress_dialog is not None:
+                try:
+                    extract_progress_dialog.destroy()
+                except Exception:
+                    pass
+                self._extract_progress_dialog = None
+
+            recovery_forced_confirmation_dialog = _safe_get("_recovery_forced_confirmation_dialog")
+            if recovery_forced_confirmation_dialog is not None:
+                try:
+                    recovery_forced_confirmation_dialog.destroy()
+                except Exception:
+                    pass
+                self._recovery_forced_confirmation_dialog = None
+
+            recovery_dialog = _safe_get("_recovery_dialog")
+            if recovery_dialog is not None:
+                _safe_cleanup_tooltips(owner=recovery_dialog)
+                try:
+                    recovery_dialog.destroy()
+                except Exception:
+                    pass
+                self._recovery_dialog = None
+
+            close_rep003_window = _safe_get("_close_rep003_window")
+            if callable(close_rep003_window):
+                try:
+                    close_rep003_window()
+                except Exception:
+                    pass
+
+            diagnostics_window = _safe_get("diagnostics_window")
+            if diagnostics_window is not None:
+                _safe_cleanup_tooltips(owner=diagnostics_window)
+                try:
+                    diagnostics_window.destroy()
+                except Exception:
+                    pass
+                self.diagnostics_window = None
+
+            _safe_cleanup_tooltips()
+
+            cancel_tracked_after_jobs = _safe_get("_cancel_tracked_after_jobs")
+            if callable(cancel_tracked_after_jobs):
+                try:
+                    cancel_tracked_after_jobs()
+                except Exception:
+                    pass
+
+            try:
+                if self._widget_exists(self):
+                    self.update_idletasks()
+            except Exception:
+                pass
+
+            try:
+                super().destroy()
+            except (tk.TclError, RuntimeError):
+                pass
+        finally:
+            tracked_after_jobs = _safe_get("_tracked_after_jobs")
+            if isinstance(tracked_after_jobs, set):
+                tracked_after_jobs.clear()
+            self._destroy_completed = True
+            self._is_destroying = False

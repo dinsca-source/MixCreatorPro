@@ -15,11 +15,28 @@ from clip_info import ClipInfo
 from mp3_diagnostics import STATUS_PERFECT, STATUS_REPAIRED, STATUS_UNRECOVERABLE
 
 
+class _FakeAppearanceCombo:
+    def __init__(self, initial: str = "System") -> None:
+        self.value = str(initial)
+        self.set_calls: list[str] = []
+
+    def set(self, value: str) -> None:
+        self.value = str(value)
+        self.set_calls.append(self.value)
+
+    def get(self) -> str:
+        return self.value
+
+
 class GuiProjectResetTests(unittest.TestCase):
     def setUp(self) -> None:
         self.app = MixCreatorApp()
         self.app.withdraw()
         self.app._reset_to_initial_state()
+        if not hasattr(self.app, "appearance_combo"):
+            self.app.appearance_combo = _FakeAppearanceCombo(
+                str(self.app.settings.get("appearance_mode", "System"))
+            )
 
     def tearDown(self) -> None:
         try:
@@ -272,7 +289,9 @@ class GuiProjectResetTests(unittest.TestCase):
 
         self.app.settings["diagnostics_verify_mp3_integrity"] = False
         self.app.settings["diagnostics_verify_winlive"] = True
+        self.app.settings["appearance_mode"] = "Dark"
         self.app._load_settings_into_ui()
+        self.assertEqual(self.app.appearance_combo.set_calls[-1], "Dark")
         self.app.open_diagnostics_window()
         self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
         self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
@@ -285,7 +304,9 @@ class GuiProjectResetTests(unittest.TestCase):
     def test_diagnostics_invalid_saved_both_off_recovers_with_integrity_on(self) -> None:
         self.app.settings["diagnostics_verify_mp3_integrity"] = False
         self.app.settings["diagnostics_verify_winlive"] = False
+        self.app.settings["appearance_mode"] = "Light"
         self.app._load_settings_into_ui()
+        self.assertEqual(self.app.appearance_combo.set_calls[-1], "Light")
         self.assertTrue(bool(self.app.diagnostics_verify_mp3_integrity_var.get()))
         self.assertFalse(bool(self.app.diagnostics_verify_winlive_var.get()))
 
